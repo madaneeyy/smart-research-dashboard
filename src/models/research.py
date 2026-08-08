@@ -6,7 +6,7 @@ from pydantic import BaseModel, HttpUrl
 class ResearchItem(BaseModel):
     id: str
     title: str
-    description: str
+    description: str | None = None
     authors: list[str]
 
     source: str

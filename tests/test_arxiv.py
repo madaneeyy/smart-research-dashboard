@@ -284,7 +284,7 @@ def test_fetch_arxiv_xml_returns_response_text(monkeypatch):
     )
 
     assert result == xml
-    
+
 def test_research_paper_to_item():
     paper = ResearchPaper(
         id="test-001",
@@ -310,3 +310,29 @@ def test_research_paper_to_item():
     assert item.published == paper.published
     assert item.updated == paper.updated
     assert item.tags == ["cs.AI", "cs.CV"]
+
+def test_research_paper_to_item():
+    paper = ResearchPaper(
+        id="1234.5678",
+        title="Test Research Paper",
+        authors=["Test Author"],
+        abstract="This is a test abstract.",
+        published="2026-08-01T00:00:00Z",
+        updated="2026-08-02T00:00:00Z",
+        categories=["cs.AI", "cs.LG"],
+        primary_category="cs.AI",
+        pdf_url="https://arxiv.org/pdf/1234.5678",
+        arxiv_url="https://arxiv.org/abs/1234.5678",
+    )
+
+    item = research_paper_to_item(paper)
+
+    assert item.id == "1234.5678"
+    assert item.title == "Test Research Paper"
+    assert item.description == "This is a test abstract."
+    assert item.authors == ["Test Author"]
+    assert item.source == "arxiv"
+    assert str(item.url) == "https://arxiv.org/abs/1234.5678"
+    assert item.published.year == 2026
+    assert item.updated.year == 2026
+    assert item.tags == ["cs.AI", "cs.LG"]
