@@ -145,9 +145,13 @@ def load_paperswithcode_papers(
     ]
 
 def search_paperswithcode_papers(
+    query: str | None = None,
     offset: int = 0,
     length: int = 20,
 ) -> list[PapersWithCodePaper]:
+    if query is not None and not query.strip():
+        raise ValueError("query must not be empty")
+
     if offset < 0:
         raise ValueError("offset must be 0 or greater")
 
@@ -155,19 +159,33 @@ def search_paperswithcode_papers(
         raise ValueError("length must be at least 1")
 
     response = get_paperswithcode_rows(
-        "pwc-archive/papers-with-abstracts",
+        PAPERS_DATASET,
         offset=offset,
         length=length,
     )
 
     data = response.json()
 
-    return [
+    papers = [
         parse_paperswithcode_paper(row["row"])
         for row in data.get("rows", [])
     ]
 
+    if query is None:
+        return papers
 
+    query_lower = query.lower()
+
+    return [
+        paper
+        for paper in papers
+        if query_lower in paper.title.lower()
+        or query_lower in (paper.abstract or "").lower()
+        or any(
+            query_lower in task.lower()
+            for task in paper.tasks
+        )
+    ]
 
 
 def search_paper_code_links(
