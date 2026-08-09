@@ -237,7 +237,7 @@ def search_paperswithcode_papers(
     length: int = 20,
     *,
     page_size: int = 100,
-    max_scan: int = 5000,
+    max_scan: int = 500,
 ) -> list[PapersWithCodePaper]:
     """
     Search Papers With Code by scanning the archived dataset.

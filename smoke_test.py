@@ -1,9 +1,10 @@
+import logging
 from src.services.research import ResearchService
 from src.services.relevance import RelevanceScorer
 
 
 def main():
-    query = "transformer models"
+    query = "large language models"
 
     print("=" * 80)
     print("RESEARCH SEARCH SMOKE TEST")

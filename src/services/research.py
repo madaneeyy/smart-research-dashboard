@@ -1,3 +1,5 @@
+import logging
+
 from src.collectors.arxiv import (
     research_paper_to_item,
     search_arxiv,
@@ -16,6 +18,9 @@ from src.collectors.paperswithcode import (
 )
 from src.models.research import ResearchItem
 from src.services.relevance import RelevanceScorer
+
+
+logger = logging.getLogger(__name__)
 
 
 class ResearchService:
@@ -42,7 +47,7 @@ class ResearchService:
         1. Collected from each selected source
         2. Converted into ResearchItem objects
         3. Deduplicated
-        4. Ranked by relevance to the query
+        4. Ranked by relevance
         """
 
         if not query.strip():
@@ -81,9 +86,10 @@ class ResearchService:
                 )
 
             except Exception:
-                # One failing source should not break the
-                # entire research search.
-                pass
+                logger.exception(
+                    "ArXiv search failed for query=%r",
+                    query,
+                )
 
         # ---------------------------------------------------------
         # GitHub
@@ -101,7 +107,10 @@ class ResearchService:
                 )
 
             except Exception:
-                pass
+                logger.exception(
+                    "GitHub search failed for query=%r",
+                    query,
+                )
 
         # ---------------------------------------------------------
         # PapersWithCode
@@ -119,7 +128,10 @@ class ResearchService:
                 )
 
             except Exception:
-                pass
+                logger.exception(
+                    "PapersWithCode search failed for query=%r",
+                    query,
+                )
 
         # ---------------------------------------------------------
         # Hugging Face
@@ -137,7 +149,10 @@ class ResearchService:
                 )
 
             except Exception:
-                pass
+                logger.exception(
+                    "Hugging Face search failed for query=%r",
+                    query,
+                )
 
         # ---------------------------------------------------------
         # Deduplicate
