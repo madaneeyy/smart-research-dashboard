@@ -103,17 +103,21 @@ def test_search_returns_research_items_from_all_sources(monkeypatch):
         for result in results
     )
 
-    assert results[0].source == "arxiv"
-    assert results[0].title == "ArXiv Paper"
+    # Search results are now ranked by relevance,
+    # so do not assume source order.
+    assert {result.source for result in results} == {
+        "arxiv",
+        "github",
+        "paperswithcode",
+        "huggingface",
+    }
 
-    assert results[1].source == "github"
-    assert results[1].title == "test-repo"
-
-    assert results[2].source == "paperswithcode"
-    assert results[2].title == "PapersWithCode Paper"
-
-    assert results[3].source == "huggingface"
-    assert results[3].title == "test-user/test-model"
+    assert {result.title for result in results} == {
+        "ArXiv Paper",
+        "test-repo",
+        "PapersWithCode Paper",
+        "test-user/test-model",
+    }
 
 
 def test_search_rejects_empty_query():
@@ -217,17 +221,20 @@ def test_search_continues_when_one_source_fails(monkeypatch):
         for result in results
     )
 
-    assert [result.source for result in results] == [
+    # GitHub failed, but the other three sources succeeded.
+    assert {result.source for result in results} == {
         "arxiv",
         "paperswithcode",
         "huggingface",
-    ]
+    }
 
-    assert [result.title for result in results] == [
+    assert {result.title for result in results} == {
         "ArXiv Paper",
         "PapersWithCode Paper",
         "test-user/test-model",
-    ]
+    }
+
+
 def test_search_removes_duplicate_results(monkeypatch):
     arxiv_paper = ResearchPaper(
         id="1234.5678",
@@ -295,6 +302,7 @@ def test_search_removes_duplicate_results(monkeypatch):
     assert results[0].title == "Same Research Paper"
     assert results[0].source == "arxiv"
 
+
 def test_search_uses_per_source_limits(monkeypatch):
     calls = {}
 
@@ -350,3 +358,116 @@ def test_search_uses_per_source_limits(monkeypatch):
     assert calls["github"]["per_page"] == 10
     assert calls["paperswithcode"]["length"] == 3
     assert calls["huggingface"]["limit"] == 7
+
+
+def test_search_can_filter_to_one_source(monkeypatch):
+    calls = []
+
+    def mock_arxiv(*args, **kwargs):
+        calls.append("arxiv")
+        return []
+
+    def mock_github(*args, **kwargs):
+        calls.append("github")
+        return []
+
+    def mock_paperswithcode(*args, **kwargs):
+        calls.append("paperswithcode")
+        return []
+
+    def mock_huggingface(*args, **kwargs):
+        calls.append("huggingface")
+        return []
+
+    monkeypatch.setattr(
+        "src.services.research.search_arxiv",
+        mock_arxiv,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_github_repositories",
+        mock_github,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_paperswithcode_papers",
+        mock_paperswithcode,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_huggingface_models",
+        mock_huggingface,
+    )
+
+    service = ResearchService()
+
+    results = service.search(
+        "transformers",
+        sources=["arxiv"],
+    )
+
+    assert results == []
+    assert calls == ["arxiv"]
+
+
+def test_search_can_filter_to_multiple_sources(monkeypatch):
+    calls = []
+
+    def mock_arxiv(*args, **kwargs):
+        calls.append("arxiv")
+        return []
+
+    def mock_github(*args, **kwargs):
+        calls.append("github")
+        return []
+
+    def mock_paperswithcode(*args, **kwargs):
+        calls.append("paperswithcode")
+        return []
+
+    def mock_huggingface(*args, **kwargs):
+        calls.append("huggingface")
+        return []
+
+    monkeypatch.setattr(
+        "src.services.research.search_arxiv",
+        mock_arxiv,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_github_repositories",
+        mock_github,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_paperswithcode_papers",
+        mock_paperswithcode,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_huggingface_models",
+        mock_huggingface,
+    )
+
+    service = ResearchService()
+
+    results = service.search(
+        "transformers",
+        sources=["arxiv", "github"],
+    )
+
+    assert results == []
+    assert calls == ["arxiv", "github"]
+
+
+def test_search_rejects_unknown_source():
+    service = ResearchService()
+
+    with pytest.raises(
+        ValueError,
+        match="unknown source",
+    ):
+        service.search(
+            "transformers",
+            sources=["not-a-source"],
+        )

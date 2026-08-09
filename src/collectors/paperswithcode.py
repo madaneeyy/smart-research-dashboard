@@ -1,10 +1,15 @@
 from datetime import datetime
 
 from pydantic import BaseModel, HttpUrl
+
 from src.clients.paperswithcode import get_paperswithcode_rows
 from src.models.research import ResearchItem
 
+
 PAPERS_DATASET = "pwc-archive/papers-with-abstracts"
+PAPER_CODE_LINKS_DATASET = "pwc-archive/links-between-paper-and-code"
+
+
 class PapersWithCodeMethod(BaseModel):
     name: str | None = None
     full_name: str | None = None
@@ -60,7 +65,9 @@ class PaperCodeLink(BaseModel):
     framework: str | None = None
 
 
-def parse_paperswithcode_method(data: dict) -> PapersWithCodeMethod:
+def parse_paperswithcode_method(
+    data: dict,
+) -> PapersWithCodeMethod:
     return PapersWithCodeMethod(
         name=data.get("name"),
         full_name=data.get("full_name"),
@@ -71,7 +78,9 @@ def parse_paperswithcode_method(data: dict) -> PapersWithCodeMethod:
     )
 
 
-def parse_paperswithcode_paper(data: dict) -> PapersWithCodePaper:
+def parse_paperswithcode_paper(
+    data: dict,
+) -> PapersWithCodePaper:
     return PapersWithCodePaper(
         paper_url=data["paper_url"],
         arxiv_id=data.get("arxiv_id"),
@@ -95,6 +104,8 @@ def parse_paperswithcode_paper(data: dict) -> PapersWithCodePaper:
             for method in data.get("methods", [])
         ],
     )
+
+
 def paperswithcode_paper_to_item(
     paper: PapersWithCodePaper,
 ) -> ResearchItem:
@@ -111,8 +122,9 @@ def paperswithcode_paper_to_item(
     )
 
 
-
-def parse_paper_code_link(data: dict) -> PaperCodeLink:
+def parse_paper_code_link(
+    data: dict,
+) -> PaperCodeLink:
     return PaperCodeLink(
         paper_url=data["paper_url"],
         paper_title=data["paper_title"],
@@ -126,11 +138,18 @@ def parse_paper_code_link(data: dict) -> PaperCodeLink:
         framework=data.get("framework"),
     )
 
+
 def load_paperswithcode_papers(
     *,
     offset: int = 0,
     length: int = 100,
 ) -> list[PapersWithCodePaper]:
+    if offset < 0:
+        raise ValueError("offset must be 0 or greater")
+
+    if length < 1:
+        raise ValueError("length must be at least 1")
+
     response = get_paperswithcode_rows(
         PAPERS_DATASET,
         offset=offset,
@@ -144,11 +163,95 @@ def load_paperswithcode_papers(
         for item in data.get("rows", [])
     ]
 
+
+def _paper_matches_query(
+    paper: PapersWithCodePaper,
+    query: str,
+) -> bool:
+    query_lower = query.strip().lower()
+
+    if not query_lower:
+        return False
+
+    if query_lower in paper.title.lower():
+        return True
+
+    if query_lower in (paper.abstract or "").lower():
+        return True
+
+    if query_lower in (paper.short_abstract or "").lower():
+        return True
+
+    if any(
+        query_lower in task.lower()
+        for task in paper.tasks
+    ):
+        return True
+
+    if any(
+        query_lower in author.lower()
+        for author in paper.authors
+    ):
+        return True
+
+    if any(
+        query_lower in method.name.lower()
+        for method in paper.methods
+        if method.name
+    ):
+        return True
+
+    return False
+
+
+def _paper_matches_query(
+    paper: PapersWithCodePaper,
+    query: str,
+) -> bool:
+    query_lower = query.strip().lower()
+
+    if query_lower in paper.title.lower():
+        return True
+
+    if query_lower in (paper.abstract or "").lower():
+        return True
+
+    if any(
+        query_lower in task.lower()
+        for task in paper.tasks
+    ):
+        return True
+
+    if any(
+        query_lower in author.lower()
+        for author in paper.authors
+    ):
+        return True
+
+    return False
+
+
 def search_paperswithcode_papers(
     query: str | None = None,
     offset: int = 0,
     length: int = 20,
+    *,
+    page_size: int = 100,
+    max_scan: int = 5000,
 ) -> list[PapersWithCodePaper]:
+    """
+    Search Papers With Code by scanning the archived dataset.
+
+    The dataset API does not provide a native full-text search endpoint,
+    so we fetch pages and perform matching locally.
+
+    `length` controls the number of matching results returned.
+
+    `page_size` controls how many dataset rows are fetched per request.
+
+    `max_scan` limits the total number of dataset rows examined.
+    """
+
     if query is not None and not query.strip():
         raise ValueError("query must not be empty")
 
@@ -158,35 +261,53 @@ def search_paperswithcode_papers(
     if length < 1:
         raise ValueError("length must be at least 1")
 
-    response = get_paperswithcode_rows(
-        PAPERS_DATASET,
-        offset=offset,
-        length=length,
-    )
+    if page_size < 1:
+        raise ValueError("page_size must be at least 1")
 
-    data = response.json()
+    if max_scan < 1:
+        raise ValueError("max_scan must be at least 1")
 
-    papers = [
-        parse_paperswithcode_paper(row["row"])
-        for row in data.get("rows", [])
-    ]
-
+    # No query means normal dataset browsing.
     if query is None:
-        return papers
-
-    query_lower = query.lower()
-
-    return [
-        paper
-        for paper in papers
-        if query_lower in paper.title.lower()
-        or query_lower in (paper.abstract or "").lower()
-        or any(
-            query_lower in task.lower()
-            for task in paper.tasks
+        return load_paperswithcode_papers(
+            offset=offset,
+            length=length,
         )
-    ]
 
+    results: list[PapersWithCodePaper] = []
+
+    current_offset = offset
+    scanned = 0
+
+    while len(results) < length and scanned < max_scan:
+        remaining = max_scan - scanned
+        request_length = min(page_size, remaining)
+
+        papers = load_paperswithcode_papers(
+            offset=current_offset,
+            length=request_length,
+        )
+
+        if not papers:
+            break
+
+        scanned += len(papers)
+
+        for paper in papers:
+            if _paper_matches_query(paper, query):
+                results.append(paper)
+
+                if len(results) >= length:
+                    break
+
+        current_offset += len(papers)
+
+        # The API returned fewer rows than requested,
+        # so we have reached the end of the dataset.
+        if len(papers) < request_length:
+            break
+
+    return results
 
 def search_paper_code_links(
     offset: int = 0,
@@ -199,7 +320,7 @@ def search_paper_code_links(
         raise ValueError("length must be at least 1")
 
     response = get_paperswithcode_rows(
-        "pwc-archive/links-between-paper-and-code",
+        PAPER_CODE_LINKS_DATASET,
         offset=offset,
         length=length,
     )
