@@ -471,3 +471,251 @@ def test_search_rejects_unknown_source():
             "transformers",
             sources=["not-a-source"],
         )
+def test_search_sorts_by_published_date(monkeypatch):
+    older_paper = ResearchPaper(
+        id="older",
+        title="Older Paper",
+        authors=["Author A"],
+        abstract="Older research paper.",
+        published="2026-01-01T00:00:00Z",
+        updated="2026-01-02T00:00:00Z",
+        categories=["machine learning"],
+        primary_category="cs.LG",
+        pdf_url="https://arxiv.org/pdf/older",
+        arxiv_url="https://arxiv.org/abs/older",
+    )
+
+    newer_paper = ResearchPaper(
+        id="newer",
+        title="Newer Paper",
+        authors=["Author B"],
+        abstract="Newer research paper.",
+        published="2026-08-01T00:00:00Z",
+        updated="2026-08-02T00:00:00Z",
+        categories=["machine learning"],
+        primary_category="cs.LG",
+        pdf_url="https://arxiv.org/pdf/newer",
+        arxiv_url="https://arxiv.org/abs/newer",
+    )
+
+    def mock_arxiv(*args, **kwargs):
+        return [older_paper, newer_paper]
+
+    def mock_github(*args, **kwargs):
+        return []
+
+    def mock_paperswithcode(*args, **kwargs):
+        return []
+
+    def mock_huggingface(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(
+        "src.services.research.search_arxiv",
+        mock_arxiv,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_github_repositories",
+        mock_github,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_paperswithcode_papers",
+        mock_paperswithcode,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_huggingface_models",
+        mock_huggingface,
+    )
+
+    service = ResearchService()
+
+    results = service.search(
+        "research",
+        sort_by="published",
+    )
+
+    assert [result.title for result in results] == [
+        "Newer Paper",
+        "Older Paper",
+    ]
+
+
+def test_search_sorts_by_updated_date(monkeypatch):
+    older_update = ResearchPaper(
+        id="older-update",
+        title="Older Update",
+        authors=["Author A"],
+        abstract="Research paper.",
+        published="2026-08-01T00:00:00Z",
+        updated="2026-01-01T00:00:00Z",
+        categories=["machine learning"],
+        primary_category="cs.LG",
+        pdf_url="https://arxiv.org/pdf/older-update",
+        arxiv_url="https://arxiv.org/abs/older-update",
+    )
+
+    newer_update = ResearchPaper(
+        id="newer-update",
+        title="Newer Update",
+        authors=["Author B"],
+        abstract="Research paper.",
+        published="2026-01-01T00:00:00Z",
+        updated="2026-08-01T00:00:00Z",
+        categories=["machine learning"],
+        primary_category="cs.LG",
+        pdf_url="https://arxiv.org/pdf/newer-update",
+        arxiv_url="https://arxiv.org/abs/newer-update",
+    )
+
+    def mock_arxiv(*args, **kwargs):
+        return [older_update, newer_update]
+
+    def mock_github(*args, **kwargs):
+        return []
+
+    def mock_paperswithcode(*args, **kwargs):
+        return []
+
+    def mock_huggingface(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(
+        "src.services.research.search_arxiv",
+        mock_arxiv,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_github_repositories",
+        mock_github,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_paperswithcode_papers",
+        mock_paperswithcode,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_huggingface_models",
+        mock_huggingface,
+    )
+
+    service = ResearchService()
+
+    results = service.search(
+        "research",
+        sort_by="updated",
+    )
+
+    assert [result.title for result in results] == [
+        "Newer Update",
+        "Older Update",
+    ]
+
+
+def test_search_puts_missing_dates_last(monkeypatch):
+    dated_paper = ResearchPaper(
+        id="dated",
+        title="Dated Paper",
+        authors=["Author A"],
+        abstract="Research paper.",
+        published="2026-08-01T00:00:00Z",
+        updated="2026-08-01T00:00:00Z",
+        categories=["machine learning"],
+        primary_category="cs.LG",
+        pdf_url="https://arxiv.org/pdf/dated",
+        arxiv_url="https://arxiv.org/abs/dated",
+    )
+
+    undated_paper = ResearchPaper(
+        id="undated",
+        title="Undated Paper",
+        authors=["Author B"],
+        abstract="Research paper.",
+        published="2026-01-01T00:00:00Z",
+        updated="2026-01-01T00:00:00Z",
+        categories=["machine learning"],
+        primary_category="cs.LG",
+        pdf_url="https://arxiv.org/pdf/undated",
+        arxiv_url="https://arxiv.org/abs/undated",
+    )
+
+    def mock_arxiv(*args, **kwargs):
+        return [undated_paper, dated_paper]
+
+    def mock_arxiv_to_item(paper):
+        if paper.id == "undated":
+            return ResearchItem(
+                id="undated",
+                title="Undated Paper",
+                description="Research paper.",
+                authors=["Author B"],
+                source="arxiv",
+                url="https://arxiv.org/abs/undated",
+                published=None,
+                updated=None,
+                tags=["machine learning"],
+            )
+
+        return ResearchItem(
+            id="dated",
+            title="Dated Paper",
+            description="Research paper.",
+            authors=["Author A"],
+            source="arxiv",
+            url="https://arxiv.org/abs/dated",
+            published="2026-08-01T00:00:00Z",
+            updated="2026-08-01T00:00:00Z",
+            tags=["machine learning"],
+        )
+
+    monkeypatch.setattr(
+        "src.services.research.search_arxiv",
+        mock_arxiv,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.research_paper_to_item",
+        mock_arxiv_to_item,
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_github_repositories",
+        lambda *args, **kwargs: [],
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_paperswithcode_papers",
+        lambda *args, **kwargs: [],
+    )
+
+    monkeypatch.setattr(
+        "src.services.research.search_huggingface_models",
+        lambda *args, **kwargs: [],
+    )
+
+    service = ResearchService()
+
+    results = service.search(
+        "research",
+        sort_by="published",
+    )
+
+    assert [result.title for result in results] == [
+        "Dated Paper",
+        "Undated Paper",
+    ]
+
+def test_search_rejects_invalid_sort_option():
+    service = ResearchService()
+
+    with pytest.raises(
+        ValueError,
+        match="unknown sort option",
+    ):
+        service.search(
+            "transformers",
+            sort_by="invalid",
+        )

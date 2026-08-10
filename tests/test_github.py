@@ -10,7 +10,14 @@ from src.collectors.github import (
     search_github_repositories,
 )
 
+
+# =========================================================
+# GitHub Client
+# =========================================================
+
+
 def test_get_github_returns_response(monkeypatch):
+
     def mock_get(*args, **kwargs):
         request = httpx.Request(
             "GET",
@@ -25,15 +32,22 @@ def test_get_github_returns_response(monkeypatch):
             request=request,
         )
 
-    monkeypatch.setattr(httpx, "get", mock_get)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        mock_get,
+    )
 
-    response = get_github("/repos/test/repo")
+    response = get_github(
+        "/repos/test/repo"
+    )
 
     assert response.status_code == 200
     assert response.json()["name"] == "test-repo"
 
 
 def test_get_github_raises_for_http_error(monkeypatch):
+
     def mock_get(*args, **kwargs):
         request = httpx.Request(
             "GET",
@@ -45,13 +59,25 @@ def test_get_github_raises_for_http_error(monkeypatch):
             request=request,
         )
 
-    monkeypatch.setattr(httpx, "get", mock_get)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        mock_get,
+    )
 
     with pytest.raises(httpx.HTTPStatusError):
-        get_github("/repos/test/repo")
+        get_github(
+            "/repos/test/repo"
+        )
+
+
+# =========================================================
+# GitHub Repository Parsing
+# =========================================================
 
 
 def test_parse_github_repository():
+
     data = {
         "id": 123456,
         "name": "test-repo",
@@ -61,7 +87,10 @@ def test_parse_github_repository():
         "stargazers_count": 100,
         "forks_count": 20,
         "language": "Python",
-        "topics": ["ai", "research"],
+        "topics": [
+            "ai",
+            "research",
+        ],
         "created_at": "2026-01-01T12:00:00Z",
         "updated_at": "2026-08-01T12:00:00Z",
     }
@@ -70,9 +99,13 @@ def test_parse_github_repository():
 
     assert repository.id == 123456
     assert repository.name == "test-repo"
-    assert repository.full_name == "test-user/test-repo"
+    assert repository.full_name == (
+        "test-user/test-repo"
+    )
 
-    assert repository.description == "A test repository."
+    assert repository.description == (
+        "A test repository."
+    )
 
     assert str(repository.html_url) == (
         "https://github.com/test-user/test-repo"
@@ -81,13 +114,31 @@ def test_parse_github_repository():
     assert repository.stars == 100
     assert repository.forks == 20
     assert repository.language == "Python"
-    assert repository.topics == ["ai", "research"]
 
+    assert repository.topics == [
+        "ai",
+        "research",
+    ]
+
+    # Verify created_at.
     assert repository.created_at.year == 2026
-    assert repository.updated_at.year == 2026
+
+    # Verify exact updated_at timestamp.
+    assert repository.updated_at is not None
+    assert repository.updated_at.isoformat().startswith(
+        "2026-08-01T12:00:00"
+    )
 
 
-def test_search_github_repositories(monkeypatch):
+# =========================================================
+# GitHub Search
+# =========================================================
+
+
+def test_search_github_repositories(
+    monkeypatch,
+):
+
     response_data = {
         "items": [
             {
@@ -95,25 +146,37 @@ def test_search_github_repositories(monkeypatch):
                 "name": "test-repo",
                 "full_name": "test-user/test-repo",
                 "description": "A test repository.",
-                "html_url": "https://github.com/test-user/test-repo",
+                "html_url": (
+                    "https://github.com/test-user/test-repo"
+                ),
                 "stargazers_count": 100,
                 "forks_count": 20,
                 "language": "Python",
-                "topics": ["ai", "research"],
-                "created_at": "2026-01-01T12:00:00Z",
-                "updated_at": "2026-08-01T12:00:00Z",
+                "topics": [
+                    "ai",
+                    "research",
+                ],
+                "created_at": (
+                    "2026-01-01T12:00:00Z"
+                ),
+                "updated_at": (
+                    "2026-08-01T12:00:00Z"
+                ),
             }
         ]
     }
 
     class MockResponse:
+
         def json(self):
             return response_data
 
-    def mock_get_github(*args, **kwargs):
+    def mock_get_github(
+        *args,
+        **kwargs,
+    ):
         return MockResponse()
 
-    # Patch the function where the collector uses it.
     monkeypatch.setattr(
         "src.collectors.github.get_github",
         mock_get_github,
@@ -130,12 +193,34 @@ def test_search_github_repositories(monkeypatch):
 
     assert repository.id == 123456
     assert repository.name == "test-repo"
-    assert repository.full_name == "test-user/test-repo"
+
+    assert repository.full_name == (
+        "test-user/test-repo"
+    )
+
     assert repository.stars == 100
+    assert repository.forks == 20
     assert repository.language == "Python"
+
+    assert repository.topics == [
+        "ai",
+        "research",
+    ]
+
+    # Verify updated_at survives the search flow.
+    assert repository.updated_at is not None
+    assert repository.updated_at.isoformat().startswith(
+        "2026-08-01T12:00:00"
+    )
+
+
+# =========================================================
+# Validation
+# =========================================================
 
 
 def test_search_github_repositories_rejects_invalid_page():
+
     with pytest.raises(
         ValueError,
         match="page must be 1 or greater",
@@ -147,6 +232,7 @@ def test_search_github_repositories_rejects_invalid_page():
 
 
 def test_search_github_repositories_rejects_invalid_per_page():
+
     with pytest.raises(
         ValueError,
         match="per_page must be at least 1",
@@ -156,31 +242,90 @@ def test_search_github_repositories_rejects_invalid_per_page():
             per_page=0,
         )
 
+
+# =========================================================
+# ResearchItem Conversion
+# =========================================================
+
+
 def test_github_repository_to_item():
+
     repository = GitHubRepository(
         id=123456,
         name="test-repo",
         full_name="test-user/test-repo",
         description="A test repository.",
-        html_url="https://github.com/test-user/test-repo",
+        html_url=(
+            "https://github.com/test-user/test-repo"
+        ),
         stars=100,
         forks=20,
         language="Python",
-        topics=["ai", "research"],
+        topics=[
+            "ai",
+            "research",
+        ],
         created_at="2026-01-01T12:00:00Z",
         updated_at="2026-08-01T12:00:00Z",
     )
 
-    item = github_repository_to_item(repository)
+    item = github_repository_to_item(
+        repository
+    )
+
+    # -----------------------------------------------------
+    # Common ResearchItem fields
+    # -----------------------------------------------------
 
     assert item.id == "test-user/test-repo"
+
     assert item.title == "test-repo"
-    assert item.description == "A test repository."
+
+    assert item.description == (
+        "A test repository."
+    )
+
     assert item.authors == []
+
     assert item.source == "github"
+
     assert str(item.url) == (
         "https://github.com/test-user/test-repo"
     )
+
+    # -----------------------------------------------------
+    # Dates
+    # -----------------------------------------------------
+
+    assert item.published is not None
     assert item.published.year == 2026
-    assert item.updated.year == 2026
-    assert item.tags == ["ai", "research", "Python"]
+
+    assert item.published.isoformat().startswith(
+        "2026-01-01T12:00:00"
+    )
+
+    # GitHub updated_at → ResearchItem.updated
+    assert item.updated is not None
+    assert item.updated.isoformat().startswith(
+        "2026-08-01T12:00:00"
+    )
+
+    # -----------------------------------------------------
+    # Tags
+    # -----------------------------------------------------
+
+    assert item.tags == [
+        "ai",
+        "research",
+        "Python",
+    ]
+
+    # -----------------------------------------------------
+    # GitHub-specific fields
+    # -----------------------------------------------------
+
+    assert item.stars == 100
+
+    assert item.forks == 20
+
+    assert item.language == "Python"

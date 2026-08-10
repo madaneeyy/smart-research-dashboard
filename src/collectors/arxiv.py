@@ -1,82 +1,242 @@
-from src.models.research import ResearchItem
 from datetime import datetime
 import xml.etree.ElementTree as ET
-from src.clients.http import get
+
 from pydantic import BaseModel, HttpUrl
 
+from src.clients.http import get
+from src.models.research import ResearchItem
 
+
+# =============================================================
+# ARXIV CONSTANTS
+# =============================================================
+
+ARXIV_API_URL = (
+    "https://export.arxiv.org/api/query"
+)
+
+ATOM_NS = (
+    "http://www.w3.org/2005/Atom"
+)
+
+ARXIV_NS = (
+    "http://arxiv.org/schemas/atom"
+)
+
+
+# =============================================================
+# ARXIV RESEARCH PAPER MODEL
+# =============================================================
 
 class ResearchPaper(BaseModel):
     id: str
     title: str
     authors: list[str]
+
     abstract: str
+
     published: datetime
     updated: datetime
+
     categories: list[str]
     primary_category: str
+
     pdf_url: HttpUrl
     arxiv_url: HttpUrl
+
     source: str = "arxiv"
-    
-def research_paper_to_item(paper: ResearchPaper) -> ResearchItem:
+
+
+# =============================================================
+# CONVERT ARXIV PAPER → RESEARCH ITEM
+# =============================================================
+
+def research_paper_to_item(
+    paper: ResearchPaper,
+) -> ResearchItem:
+    """
+    Convert an arXiv ResearchPaper into the common
+    ResearchItem model.
+
+    Mappings:
+
+        arXiv title
+            → ResearchItem.title
+
+        arXiv abstract
+            → ResearchItem.description
+
+        arXiv authors
+            → ResearchItem.authors
+
+        arXiv published
+            → ResearchItem.published
+
+        arXiv updated
+            → ResearchItem.updated
+
+        arXiv categories
+            → ResearchItem.tags
+
+        arXiv URL
+            → ResearchItem.url
+    """
+
     return ResearchItem(
+        # -----------------------------------------------------
+        # Common fields
+        # -----------------------------------------------------
+
         id=paper.id,
+
         title=paper.title,
+
         description=paper.abstract,
-        authors=paper.authors,
+
+        authors=list(paper.authors),
+
         source=paper.source,
+
         url=paper.arxiv_url,
+
+        # -----------------------------------------------------
+        # Dates
+        # -----------------------------------------------------
+
         published=paper.published,
+
         updated=paper.updated,
-        tags=paper.categories,
+
+        # -----------------------------------------------------
+        # Categories → Tags
+        # -----------------------------------------------------
+
+        tags=list(paper.categories),
     )
 
 
-ARXIV_API_URL = "https://export.arxiv.org/api/query"
-ATOM_NS = "http://www.w3.org/2005/Atom"
+# =============================================================
+# PARSE ARXIV API RESPONSE
+# =============================================================
 
+def parse_arxiv_response(
+    xml_text: str,
+) -> list[ResearchPaper]:
+    """
+    Parse an arXiv Atom XML response into a list of
+    ResearchPaper objects.
 
-def parse_arxiv_response(xml_text: str) -> list[ResearchPaper]:
+    The parser extracts:
+
+        ID
+        title
+        abstract
+        authors
+        published date
+        updated date
+        categories
+        primary category
+        arXiv URL
+        PDF URL
+    """
+
+    # ---------------------------------------------------------
+    # Remove leading whitespace
+    # ---------------------------------------------------------
+
+    # XML declarations such as:
+    #
+    # <?xml version="1.0" encoding="UTF-8"?>
+    #
+    # must appear at the beginning of the XML document.
+    #
+    # arXiv responses/tests may contain leading whitespace,
+    # so strip it before parsing.
+
+    xml_text = xml_text.strip()
+
     root = ET.fromstring(xml_text)
 
-    papers = []
+    papers: list[ResearchPaper] = []
 
-    for entry in root.findall(f"{{{ATOM_NS}}}entry"):
+    # ---------------------------------------------------------
+    # Iterate through entries
+    # ---------------------------------------------------------
+
+    for entry in root.findall(
+        f"{{{ATOM_NS}}}entry"
+    ):
+
+        # -----------------------------------------------------
+        # ID
+        # -----------------------------------------------------
+
         entry_id = entry.findtext(
             f"{{{ATOM_NS}}}id",
             "",
         ).strip()
+
+        paper_id = entry_id.rsplit(
+            "/",
+            1,
+        )[-1]
+
+        # -----------------------------------------------------
+        # Title
+        # -----------------------------------------------------
 
         title = entry.findtext(
             f"{{{ATOM_NS}}}title",
             "",
         ).strip()
 
+        # -----------------------------------------------------
+        # Abstract
+        # -----------------------------------------------------
+
         abstract = entry.findtext(
             f"{{{ATOM_NS}}}summary",
             "",
         ).strip()
+
+        # -----------------------------------------------------
+        # Published date
+        # -----------------------------------------------------
 
         published = entry.findtext(
             f"{{{ATOM_NS}}}published",
             "",
         ).strip()
 
+        # -----------------------------------------------------
+        # Updated date
+        # -----------------------------------------------------
+
         updated = entry.findtext(
             f"{{{ATOM_NS}}}updated",
             "",
         ).strip()
 
-        authors = [
-            author.findtext(
+        # -----------------------------------------------------
+        # Authors
+        # -----------------------------------------------------
+
+        authors = []
+
+        for author in entry.findall(
+            f"{{{ATOM_NS}}}author"
+        ):
+            name = author.findtext(
                 f"{{{ATOM_NS}}}name",
                 "",
             ).strip()
-            for author in entry.findall(
-                f"{{{ATOM_NS}}}author"
-            )
-        ]
+
+            if name:
+                authors.append(name)
+
+        # -----------------------------------------------------
+        # Categories
+        # -----------------------------------------------------
 
         categories = [
             category.attrib["term"]
@@ -86,32 +246,61 @@ def parse_arxiv_response(xml_text: str) -> list[ResearchPaper]:
             if "term" in category.attrib
         ]
 
+        # -----------------------------------------------------
+        # Primary category
+        # -----------------------------------------------------
+
         primary_category_element = entry.find(
-            "{http://arxiv.org/schemas/atom}primary_category"
+            f"{{{ARXIV_NS}}}primary_category"
         )
 
-        primary_category = (
-            primary_category_element.attrib["term"]
-            if primary_category_element is not None
+        primary_category = ""
+
+        if (
+            primary_category_element is not None
             and "term" in primary_category_element.attrib
-            else ""
-        )
+        ):
+            primary_category = (
+                primary_category_element.attrib[
+                    "term"
+                ]
+            )
+
+        # -----------------------------------------------------
+        # Links
+        # -----------------------------------------------------
 
         arxiv_url = ""
         pdf_url = ""
 
-        for link in entry.findall(f"{{{ATOM_NS}}}link"):
-            link_type = link.attrib.get("type")
-            link_rel = link.attrib.get("rel")
-            href = link.attrib.get("href", "")
+        for link in entry.findall(
+            f"{{{ATOM_NS}}}link"
+        ):
 
+            link_type = link.attrib.get(
+                "type"
+            )
+
+            link_rel = link.attrib.get(
+                "rel"
+            )
+
+            href = link.attrib.get(
+                "href",
+                "",
+            )
+
+            # arXiv abstract/web page
             if link_rel == "alternate":
                 arxiv_url = href
 
+            # PDF
             elif link_type == "application/pdf":
                 pdf_url = href
 
-        paper_id = entry_id.rsplit("/", 1)[-1]
+        # -----------------------------------------------------
+        # Build ResearchPaper
+        # -----------------------------------------------------
 
         paper = ResearchPaper(
             id=paper_id,
@@ -130,16 +319,41 @@ def parse_arxiv_response(xml_text: str) -> list[ResearchPaper]:
 
     return papers
 
+
+# =============================================================
+# FETCH ARXIV XML
+# =============================================================
+
 def fetch_arxiv_xml(
     search_query: str,
     start: int = 0,
     max_results: int = 20,
 ) -> str:
+    """
+    Fetch raw XML data from the arXiv API.
+    """
+
+    # ---------------------------------------------------------
+    # Validate start
+    # ---------------------------------------------------------
+
     if start < 0:
-        raise ValueError("start must be 0 or greater")
+        raise ValueError(
+            "start must be 0 or greater"
+        )
+
+    # ---------------------------------------------------------
+    # Validate max_results
+    # ---------------------------------------------------------
 
     if max_results < 1:
-        raise ValueError("max_results must be at least 1")
+        raise ValueError(
+            "max_results must be at least 1"
+        )
+
+    # ---------------------------------------------------------
+    # Request parameters
+    # ---------------------------------------------------------
 
     params = {
         "search_query": search_query,
@@ -147,9 +361,20 @@ def fetch_arxiv_xml(
         "max_results": max_results,
     }
 
+    # ---------------------------------------------------------
+    # Request headers
+    # ---------------------------------------------------------
+
     headers = {
-        "User-Agent": "SmartResearchDashboard/0.1 (research project)"
+        "User-Agent": (
+            "SmartResearchDashboard/0.1 "
+            "(research project)"
+        )
     }
+
+    # ---------------------------------------------------------
+    # API request
+    # ---------------------------------------------------------
 
     return get(
         ARXIV_API_URL,
@@ -158,24 +383,45 @@ def fetch_arxiv_xml(
         timeout=30.0,
     )
 
+
+# =============================================================
+# SEARCH ARXIV
+# =============================================================
+
 def search_arxiv(
     search_query: str,
     start: int = 0,
     max_results: int = 20,
 ) -> list[ResearchPaper]:
+    """
+    Search arXiv and return parsed research papers.
+    """
+
     xml_text = fetch_arxiv_xml(
         search_query=search_query,
         start=start,
         max_results=max_results,
     )
 
-    return parse_arxiv_response(xml_text)
+    return parse_arxiv_response(
+        xml_text
+    )
+
+
+# =============================================================
+# MAIN
+# =============================================================
 
 if __name__ == "__main__":
+
     papers = search_arxiv(
         search_query="cat:cs.AI",
         max_results=5,
     )
 
     for paper in papers:
-        print(paper.id, "-", paper.title)
+        print(
+            paper.id,
+            "-",
+            paper.title,
+        )

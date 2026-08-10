@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import logging
 
 from src.collectors.arxiv import (
@@ -31,6 +32,12 @@ class ResearchService:
         "huggingface",
     }
 
+    VALID_SORT_OPTIONS = {
+        "relevance",
+        "published",
+        "updated",
+    }
+
     def search(
         self,
         query: str,
@@ -39,19 +46,35 @@ class ResearchService:
         github_limit: int = 20,
         paperswithcode_limit: int = 20,
         huggingface_limit: int = 20,
+        sort_by: str = "relevance",
     ) -> list[ResearchItem]:
         """
         Search across the selected research sources.
 
-        Results are:
-        1. Collected from each selected source
-        2. Converted into ResearchItem objects
-        3. Deduplicated
-        4. Ranked by relevance
+        Pipeline:
+
+        1. Collect results from each selected source
+        2. Normalize results into ResearchItem objects
+        3. Deduplicate results
+        4. Rank/sort results
+        5. Return final results
+
+        sort_by options:
+            - "relevance": relevance score, highest first
+            - "published": newest publication date first
+            - "updated": most recently updated first
         """
 
         if not query.strip():
             raise ValueError("query must not be empty")
+
+        # ---------------------------------------------------------
+        # Validate sorting option
+        # ---------------------------------------------------------
+        if sort_by not in self.VALID_SORT_OPTIONS:
+            raise ValueError(
+                f"unknown sort option: {sort_by}"
+            )
 
         # ---------------------------------------------------------
         # Determine selected sources
@@ -157,15 +180,163 @@ class ResearchService:
         # ---------------------------------------------------------
         # Deduplicate
         # ---------------------------------------------------------
-        deduplicated_results = self._deduplicate_results(results)
+        deduplicated_results = self._deduplicate_results(
+            results
+        )
 
         # ---------------------------------------------------------
-        # Rank by relevance
+        # Sort / rank
         # ---------------------------------------------------------
-        return RelevanceScorer.rank(
-            query,
-            deduplicated_results,
+        if sort_by == "relevance":
+            return RelevanceScorer.rank(
+                query,
+                deduplicated_results,
+            )
+
+        if sort_by == "published":
+            return self._sort_by_date(
+                deduplicated_results,
+                field="published",
+            )
+
+        if sort_by == "updated":
+            return self._sort_by_date(
+                deduplicated_results,
+                field="updated",
+            )
+
+        raise ValueError(
+            f"unsupported sort option: {sort_by}"
         )
+
+    # =============================================================
+    # SORTING
+    # =============================================================
+
+    @staticmethod
+    def _sort_by_date(
+        results: list[ResearchItem],
+        field: str,
+    ) -> list[ResearchItem]:
+        """
+        Sort results by a date field in descending order.
+
+        Handles:
+
+        - timezone-aware datetime objects
+        - timezone-naive datetime objects
+        - ISO datetime strings
+        - ISO strings ending with Z
+        - missing dates
+        - invalid dates
+
+        All valid dates are normalized to UTC.
+
+        Missing/invalid dates are placed at the end.
+        """
+
+        def normalize_date(
+            value,
+        ) -> datetime | None:
+            # -----------------------------------------------------
+            # Missing value
+            # -----------------------------------------------------
+            if value is None:
+                return None
+
+            # -----------------------------------------------------
+            # datetime object
+            # -----------------------------------------------------
+            if isinstance(value, datetime):
+
+                # Convert naive datetime to UTC.
+                if value.tzinfo is None:
+                    return value.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                # Convert aware datetime to UTC.
+                return value.astimezone(
+                    timezone.utc
+                )
+
+            # -----------------------------------------------------
+            # String datetime
+            # -----------------------------------------------------
+            if isinstance(value, str):
+                value = value.strip()
+
+                if not value:
+                    return None
+
+                try:
+                    # Convert trailing Z into UTC offset.
+                    parsed = datetime.fromisoformat(
+                        value.replace(
+                            "Z",
+                            "+00:00",
+                        )
+                    )
+
+                except ValueError:
+                    return None
+
+                # Naive datetime string.
+                if parsed.tzinfo is None:
+                    return parsed.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                # Aware datetime string.
+                return parsed.astimezone(
+                    timezone.utc
+                )
+
+            # -----------------------------------------------------
+            # Unsupported value type
+            # -----------------------------------------------------
+            return None
+
+        dated_results: list[
+            tuple[ResearchItem, datetime]
+        ] = []
+
+        undated_results: list[ResearchItem] = []
+
+        # ---------------------------------------------------------
+        # Separate dated and undated results
+        # ---------------------------------------------------------
+        for result in results:
+            value = getattr(
+                result,
+                field,
+                None,
+            )
+
+            normalized = normalize_date(value)
+
+            if normalized is None:
+                undated_results.append(result)
+            else:
+                dated_results.append(
+                    (result, normalized)
+                )
+
+        # ---------------------------------------------------------
+        # Sort valid dates newest first
+        # ---------------------------------------------------------
+        dated_results.sort(
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        # ---------------------------------------------------------
+        # Return dated results first and undated results last
+        # ---------------------------------------------------------
+        return [
+            result
+            for result, _ in dated_results
+        ] + undated_results
 
     # =============================================================
     # DEDUPLICATION
@@ -180,6 +351,7 @@ class ResearchService:
         first occurrence.
 
         Deduplication uses:
+
         1. Cross-source research ID
         2. Normalized URL
         3. Source-specific ID
@@ -189,11 +361,14 @@ class ResearchService:
         seen_keys: set[str] = set()
 
         for result in results:
-            keys = ResearchService._deduplication_keys(result)
+            keys = ResearchService._deduplication_keys(
+                result
+            )
 
-            # If any identity key has already been seen,
-            # this result is considered a duplicate.
-            if any(key in seen_keys for key in keys):
+            if any(
+                key in seen_keys
+                for key in keys
+            ):
                 continue
 
             unique_results.append(result)
@@ -229,16 +404,22 @@ class ResearchService:
         # ---------------------------------------------------------
         # 1. Cross-source research ID
         # ---------------------------------------------------------
-        raw_id = str(result.id).strip().lower()
+        raw_id = str(
+            result.id
+        ).strip().lower()
 
         if raw_id:
             normalized_id = raw_id
 
             if normalized_id.startswith("arxiv-"):
-                normalized_id = normalized_id.removeprefix("arxiv-")
+                normalized_id = normalized_id.removeprefix(
+                    "arxiv-"
+                )
 
             if normalized_id.startswith("arxiv:"):
-                normalized_id = normalized_id.removeprefix("arxiv:")
+                normalized_id = normalized_id.removeprefix(
+                    "arxiv:"
+                )
 
             keys.add(
                 f"research-id:{normalized_id}"
@@ -247,7 +428,9 @@ class ResearchService:
         # ---------------------------------------------------------
         # 2. Normalized URL
         # ---------------------------------------------------------
-        raw_url = str(result.url).strip().lower()
+        raw_url = str(
+            result.url
+        ).strip().lower()
 
         if raw_url:
             normalized_url = raw_url.rstrip("/")
