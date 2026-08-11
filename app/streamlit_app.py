@@ -1,7 +1,8 @@
 import streamlit as st
+import requests
 
 from src.services.research import ResearchService
-from src.services.ai_research import AIResearchService
+
 
 
 # ============================================================
@@ -431,22 +432,223 @@ def display_ask_ai(result):
                         "AI is analyzing the research..."
                     ):
 
-                        ai_service = (
-                            AIResearchService()
+                        # ------------------------------------------------
+                        # Ask the local FastAPI + Ollama backend.
+                        #
+                        # Streamlit does NOT call OpenAI directly.
+                        # The backend sends the request to Ollama/Qwen.
+                        # ------------------------------------------------
+
+                        backend_url = "http://127.0.0.1:8000/ask"
+
+                        # Build the research context from the collector result.
+                        context_parts = [
+                            f"Title: {getattr(result, 'title', '')}",
+                            f"Source: {getattr(result, 'source', '')}",
+                            f"URL: {getattr(result, 'url', '')}",
+                        ]
+
+                        description = getattr(
+                            result,
+                            "description",
+                            None,
                         )
 
-                        # IMPORTANT:
-                        #
-                        # AIResearchService.ask()
-                        # requires:
-                        #
-                        #   1. ResearchItem
-                        #   2. Question
-                        #
-                        answer = ai_service.ask(
+                        if description:
+                            context_parts.append(
+                                f"Description: {description}"
+                            )
+
+                        authors = getattr(
                             result,
-                            ai_question.strip(),
+                            "authors",
+                            None,
                         )
+
+                        if authors:
+                            context_parts.append(
+                                "Authors: "
+                                + ", ".join(
+                                    str(author)
+                                    for author in authors
+                                )
+                            )
+
+                        tags = getattr(
+                            result,
+                            "tags",
+                            None,
+                        )
+
+                        if tags:
+                            context_parts.append(
+                                "Tags: "
+                                + ", ".join(
+                                    str(tag)
+                                    for tag in tags
+                                )
+                            )
+
+                        published = getattr(
+                            result,
+                            "published",
+                            None,
+                        )
+
+                        if published:
+                            context_parts.append(
+                                f"Published: {published}"
+                            )
+
+                        updated = getattr(
+                            result,
+                            "updated",
+                            None,
+                        )
+
+                        if updated:
+                            context_parts.append(
+                                f"Updated: {updated}"
+                            )
+
+                        # GitHub metadata
+                        stars = getattr(
+                            result,
+                            "stars",
+                            None,
+                        )
+
+                        if stars is not None:
+                            context_parts.append(
+                                f"GitHub stars: {stars}"
+                            )
+
+                        forks = getattr(
+                            result,
+                            "forks",
+                            None,
+                        )
+
+                        if forks is not None:
+                            context_parts.append(
+                                f"GitHub forks: {forks}"
+                            )
+
+                        language = getattr(
+                            result,
+                            "language",
+                            None,
+                        )
+
+                        if language:
+                            context_parts.append(
+                                f"Programming language: {language}"
+                            )
+
+                        # Hugging Face metadata
+                        downloads = getattr(
+                            result,
+                            "downloads",
+                            None,
+                        )
+
+                        if downloads is not None:
+                            context_parts.append(
+                                f"Downloads: {downloads}"
+                            )
+
+                        likes = getattr(
+                            result,
+                            "likes",
+                            None,
+                        )
+
+                        if likes is not None:
+                            context_parts.append(
+                                f"Likes: {likes}"
+                            )
+
+                        library = getattr(
+                            result,
+                            "library",
+                            None,
+                        )
+
+                        if library:
+                            context_parts.append(
+                                f"Library: {library}"
+                            )
+
+                        pipeline_tag = getattr(
+                            result,
+                            "pipeline_tag",
+                            None,
+                        )
+
+                        if pipeline_tag:
+                            context_parts.append(
+                                f"Pipeline tag: {pipeline_tag}"
+                            )
+
+                        # PapersWithCode metadata
+                        tasks = getattr(
+                            result,
+                            "tasks",
+                            None,
+                        )
+
+                        if tasks:
+                            context_parts.append(
+                                "Tasks: "
+                                + ", ".join(
+                                    str(task)
+                                    for task in tasks
+                                )
+                            )
+
+                        conference = getattr(
+                            result,
+                            "conference",
+                            None,
+                        )
+
+                        if conference:
+                            context_parts.append(
+                                f"Conference: {conference}"
+                            )
+
+                        research_context = "\n".join(
+                            context_parts
+                        )
+
+                        payload = {
+                            "question": ai_question.strip(),
+                            "context": research_context,
+                        }
+
+                        response = requests.post(
+                            backend_url,
+                            json=payload,
+                            timeout=180,
+                        )
+
+                        response.raise_for_status()
+
+                        data = response.json()
+
+                        # Support the common FastAPI response shapes:
+                        # {"answer": "..."} or {"response": "..."}
+                        answer = (
+                            data.get("answer")
+                            or data.get("response")
+                            or data.get("output")
+                        )
+
+                        if not answer:
+                            raise ValueError(
+                                "FastAPI returned no AI answer. "
+                                f"Response: {data}"
+                            )
 
                     st.session_state.ai_answers[
                         result_id
@@ -457,6 +659,33 @@ def display_ask_ai(result):
                         "answer":
                             answer,
                     }
+
+                except requests.exceptions.ConnectionError:
+
+                    st.error(
+                        "Could not connect to the AI backend. "
+                        "Make sure FastAPI and Ollama are running."
+                    )
+
+                except requests.exceptions.Timeout:
+
+                    st.error(
+                        "The AI request timed out. "
+                        "Qwen may still be processing the request."
+                    )
+
+                except requests.exceptions.HTTPError as exc:
+
+                    st.error(
+                        "The AI backend returned an error."
+                    )
+
+                    try:
+                        st.code(
+                            exc.response.text
+                        )
+                    except Exception:
+                        st.exception(exc)
 
                 except Exception as exc:
 
