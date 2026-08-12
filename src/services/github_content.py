@@ -20,10 +20,19 @@ class GitHubContentService:
     """
     Fetch research-related content from public GitHub repositories.
 
-    Phase 2:
-        Step 1 -> README
-        Step 2 -> Important repository files
-        Step 3 -> Compact AI-ready research context
+    Pipeline:
+
+        GitHub Repository
+              ↓
+        README extraction
+              ↓
+        Important files
+              ↓
+        Curated research context
+              ↓
+        Chunking
+              ↓
+        Embedding-based RAG
     """
 
     API_BASE_URL = "https://api.github.com"
@@ -32,18 +41,21 @@ class GitHubContentService:
     # CONTEXT LIMITS
     # =========================================================
 
-    # Target range:
-    # ~4,000 - 6,000 characters
+    # We now allow a larger context because the embedding
+    # retriever will decide which parts are actually relevant.
     #
-    # We use 6,000 as a hard maximum so the AI receives
-    # useful information without unnecessary repository noise.
-    MAX_CONTEXT_CHARS = 6000
+    # Target:
+    # approximately 8,000 - 15,000 characters
+    #
+    # Hard maximum:
+    # 18,000 characters
+    MAX_CONTEXT_CHARS = 18000
 
-    # Maximum amount of README information we want to keep.
-    MAX_README_CHARS = 4500
+    # Maximum README content we are willing to keep.
+    MAX_README_CHARS = 12000
 
-    # Maximum amount from each important configuration file.
-    MAX_FILE_CHARS = 700
+    # Maximum content from each important configuration file.
+    MAX_FILE_CHARS = 2500
 
     # =========================================================
     # GITHUB URL PARSING
@@ -53,6 +65,9 @@ class GitHubContentService:
     def _parse_github_url(
         url: str,
     ) -> tuple[str, str]:
+        """
+        Extract owner and repository from a GitHub URL.
+        """
 
         if not url:
             raise ValueError(
@@ -102,9 +117,6 @@ class GitHubContentService:
     def _headers() -> dict[str, str]:
         """
         Build headers for GitHub API requests.
-
-        If GITHUB_TOKEN is available, authenticate the
-        request to avoid the unauthenticated API rate limit.
         """
 
         headers = {
@@ -128,6 +140,9 @@ class GitHubContentService:
         cls,
         github_url: str,
     ) -> str:
+        """
+        Fetch the repository README.
+        """
 
         owner, repository = (
             cls._parse_github_url(
@@ -166,7 +181,6 @@ class GitHubContentService:
             )
 
         try:
-
             return base64.b64decode(
                 content
             ).decode(
@@ -175,7 +189,6 @@ class GitHubContentService:
             )
 
         except Exception as exc:
-
             raise ValueError(
                 "Could not decode GitHub README."
             ) from exc
@@ -244,17 +257,12 @@ class GitHubContentService:
                 f"No content returned for: {file_path}"
             )
 
-        encoding = data.get(
-            "encoding"
-        )
-
-        if encoding != "base64":
+        if data.get("encoding") != "base64":
             raise ValueError(
                 f"Unsupported encoding for: {file_path}"
             )
 
         try:
-
             return base64.b64decode(
                 content
             ).decode(
@@ -263,7 +271,6 @@ class GitHubContentService:
             )
 
         except Exception as exc:
-
             raise ValueError(
                 f"Could not decode file: {file_path}"
             ) from exc
@@ -278,8 +285,7 @@ class GitHubContentService:
         github_url: str,
     ) -> list[dict]:
         """
-        Get files and directories from the
-        repository root.
+        Get files and directories from repository root.
         """
 
         owner, repository = (
@@ -329,9 +335,7 @@ class GitHubContentService:
         github_url: str,
     ) -> list[str]:
         """
-        Identify useful files from the repository root.
-
-        We intentionally keep this limited.
+        Identify useful project/configuration files.
         """
 
         contents = (
@@ -388,7 +392,7 @@ class GitHubContentService:
         github_url: str,
     ) -> dict[str, str]:
         """
-        Fetch the contents of important repository files.
+        Fetch important configuration files.
         """
 
         files = (
@@ -411,7 +415,8 @@ class GitHubContentService:
                 results[file_path] = content
 
             except Exception:
-                # Ignore an individual file failure.
+                # One failed file should not break
+                # the entire repository analysis.
                 continue
 
         return results
@@ -425,8 +430,8 @@ class GitHubContentService:
         readme: str,
     ) -> str:
         """
-        Remove README noise that is generally not useful
-        for answering research questions.
+        Remove obvious README noise while preserving
+        useful technical information.
         """
 
         if not readme:
@@ -434,10 +439,7 @@ class GitHubContentService:
 
         text = readme
 
-        # -----------------------------------------------------
-        # Remove HTML comments
-        # -----------------------------------------------------
-
+        # Remove HTML comments.
         text = re.sub(
             r"<!--.*?-->",
             "",
@@ -445,21 +447,14 @@ class GitHubContentService:
             flags=re.DOTALL,
         )
 
-        # -----------------------------------------------------
-        # Remove HTML tags
-        # -----------------------------------------------------
-
+        # Remove HTML tags.
         text = re.sub(
             r"<[^>]+>",
             "",
             text,
         )
 
-        # -----------------------------------------------------
-        # Remove image/badge lines
-        # -----------------------------------------------------
-
-        lines = []
+        cleaned_lines = []
 
         for line in text.splitlines():
 
@@ -468,25 +463,22 @@ class GitHubContentService:
             if not stripped:
                 continue
 
-            # Skip badge/image-heavy lines.
+            # Remove badge/image-only lines.
             if (
                 stripped.startswith("[![")
                 or stripped.startswith("![")
             ):
                 continue
 
-            lines.append(
+            cleaned_lines.append(
                 line
             )
 
         text = "\n".join(
-            lines
+            cleaned_lines
         )
 
-        # -----------------------------------------------------
-        # Remove excessive blank lines
-        # -----------------------------------------------------
-
+        # Normalize excessive blank lines.
         text = re.sub(
             r"\n{3,}",
             "\n\n",
@@ -496,37 +488,23 @@ class GitHubContentService:
         return text.strip()
 
     # =========================================================
-    # EXTRACT IMPORTANT README SECTIONS
+    # EXTRACT RELEVANT README SECTIONS
     # =========================================================
-
     @classmethod
     def _extract_relevant_readme(
         cls,
         readme: str,
     ) -> str:
         """
-        Extract README sections that are most useful for
-        answering research-related questions.
+        Extract a large, useful portion of the README
+        for embedding-based RAG.
 
-        We prioritize sections describing:
-
-        - project overview
-        - architecture
-        - components
-        - features
-        - capabilities
-        - research
-        - models
-        - training
-        - usage/concepts
-
-        We intentionally avoid long installation,
-        contribution, and changelog sections.
+        We keep important technical sections while
+        avoiding administrative sections such as
+        contributing, licensing, and citations.
         """
 
-        cleaned = cls._clean_readme(
-            readme
-        )
+        cleaned = cls._clean_readme(readme)
 
         if not cleaned:
             return ""
@@ -534,7 +512,7 @@ class GitHubContentService:
         lines = cleaned.splitlines()
 
         # -----------------------------------------------------
-        # Parse markdown sections
+        # Split README into sections
         # -----------------------------------------------------
 
         sections = []
@@ -551,7 +529,9 @@ class GitHubContentService:
 
             if heading_match:
 
+                # Save previous section.
                 if current_lines:
+
                     sections.append(
                         (
                             current_title,
@@ -562,19 +542,17 @@ class GitHubContentService:
                     )
 
                 current_title = (
-                    heading_match.group(1)
-                    .strip()
+                    heading_match.group(1).strip()
                 )
 
                 current_lines = []
 
             else:
+                current_lines.append(line)
 
-                current_lines.append(
-                    line
-                )
-
+        # Save final section.
         if current_lines:
+
             sections.append(
                 (
                     current_title,
@@ -585,7 +563,7 @@ class GitHubContentService:
             )
 
         # -----------------------------------------------------
-        # Keywords we care about
+        # Keywords we consider valuable for RAG
         # -----------------------------------------------------
 
         priority_keywords = [
@@ -607,125 +585,172 @@ class GitHubContentService:
             "library",
             "design",
             "method",
+            "benchmark",
+            "memory",
+            "gpu",
+            "distributed",
+            "inference",
+            "usage",
+            "example",
+            "requirement",
+            "install",
+            "quickstart",
+            "configuration",
+            "data",
         ]
 
         excluded_keywords = [
-            "install",
-            "getting started",
             "contribut",
             "license",
-            "changelog",
-            "news",
             "citation",
             "acknowledg",
             "security",
-            "release",
         ]
 
-        selected = []
-
         # -----------------------------------------------------
-        # Select relevant sections
+        # Score sections
         # -----------------------------------------------------
 
-        for title, body in sections:
+        scored_sections = []
+
+        for index, (title, body) in enumerate(sections):
+
+            if not body:
+                continue
 
             title_lower = title.lower()
 
+            # Skip administrative sections.
             if any(
                 keyword in title_lower
                 for keyword in excluded_keywords
             ):
                 continue
 
-            score = sum(
-                1
-                for keyword in priority_keywords
-                if keyword in title_lower
+            score = 0
+
+            for keyword in priority_keywords:
+
+                if keyword in title_lower:
+                    score += 3
+
+            # Give early README sections a small bonus.
+            if index <= 2:
+                score += 2
+
+            scored_sections.append(
+                (
+                    score,
+                    index,
+                    title,
+                    body,
+                )
             )
 
-            if score > 0:
+        # -----------------------------------------------------
+        # Sort by relevance
+        # -----------------------------------------------------
+
+        scored_sections.sort(
+            key=lambda item: (
+                -item[0],
+                item[1],
+            )
+        )
+
+        # -----------------------------------------------------
+        # Select sections until README budget is reached
+        # -----------------------------------------------------
+
+        selected = []
+
+        current_length = 0
+
+        for (
+            score,
+            index,
+            title,
+            body,
+        ) in scored_sections:
+
+            section_text = (
+                f"## {title}\n"
+                f"{body}"
+            )
+
+            section_length = (
+                len(section_text) + 2
+            )
+
+            remaining = (
+                cls.MAX_README_CHARS
+                - current_length
+            )
+
+            if remaining <= 0:
+                break
+
+            if section_length <= remaining:
 
                 selected.append(
                     (
-                        score,
-                        title,
-                        body,
+                        index,
+                        section_text,
                     )
                 )
 
-        # Highest-value sections first.
-        selected.sort(
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        result_parts = []
-
-        # -----------------------------------------------------
-        # Always include the introduction if useful
-        # -----------------------------------------------------
-
-        for title, body in sections:
-
-            if title == "Introduction" and body:
-
-                result_parts.append(
-                    f"## {title}\n{body}"
+                current_length += (
+                    section_length
                 )
+
+            else:
+
+                # If there is still a reasonable amount
+                # of space, keep a partial section.
+                if remaining > 500:
+
+                    partial = section_text[
+                        :remaining
+                    ]
+
+                    # Avoid cutting in the middle of
+                    # a line where possible.
+                    partial = partial.rsplit(
+                        "\n",
+                        1,
+                    )[0]
+
+                    selected.append(
+                        (
+                            index,
+                            partial,
+                        )
+                    )
 
                 break
 
         # -----------------------------------------------------
-        # Add prioritized sections
+        # Restore original README order
         # -----------------------------------------------------
 
-        for (
-            _score,
-            title,
-            body,
-        ) in selected:
-
-            section = (
-                f"## {title}\n{body}"
-            )
-
-            # Avoid duplicates.
-            if section in result_parts:
-                continue
-
-            result_parts.append(
-                section
-            )
+        selected.sort(
+            key=lambda item: item[0]
+        )
 
         result = "\n\n".join(
-            result_parts
+            section_text
+            for _, section_text in selected
         )
 
         # -----------------------------------------------------
-        # If section parsing didn't find enough useful
-        # information, use the beginning of the README.
+        # Fallback
         # -----------------------------------------------------
 
-        if len(result.strip()) < 1000:
+        if not result.strip():
 
-            result = cleaned[:3000]
-
-        # -----------------------------------------------------
-        # Keep README portion within budget.
-        # -----------------------------------------------------
-
-        if len(result) > cls.MAX_README_CHARS:
-
-            result = (
-                result[
-                    :cls.MAX_README_CHARS
-                ]
-                .rsplit(
-                    "\n",
-                    1,
-                )[0]
-            )
+            result = cleaned[
+                :cls.MAX_README_CHARS
+            ]
 
         return result.strip()
 
@@ -738,8 +763,8 @@ class GitHubContentService:
         content: str,
     ) -> str:
         """
-        Keep useful configuration information while removing
-        excessive comments and blank lines.
+        Remove excessive blank lines and obvious comments
+        while preserving configuration/code values.
         """
 
         if not content:
@@ -754,11 +779,9 @@ class GitHubContentService:
             if not stripped:
                 continue
 
-            # Skip obvious long comment-only lines.
-            if stripped.startswith(
-                "#"
-            ):
-                continue
+            # Don't remove code comments aggressively.
+            # Configuration comments can occasionally be
+            # useful, so we preserve them.
 
             lines.append(
                 line
@@ -769,7 +792,7 @@ class GitHubContentService:
         ).strip()
 
     # =========================================================
-    # BUILD RESEARCH CONTEXT
+    # BUILD RAG CONTEXT
     # =========================================================
 
     @classmethod
@@ -778,16 +801,19 @@ class GitHubContentService:
         github_url: str,
     ) -> str:
         """
-        Build compact AI-ready research context.
-
-        The context intentionally contains only information
-        useful for answering questions about the repository.
+        Build a larger, curated research context.
 
         Target:
-            ~4,000 - 6,000 characters
+            ~8,000 - 15,000 characters
 
         Hard maximum:
-            6,000 characters
+            18,000 characters
+
+        The important idea is that this method should preserve
+        enough information for embedding-based retrieval.
+
+        We do NOT want to aggressively reduce the repository
+        to a few hundred words.
         """
 
         owner, repository = (
@@ -804,8 +830,14 @@ class GitHubContentService:
             github_url
         )
 
+        relevant_readme = (
+            cls._extract_relevant_readme(
+                readme
+            )
+        )
+
         # -----------------------------------------------------
-        # Fetch important configuration files
+        # Fetch important files
         # -----------------------------------------------------
 
         important_files = (
@@ -815,44 +847,31 @@ class GitHubContentService:
         )
 
         # -----------------------------------------------------
-        # Build compact context
+        # Build context sections
         # -----------------------------------------------------
 
-        context_parts = []
+        sections = []
 
-        # -----------------------------------------------------
-        # Repository identity
-        # -----------------------------------------------------
-
-        context_parts.append(
+        # Repository identity.
+        sections.append(
             f"GitHub Repository: "
             f"{owner}/{repository}"
         )
 
-        # -----------------------------------------------------
-        # Relevant README
-        # -----------------------------------------------------
-
-        relevant_readme = (
-            cls._extract_relevant_readme(
-                readme
-            )
-        )
-
+        # README.
         if relevant_readme:
 
-            context_parts.append(
-                "\n===== PROJECT INFORMATION =====\n"
+            sections.append(
+                "===== PROJECT INFORMATION =====\n"
                 + relevant_readme
             )
 
-        # -----------------------------------------------------
-        # Important files
-        # -----------------------------------------------------
-
+        # Important files.
         if important_files:
 
-            file_parts = []
+            file_sections = [
+                "===== IMPORTANT FILES ====="
+            ]
 
             for (
                 file_path,
@@ -868,12 +887,14 @@ class GitHubContentService:
                 if not cleaned_content:
                     continue
 
-                # Limit each configuration file.
-                if len(cleaned_content) > cls.MAX_FILE_CHARS:
+                if (
+                    len(cleaned_content)
+                    > cls.MAX_FILE_CHARS
+                ):
 
                     cleaned_content = (
                         cleaned_content[
-                            :cls.MAX_FILE_CHARS
+                            : cls.MAX_FILE_CHARS
                         ]
                         .rsplit(
                             "\n",
@@ -881,17 +902,16 @@ class GitHubContentService:
                         )[0]
                     )
 
-                file_parts.append(
-                    f"### {file_path}\n"
+                file_sections.append(
+                    f"\n### {file_path}\n"
                     f"{cleaned_content}"
                 )
 
-            if file_parts:
+            if len(file_sections) > 1:
 
-                context_parts.append(
-                    "\n===== IMPORTANT FILES =====\n"
-                    + "\n\n".join(
-                        file_parts
+                sections.append(
+                    "\n".join(
+                        file_sections
                     )
                 )
 
@@ -900,23 +920,18 @@ class GitHubContentService:
         # -----------------------------------------------------
 
         context = "\n\n".join(
-            context_parts
+            sections
         ).strip()
 
         # -----------------------------------------------------
         # FINAL SAFETY LIMIT
-        #
-        # This should rarely be reached because the README
-        # and file limits already control the size.
-        #
-        # If it is reached, cut at the last complete line.
         # -----------------------------------------------------
 
         if len(context) > cls.MAX_CONTEXT_CHARS:
 
             context = (
                 context[
-                    :cls.MAX_CONTEXT_CHARS
+                    : cls.MAX_CONTEXT_CHARS
                 ]
                 .rsplit(
                     "\n",

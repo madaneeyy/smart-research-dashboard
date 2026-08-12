@@ -14,6 +14,14 @@ except ImportError:
 
 
 # ============================================================
+# RAG IMPORTS
+# ============================================================
+
+from src.services.rag.chunker import TextChunker
+from src.services.rag.retriever import SimpleRetriever
+
+
+# ============================================================
 # CONFIGURATION
 # ============================================================
 
@@ -26,6 +34,10 @@ OLLAMA_HOST = os.getenv(
     "OLLAMA_HOST",
     "http://127.0.0.1:11434",
 )
+
+
+# Number of chunks sent to the LLM
+TOP_K = 2
 
 
 # ============================================================
@@ -137,9 +149,74 @@ def ask_ai(request: AskRequest):
             detail="Research context must not be empty.",
         )
 
-    # --------------------------------------------------------
-    # Build system prompt
-    # --------------------------------------------------------
+    # ========================================================
+    # RAG STEP 1 — CHUNK THE CONTEXT
+    # ========================================================
+
+    try:
+
+        chunks = TextChunker.chunk_text(
+            context
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to chunk research context: "
+                f"{str(e)}"
+            ),
+        )
+
+    if not chunks:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No usable research chunks were created.",
+        )
+
+    # ========================================================
+    # RAG STEP 2 — RETRIEVE RELEVANT CHUNKS
+    # ========================================================
+
+    try:
+
+        retrieved_chunks = SimpleRetriever.retrieve(
+            question=question,
+            chunks=chunks,
+            top_k=TOP_K,
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to retrieve relevant research "
+                f"chunks: {str(e)}"
+            ),
+        )
+
+    if not retrieved_chunks:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No relevant research information was found.",
+        )
+
+    # ========================================================
+    # RAG STEP 3 — BUILD RETRIEVED CONTEXT
+    # ========================================================
+
+    retrieved_context = "\n\n".join(
+        f"--- Research Chunk {i + 1} ---\n{chunk}"
+        for i, chunk in enumerate(retrieved_chunks)
+    )
+
+    # ========================================================
+    # BUILD SYSTEM PROMPT
+    # ========================================================
 
     system_prompt = f"""
 You are an AI research assistant for a research
@@ -150,64 +227,66 @@ resource provided by the application.
 
 IMPORTANT RULES:
 
-1. Answer the user's question using the research
-   information provided below.
+1. Answer the user's question using ONLY the
+   retrieved research information below.
 
-2. Do not ask the user to provide information that is
-   already present in the research context.
+2. Do not invent facts that are not supported
+   by the retrieved research information.
 
-3. Do not invent information that is not present in
-   the research context.
+3. If the retrieved information is insufficient
+   to answer the question, clearly say so.
 
-4. If the available information is insufficient to
-   answer the question, clearly say that the available
-   research information is insufficient.
+4. You may summarize, explain, organize, and
+   interpret information explicitly present
+   in the retrieved context.
 
-5. You may summarize, explain, organize, and interpret
-   information that is explicitly present in the context.
+5. Clearly distinguish facts from reasonable
+   interpretations.
 
-6. Clearly distinguish between facts explicitly stated
-   in the research information and reasonable interpretations.
+6. Do not pretend that you have read the complete
+   repository, paper, or research resource if
+   the retrieved context does not contain that
+   information.
 
-7. Do not pretend that you have read the complete paper
-   or repository if the supplied context does not contain
-   that information.
+7. Keep answers clear and reasonably concise.
 
-8. Keep answers clear and reasonably concise.
-
-9. When the context contains technical information,
+8. When technical information is present,
    explain it in simple language when appropriate.
 
-10. Focus on answering the user's actual question rather
-    than giving unrelated information.
+9. Focus directly on the user's question.
 
-The research information supplied by the application is:
+10. Prefer structured answers when they improve
+    clarity.
 
-============================================================
-RESEARCH CONTEXT
-============================================================
-
-{context}
+The following information was retrieved from
+the research resource because it is relevant
+to the user's question:
 
 ============================================================
-END RESEARCH CONTEXT
+RETRIEVED RESEARCH CONTEXT
+============================================================
+
+{retrieved_context}
+
+============================================================
+END RETRIEVED RESEARCH CONTEXT
 ============================================================
 """
 
-    # --------------------------------------------------------
-    # User prompt
-    # --------------------------------------------------------
+    # ========================================================
+    # USER PROMPT
+    # ========================================================
 
     user_prompt = f"""
-Based strictly on the research information provided above,
+Based strictly on the retrieved research information,
 answer the following question:
 
 {question}
 """
 
-    # --------------------------------------------------------
-    # Send request to Ollama
-    # --------------------------------------------------------
+    # ========================================================
+    # SEND REQUEST TO OLLAMA
+    # ========================================================
 
     try:
 
@@ -227,18 +306,18 @@ answer the following question:
             ],
 
             options={
-                # Keep the context reasonably sized for
-                # your laptop's available memory.
+
+                # Context window
                 "num_ctx": 8192,
 
-                # Keep answers reasonably concise.
+                # More deterministic answers
                 "temperature": 0.2,
+
+                # Limit response length
                 "num_predict": 450,
             },
 
-            # Keep the model loaded for a few minutes after
-            # the request so repeated questions don't require
-            # a complete reload every time.
+            # Keep model loaded for repeated questions
             keep_alive="5m",
         )
 
@@ -250,10 +329,17 @@ answer the following question:
                 "Ollama returned an empty response."
             )
 
+        # ====================================================
+        # RETURN RESPONSE
+        # ====================================================
+
         return {
             "question": question,
             "answer": answer,
             "model": OLLAMA_MODEL,
+
+            # Useful for debugging RAG
+            "chunks_retrieved": len(retrieved_chunks),
         }
 
     except Exception as e:
