@@ -23,9 +23,27 @@ class GitHubContentService:
     Phase 2:
         Step 1 -> README
         Step 2 -> Important repository files
+        Step 3 -> Compact AI-ready research context
     """
 
     API_BASE_URL = "https://api.github.com"
+
+    # =========================================================
+    # CONTEXT LIMITS
+    # =========================================================
+
+    # Target range:
+    # ~4,000 - 6,000 characters
+    #
+    # We use 6,000 as a hard maximum so the AI receives
+    # useful information without unnecessary repository noise.
+    MAX_CONTEXT_CHARS = 6000
+
+    # Maximum amount of README information we want to keep.
+    MAX_README_CHARS = 4500
+
+    # Maximum amount from each important configuration file.
+    MAX_FILE_CHARS = 700
 
     # =========================================================
     # GITHUB URL PARSING
@@ -42,7 +60,7 @@ class GitHubContentService:
             )
 
         parsed = urlparse(
-            url.strip()
+            str(url).strip()
         )
 
         if parsed.netloc.lower() not in {
@@ -174,13 +192,6 @@ class GitHubContentService:
     ) -> str:
         """
         Fetch a single file from a GitHub repository.
-
-        Example:
-
-            fetch_file(
-                url,
-                "requirements.txt"
-            )
         """
 
         owner, repository = (
@@ -218,10 +229,6 @@ class GitHubContentService:
         response.raise_for_status()
 
         data = response.json()
-
-        # -----------------------------------------------------
-        # Make sure this is a file
-        # -----------------------------------------------------
 
         if data.get("type") != "file":
             raise ValueError(
@@ -324,7 +331,7 @@ class GitHubContentService:
         """
         Identify useful files from the repository root.
 
-        We intentionally keep this limited for now.
+        We intentionally keep this limited.
         """
 
         contents = (
@@ -382,13 +389,6 @@ class GitHubContentService:
     ) -> dict[str, str]:
         """
         Fetch the contents of important repository files.
-
-        Returns:
-
-            {
-                "requirements.txt": "...",
-                "pyproject.toml": "..."
-            }
         """
 
         files = (
@@ -412,11 +412,361 @@ class GitHubContentService:
 
             except Exception:
                 # Ignore an individual file failure.
-                # The rest of the repository can
-                # still be analyzed.
                 continue
 
         return results
+
+    # =========================================================
+    # CLEAN README
+    # =========================================================
+
+    @staticmethod
+    def _clean_readme(
+        readme: str,
+    ) -> str:
+        """
+        Remove README noise that is generally not useful
+        for answering research questions.
+        """
+
+        if not readme:
+            return ""
+
+        text = readme
+
+        # -----------------------------------------------------
+        # Remove HTML comments
+        # -----------------------------------------------------
+
+        text = re.sub(
+            r"<!--.*?-->",
+            "",
+            text,
+            flags=re.DOTALL,
+        )
+
+        # -----------------------------------------------------
+        # Remove HTML tags
+        # -----------------------------------------------------
+
+        text = re.sub(
+            r"<[^>]+>",
+            "",
+            text,
+        )
+
+        # -----------------------------------------------------
+        # Remove image/badge lines
+        # -----------------------------------------------------
+
+        lines = []
+
+        for line in text.splitlines():
+
+            stripped = line.strip()
+
+            if not stripped:
+                continue
+
+            # Skip badge/image-heavy lines.
+            if (
+                stripped.startswith("[![")
+                or stripped.startswith("![")
+            ):
+                continue
+
+            lines.append(
+                line
+            )
+
+        text = "\n".join(
+            lines
+        )
+
+        # -----------------------------------------------------
+        # Remove excessive blank lines
+        # -----------------------------------------------------
+
+        text = re.sub(
+            r"\n{3,}",
+            "\n\n",
+            text,
+        )
+
+        return text.strip()
+
+    # =========================================================
+    # EXTRACT IMPORTANT README SECTIONS
+    # =========================================================
+
+    @classmethod
+    def _extract_relevant_readme(
+        cls,
+        readme: str,
+    ) -> str:
+        """
+        Extract README sections that are most useful for
+        answering research-related questions.
+
+        We prioritize sections describing:
+
+        - project overview
+        - architecture
+        - components
+        - features
+        - capabilities
+        - research
+        - models
+        - training
+        - usage/concepts
+
+        We intentionally avoid long installation,
+        contribution, and changelog sections.
+        """
+
+        cleaned = cls._clean_readme(
+            readme
+        )
+
+        if not cleaned:
+            return ""
+
+        lines = cleaned.splitlines()
+
+        # -----------------------------------------------------
+        # Parse markdown sections
+        # -----------------------------------------------------
+
+        sections = []
+
+        current_title = "Introduction"
+        current_lines = []
+
+        for line in lines:
+
+            heading_match = re.match(
+                r"^\s{0,3}#{1,6}\s+(.+?)\s*$",
+                line,
+            )
+
+            if heading_match:
+
+                if current_lines:
+                    sections.append(
+                        (
+                            current_title,
+                            "\n".join(
+                                current_lines
+                            ).strip(),
+                        )
+                    )
+
+                current_title = (
+                    heading_match.group(1)
+                    .strip()
+                )
+
+                current_lines = []
+
+            else:
+
+                current_lines.append(
+                    line
+                )
+
+        if current_lines:
+            sections.append(
+                (
+                    current_title,
+                    "\n".join(
+                        current_lines
+                    ).strip(),
+                )
+            )
+
+        # -----------------------------------------------------
+        # Keywords we care about
+        # -----------------------------------------------------
+
+        priority_keywords = [
+            "about",
+            "overview",
+            "introduction",
+            "architecture",
+            "component",
+            "feature",
+            "capabilit",
+            "model",
+            "training",
+            "transformer",
+            "research",
+            "parallel",
+            "performance",
+            "scal",
+            "framework",
+            "library",
+            "design",
+            "method",
+        ]
+
+        excluded_keywords = [
+            "install",
+            "getting started",
+            "contribut",
+            "license",
+            "changelog",
+            "news",
+            "citation",
+            "acknowledg",
+            "security",
+            "release",
+        ]
+
+        selected = []
+
+        # -----------------------------------------------------
+        # Select relevant sections
+        # -----------------------------------------------------
+
+        for title, body in sections:
+
+            title_lower = title.lower()
+
+            if any(
+                keyword in title_lower
+                for keyword in excluded_keywords
+            ):
+                continue
+
+            score = sum(
+                1
+                for keyword in priority_keywords
+                if keyword in title_lower
+            )
+
+            if score > 0:
+
+                selected.append(
+                    (
+                        score,
+                        title,
+                        body,
+                    )
+                )
+
+        # Highest-value sections first.
+        selected.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        result_parts = []
+
+        # -----------------------------------------------------
+        # Always include the introduction if useful
+        # -----------------------------------------------------
+
+        for title, body in sections:
+
+            if title == "Introduction" and body:
+
+                result_parts.append(
+                    f"## {title}\n{body}"
+                )
+
+                break
+
+        # -----------------------------------------------------
+        # Add prioritized sections
+        # -----------------------------------------------------
+
+        for (
+            _score,
+            title,
+            body,
+        ) in selected:
+
+            section = (
+                f"## {title}\n{body}"
+            )
+
+            # Avoid duplicates.
+            if section in result_parts:
+                continue
+
+            result_parts.append(
+                section
+            )
+
+        result = "\n\n".join(
+            result_parts
+        )
+
+        # -----------------------------------------------------
+        # If section parsing didn't find enough useful
+        # information, use the beginning of the README.
+        # -----------------------------------------------------
+
+        if len(result.strip()) < 1000:
+
+            result = cleaned[:3000]
+
+        # -----------------------------------------------------
+        # Keep README portion within budget.
+        # -----------------------------------------------------
+
+        if len(result) > cls.MAX_README_CHARS:
+
+            result = (
+                result[
+                    :cls.MAX_README_CHARS
+                ]
+                .rsplit(
+                    "\n",
+                    1,
+                )[0]
+            )
+
+        return result.strip()
+
+    # =========================================================
+    # CLEAN IMPORTANT FILE
+    # =========================================================
+
+    @staticmethod
+    def _clean_file_content(
+        content: str,
+    ) -> str:
+        """
+        Keep useful configuration information while removing
+        excessive comments and blank lines.
+        """
+
+        if not content:
+            return ""
+
+        lines = []
+
+        for line in content.splitlines():
+
+            stripped = line.strip()
+
+            if not stripped:
+                continue
+
+            # Skip obvious long comment-only lines.
+            if stripped.startswith(
+                "#"
+            ):
+                continue
+
+            lines.append(
+                line
+            )
+
+        return "\n".join(
+            lines
+        ).strip()
 
     # =========================================================
     # BUILD RESEARCH CONTEXT
@@ -428,13 +778,16 @@ class GitHubContentService:
         github_url: str,
     ) -> str:
         """
-        Build AI-ready research context.
+        Build compact AI-ready research context.
 
-        Includes:
+        The context intentionally contains only information
+        useful for answering questions about the repository.
 
-            1. Repository identity
-            2. README
-            3. Important configuration files
+        Target:
+            ~4,000 - 6,000 characters
+
+        Hard maximum:
+            6,000 characters
         """
 
         owner, repository = (
@@ -443,9 +796,17 @@ class GitHubContentService:
             )
         )
 
+        # -----------------------------------------------------
+        # Fetch README
+        # -----------------------------------------------------
+
         readme = cls.fetch_readme(
             github_url
         )
+
+        # -----------------------------------------------------
+        # Fetch important configuration files
+        # -----------------------------------------------------
 
         important_files = (
             cls.fetch_important_files(
@@ -453,10 +814,14 @@ class GitHubContentService:
             )
         )
 
+        # -----------------------------------------------------
+        # Build compact context
+        # -----------------------------------------------------
+
         context_parts = []
 
         # -----------------------------------------------------
-        # Repository
+        # Repository identity
         # -----------------------------------------------------
 
         context_parts.append(
@@ -465,34 +830,98 @@ class GitHubContentService:
         )
 
         # -----------------------------------------------------
-        # README
+        # Relevant README
         # -----------------------------------------------------
 
-        context_parts.append(
-            "\n===== README =====\n"
+        relevant_readme = (
+            cls._extract_relevant_readme(
+                readme
+            )
         )
 
-        context_parts.append(
-            readme
-        )
+        if relevant_readme:
+
+            context_parts.append(
+                "\n===== PROJECT INFORMATION =====\n"
+                + relevant_readme
+            )
 
         # -----------------------------------------------------
         # Important files
         # -----------------------------------------------------
 
-        for (
-            file_path,
-            content,
-        ) in important_files.items():
+        if important_files:
 
-            context_parts.append(
-                f"\n===== {file_path} =====\n"
-            )
+            file_parts = []
 
-            context_parts.append(
-                content
-            )
+            for (
+                file_path,
+                content,
+            ) in important_files.items():
 
-        return "\n".join(
+                cleaned_content = (
+                    cls._clean_file_content(
+                        content
+                    )
+                )
+
+                if not cleaned_content:
+                    continue
+
+                # Limit each configuration file.
+                if len(cleaned_content) > cls.MAX_FILE_CHARS:
+
+                    cleaned_content = (
+                        cleaned_content[
+                            :cls.MAX_FILE_CHARS
+                        ]
+                        .rsplit(
+                            "\n",
+                            1,
+                        )[0]
+                    )
+
+                file_parts.append(
+                    f"### {file_path}\n"
+                    f"{cleaned_content}"
+                )
+
+            if file_parts:
+
+                context_parts.append(
+                    "\n===== IMPORTANT FILES =====\n"
+                    + "\n\n".join(
+                        file_parts
+                    )
+                )
+
+        # -----------------------------------------------------
+        # Combine
+        # -----------------------------------------------------
+
+        context = "\n\n".join(
             context_parts
-        )
+        ).strip()
+
+        # -----------------------------------------------------
+        # FINAL SAFETY LIMIT
+        #
+        # This should rarely be reached because the README
+        # and file limits already control the size.
+        #
+        # If it is reached, cut at the last complete line.
+        # -----------------------------------------------------
+
+        if len(context) > cls.MAX_CONTEXT_CHARS:
+
+            context = (
+                context[
+                    :cls.MAX_CONTEXT_CHARS
+                ]
+                .rsplit(
+                    "\n",
+                    1,
+                )[0]
+            )
+
+        return context.strip()
