@@ -217,3 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .env
+
+# RAG / ML model cache
+src/services/rag/cache/models/
+src/services/rag/cache/*.npy
