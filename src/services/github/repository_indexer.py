@@ -1,7 +1,9 @@
 import base64
+import json
 import os
 import re
-from urllib.parse import urlparse
+import time
+from urllib.parse import quote, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -37,6 +39,24 @@ class GitHubRepositoryIndexer:
     """
 
     API_BASE_URL = "https://api.github.com"
+
+    # =========================================================
+    # PERSISTENT CACHE
+    # =========================================================
+
+    CACHE_DIR = os.path.join(
+        os.path.dirname(__file__),
+        "cache",
+        "github",
+    )
+
+    TREE_CACHE_TTL_SECONDS = int(
+        os.getenv("GITHUB_TREE_CACHE_TTL", "300")
+    )
+
+    CACHE_VERSION = 1
+
+    _session = None
 
     # =========================================================
     # LIMITS
@@ -325,6 +345,122 @@ class GitHubRepositoryIndexer:
 
         return headers
 
+    @classmethod
+    def _get_session(cls) -> requests.Session:
+        """Return a reusable HTTP session."""
+        if cls._session is None:
+            cls._session = requests.Session()
+            cls._session.headers.update(cls._headers())
+        return cls._session
+
+    @classmethod
+    def _request(cls, method: str, url: str, **kwargs):
+        """Make an authenticated GitHub API request."""
+        kwargs.setdefault("timeout", 30)
+        response = cls._get_session().request(method, url, **kwargs)
+
+        if response.status_code == 401:
+            raise RuntimeError(
+                "GitHub authentication failed. Check GITHUB_TOKEN in your .env file."
+            )
+
+        if response.status_code == 403 and "rate limit" in response.text.lower():
+            raise RuntimeError(
+                "GitHub API rate limit exceeded. Set a valid GITHUB_TOKEN in your .env file."
+            )
+
+        response.raise_for_status()
+        return response
+
+    @classmethod
+    def _tree_cache_path(cls, owner: str, repository: str) -> str:
+        """Return the persistent cache path for one repository tree."""
+        os.makedirs(cls.CACHE_DIR, exist_ok=True)
+        safe_name = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "_",
+            f"{owner}__{repository}",
+        )
+        return os.path.join(
+            cls.CACHE_DIR,
+            f"tree_{safe_name}.json",
+        )
+
+    @classmethod
+    def _load_tree_cache(cls, owner: str, repository: str):
+        """Load a recent tree cache entry, if available."""
+        path = cls._tree_cache_path(owner, repository)
+
+        if not os.path.exists(path):
+            return None
+
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                cached = json.load(file)
+
+            if cached.get("version") != cls.CACHE_VERSION:
+                return None
+
+            created_at = float(cached.get("created_at", 0))
+            if time.time() - created_at > cls.TREE_CACHE_TTL_SECONDS:
+                return None
+
+            tree = cached.get("tree")
+            if not isinstance(tree, list):
+                return None
+
+            return tree
+
+        except (OSError, ValueError, TypeError):
+            return None
+
+    @classmethod
+    def _save_tree_cache(cls, owner: str, repository: str, tree: list[dict], commit_sha: str | None = None):
+        """Persist the repository tree to disk."""
+        path = cls._tree_cache_path(owner, repository)
+        temporary_path = f"{path}.tmp"
+
+        payload = {
+            "version": cls.CACHE_VERSION,
+            "created_at": time.time(),
+            "owner": owner,
+            "repository": repository,
+            "commit_sha": commit_sha,
+            "tree": tree,
+        }
+
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False)
+            os.replace(temporary_path, path)
+        except OSError:
+            try:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+            except OSError:
+                pass
+
+    @classmethod
+    def clear_tree_cache(cls, github_url: str | None = None) -> None:
+        """Clear all tree caches or the cache for one repository."""
+        os.makedirs(cls.CACHE_DIR, exist_ok=True)
+
+        if github_url is None:
+            for filename in os.listdir(cls.CACHE_DIR):
+                if filename.startswith("tree_") and filename.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(cls.CACHE_DIR, filename))
+                    except OSError:
+                        pass
+            return
+
+        owner, repository = cls._parse_github_url(github_url)
+        path = cls._tree_cache_path(owner, repository)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
     # =========================================================
     # PARSE GITHUB URL
     # =========================================================
@@ -387,100 +523,66 @@ class GitHubRepositoryIndexer:
     ) -> list[dict]:
         """
         Fetch the complete recursive repository tree.
+
+        The recursive tree is persisted on disk for
+        ``TREE_CACHE_TTL_SECONDS`` (5 minutes by default), so repeated
+        runs do not repeatedly hit the expensive Git tree endpoint.
         """
 
-        owner, repository = (
-            cls._parse_github_url(
-                github_url
-            )
-        )
+        owner, repository = cls._parse_github_url(github_url)
 
-        # -----------------------------------------------------
-        # Repository metadata
-        # -----------------------------------------------------
+        cached_tree = cls._load_tree_cache(owner, repository)
+        if cached_tree is not None:
+            print(f"Tree cache hit: {owner}/{repository}")
+            return cached_tree
 
-        repo_url = (
-            f"{cls.API_BASE_URL}"
-            f"/repos/{owner}/{repository}"
-        )
+        print(f"Fetching repository tree: {owner}/{repository}")
 
-        response = requests.get(
-            repo_url,
-            headers=cls._headers(),
-            timeout=30,
-        )
-
-        response.raise_for_status()
-
+        repo_url = f"{cls.API_BASE_URL}/repos/{owner}/{repository}"
+        response = cls._request("GET", repo_url, timeout=30)
         repo_data = response.json()
 
-        default_branch = repo_data.get(
-            "default_branch"
-        )
-
+        default_branch = repo_data.get("default_branch")
         if not default_branch:
-            raise ValueError(
-                "Could not determine repository default branch."
-            )
+            raise ValueError("Could not determine repository default branch.")
 
-        # -----------------------------------------------------
-        # Branch reference
-        # -----------------------------------------------------
-
+        encoded_branch = quote(default_branch, safe="")
         ref_url = (
-            f"{cls.API_BASE_URL}"
-            f"/repos/{owner}/{repository}"
-            f"/git/ref/heads/{default_branch}"
+            f"{cls.API_BASE_URL}/repos/{owner}/{repository}"
+            f"/git/ref/heads/{encoded_branch}"
         )
 
-        response = requests.get(
-            ref_url,
-            headers=cls._headers(),
-            timeout=30,
-        )
-
-        response.raise_for_status()
-
+        response = cls._request("GET", ref_url, timeout=30)
         ref_data = response.json()
-
-        commit_sha = (
-            ref_data
-            .get("object", {})
-            .get("sha")
-        )
+        commit_sha = ref_data.get("object", {}).get("sha")
 
         if not commit_sha:
-            raise ValueError(
-                "Could not determine repository commit."
-            )
-
-        # -----------------------------------------------------
-        # Recursive Git tree
-        # -----------------------------------------------------
+            raise ValueError("Could not determine repository commit.")
 
         tree_url = (
-            f"{cls.API_BASE_URL}"
-            f"/repos/{owner}/{repository}"
+            f"{cls.API_BASE_URL}/repos/{owner}/{repository}"
             f"/git/trees/{commit_sha}"
         )
 
-        response = requests.get(
+        response = cls._request(
+            "GET",
             tree_url,
-            headers=cls._headers(),
-            params={
-                "recursive": "1"
-            },
+            params={"recursive": "1"},
             timeout=60,
         )
 
-        response.raise_for_status()
-
         data = response.json()
+        tree = data.get("tree", [])
 
-        return data.get(
-            "tree",
-            []
+        cls._save_tree_cache(
+            owner,
+            repository,
+            tree,
+            commit_sha=commit_sha,
         )
+
+        print(f"Tree cached: {len(tree)} entries")
+        return tree
 
     # =========================================================
     # FILE EXTENSION
@@ -1332,13 +1434,11 @@ class GitHubRepositoryIndexer:
             f"/contents/{path}"
         )
 
-        response = requests.get(
+        response = cls._request(
+            "GET",
             url,
-            headers=cls._headers(),
             timeout=30,
         )
-
-        response.raise_for_status()
 
         data = response.json()
 
@@ -1448,3 +1548,60 @@ class GitHubRepositoryIndexer:
             )
 
         return documents
+    
+    @classmethod
+    def fetch_file_content(cls, file):
+        """
+        Fetch the actual content of a GitHub file using
+        the GitHub Blob API.
+
+        The `file` dictionary is expected to contain:
+        - path
+        - sha
+        - url
+        """
+
+        url = file.get("url")
+
+        if not url:
+            return ""
+
+        try:
+            response = cls._request(
+                "GET",
+                url,
+                timeout=30,
+            )
+
+            data = response.json()
+
+            encoded_content = data.get("content")
+
+            if not encoded_content:
+                return ""
+
+            # GitHub sometimes inserts newlines into base64
+            encoded_content = encoded_content.replace("\n", "")
+
+            decoded_content = base64.b64decode(
+                encoded_content
+            )
+
+            return decoded_content.decode(
+                "utf-8",
+                errors="replace",
+            )
+
+        except requests.RequestException as exc:
+            print(
+                f"Failed to fetch {file.get('path', 'unknown')}: "
+                f"{exc}"
+            )
+            return ""
+
+        except (ValueError, UnicodeDecodeError) as exc:
+            print(
+                f"Failed to decode {file.get('path', 'unknown')}: "
+                f"{exc}"
+            )
+            return ""
