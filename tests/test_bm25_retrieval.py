@@ -10,8 +10,8 @@ from src.services.rag.chunker import (
     DocumentChunker,
 )
 
-from src.services.rag.retriever import (
-    SimpleRetriever,
+from src.services.rag.bm25_retriever import (
+    BM25Retriever,
 )
 
 
@@ -21,7 +21,7 @@ REPOSITORY_URL = (
 
 
 print("=" * 70)
-print("SEMANTIC RETRIEVAL TEST")
+print("BM25 RETRIEVAL TEST")
 print("=" * 70)
 
 
@@ -56,12 +56,11 @@ print(
 
 
 # ============================================================
-# 3. Create improved semantic chunks
+# 3. Create semantic chunks
 # ============================================================
 
-print("\n[3/4] Creating semantic chunks...")
+print("\n[3/4] Creating chunks...")
 
-# DocumentChunker is an instance-based class.
 chunker = DocumentChunker()
 
 chunks = chunker.chunk_documents(
@@ -74,75 +73,21 @@ print(
 
 
 # ============================================================
-# Inspect chunk structure
+# 4. Initialize BM25
 # ============================================================
 
-if chunks:
+print("\n[4/4] Initializing BM25 retriever...")
 
-    print("\n" + "-" * 70)
-    print("CHUNK STRUCTURE CHECK")
-    print("-" * 70)
+retriever = BM25Retriever(
+    chunks
+)
 
-    sample_chunk = chunks[0]
-
-    # --------------------------------------------------------
-    # Available fields
-    # --------------------------------------------------------
-
-    print("\nAvailable fields:")
-
-    for key in sample_chunk.keys():
-        print(f"  - {key}")
-
-    # --------------------------------------------------------
-    # Metadata
-    # --------------------------------------------------------
-
-    print("\nSample chunk metadata:")
-
-    metadata_fields = [
-        "path",
-        "category",
-        "section",
-        "chunk_index",
-        "chunk_type",
-        "symbol",
-        "language",
-    ]
-
-    for field in metadata_fields:
-
-        if field in sample_chunk:
-
-            print(
-                f"{field}: "
-                f"{sample_chunk.get(field)}"
-            )
-
-    # --------------------------------------------------------
-    # Content
-    # --------------------------------------------------------
-
-    print("\nSample content:\n")
-
-    print(
-        sample_chunk.get(
-            "content",
-            "",
-        )[:1000]
-    )
-
-else:
-
-    print("\nWARNING: No chunks were created.")
+print("BM25 retriever ready.")
 
 
 # ============================================================
-# 4. Test semantic retrieval
+# Queries
 # ============================================================
-
-print("\n[4/4] Testing semantic retrieval...")
-
 
 queries = [
     "linear regression",
@@ -153,6 +98,10 @@ queries = [
 ]
 
 
+# ============================================================
+# Run BM25 retrieval
+# ============================================================
+
 for query in queries:
 
     print("\n")
@@ -160,20 +109,17 @@ for query in queries:
     print(f"QUERY: {query}")
     print("=" * 70)
 
-    results = SimpleRetriever.retrieve(
+    results = retriever.retrieve(
         query,
-        chunks,
         top_k=5,
     )
 
     if not results:
 
         print("\nNo results found.")
+
         continue
 
-    # ========================================================
-    # Display retrieved results
-    # ========================================================
 
     for i, result in enumerate(
         results,
@@ -185,18 +131,21 @@ for query in queries:
         )
 
         # ----------------------------------------------------
-        # Similarity
+        # BM25 score
         # ----------------------------------------------------
 
-        similarity = result.get(
-            "similarity",
-            0.0,
+        score = result.get(
+            "bm25_score",
+            result.get(
+                "score",
+                0.0,
+            ),
         )
 
         print(
-            "Similarity:",
+            "BM25 Score:",
             round(
-                similarity,
+                score,
                 4,
             ),
         )
@@ -285,11 +234,7 @@ for query in queries:
         )
 
 
-# ============================================================
-# Test complete
-# ============================================================
-
 print("\n")
 print("=" * 70)
-print("SEMANTIC RETRIEVAL TEST COMPLETE")
+print("BM25 RETRIEVAL TEST COMPLETE")
 print("=" * 70)
