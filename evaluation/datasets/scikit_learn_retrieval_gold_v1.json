@@ -1,0 +1,407 @@
+{
+  "dataset_name": "scikit_learn_retrieval_gold_v1",
+  "repository": "https://github.com/scikit-learn/scikit-learn.git",
+  "purpose": "Repository-grounded retrieval evaluation. Gold relevance is defined by human-readable section/content anchors from the supplied scikit-learn JSON documents, not by the retriever's own ranking.",
+  "relevance_scale": {
+    "3": "Direct evidence that answers the query.",
+    "2": "Useful supporting evidence needed or strongly helpful for the answer.",
+    "1": "Related context but insufficient to answer the query alone.",
+    "0": "Not relevant."
+  },
+  "important_note": "Gold targets use path + section/anchor text rather than fixed chunk_index. The evaluator should resolve these anchors against the chunks produced by the current DocumentChunker, making the gold set less brittle if chunk boundaries change.",
+  "queries": [
+    {
+      "id": "sk_001",
+      "query": "linear regression",
+      "type": "exact_technical",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Ordinary Least Squares",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_002",
+      "query": "How does ordinary least squares regression work?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Ordinary Least Squares",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Ordinary Least Squares Complexity",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_003",
+      "query": "Why does Ridge regression use regularization?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Ridge regression and classification",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Setting the regularization parameter: leave-one-out Cross-Validation",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_004",
+      "query": "What does the alpha parameter do in Ridge regression?",
+      "type": "exact_conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Ridge regression and classification",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Setting the regularization parameter: leave-one-out Cross-Validation",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_005",
+      "query": "How does Ridge choose its solver?",
+      "type": "procedural",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Ridge regression and classification",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_006",
+      "query": "How does Lasso regression work?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Lasso",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Coordinate Descent with Gap Safe Screening Rules",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_007",
+      "query": "How does Lasso select sparse features?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Lasso",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Coordinate Descent with Gap Safe Screening Rules",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_008",
+      "query": "logistic regression implementation",
+      "type": "exact_technical",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Logistic regression",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_009",
+      "query": "How does logistic regression work for binary classification?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Logistic regression",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Binary Case",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_010",
+      "query": "How does logistic regression handle multiclass classification?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Multinomial Case",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Logistic regression",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_011",
+      "query": "Which solver should I use for LogisticRegression?",
+      "type": "procedural",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Solvers",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Logistic regression",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_012",
+      "query": "Which LogisticRegression solver is best for large datasets?",
+      "type": "procedural",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Solvers",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_013",
+      "query": "Does LogisticRegression require scaled features?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Solvers",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_014",
+      "query": "What scoring function should I use to evaluate a model?",
+      "type": "procedural",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Which scoring function should I use?",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "The ``scoring`` parameter: defining model evaluation rules",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_015",
+      "query": "How do I use multiple metrics to evaluate a model?",
+      "type": "procedural",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Using multiple metric evaluation",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Scoring API overview",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_016",
+      "query": "What is the difference between precision recall and F-measure?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Precision, recall and F-measures",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Classification metrics",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_017",
+      "query": "How do I evaluate a binary classifier using ROC?",
+      "type": "procedural",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Receiver operating characteristic (ROC)",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Classification metrics",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_018",
+      "query": "What is log loss and when is it useful?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Log loss",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Classification metrics",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_019",
+      "query": "What is R2 score used for?",
+      "type": "exact_conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "R² score, the coefficient of determination",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Regression metrics",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_020",
+      "query": "What is the difference between mean absolute error and mean squared error?",
+      "type": "conceptual",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Mean absolute error",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Mean squared error",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Regression metrics",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_021",
+      "query": "How should I choose a regression metric?",
+      "type": "procedural",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Regression metrics",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Which scoring function should I use?",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_022",
+      "query": "How does cross-validation help choose a Ridge regularization parameter?",
+      "type": "complementary",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Ridge regression and classification",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Setting the regularization parameter: leave-one-out Cross-Validation",
+          "relevance": 3
+        }
+      ]
+    },
+    {
+      "id": "sk_023",
+      "query": "Which logistic regression solver should I choose if my dataset is poorly scaled?",
+      "type": "complementary",
+      "gold": [
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Solvers",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/linear_model.rst",
+          "anchor": "Logistic regression",
+          "relevance": 2
+        }
+      ]
+    },
+    {
+      "id": "sk_024",
+      "query": "How can I evaluate a classifier using several complementary metrics?",
+      "type": "complementary",
+      "gold": [
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Using multiple metric evaluation",
+          "relevance": 3
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Precision, recall and F-measures",
+          "relevance": 2
+        },
+        {
+          "path": "doc/modules/model_evaluation.rst",
+          "anchor": "Receiver operating characteristic (ROC)",
+          "relevance": 2
+        }
+      ]
+    }
+  ]
+}
