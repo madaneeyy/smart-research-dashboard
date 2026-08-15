@@ -395,31 +395,32 @@ def display_ask_ai(result):
     """
     Display the Ask AI interface for a research result.
 
-    Phase 2:
-    - Builds the existing metadata context.
-    - If the result is from GitHub, also fetches:
-        * README
-        * Important repository files
-    - Sends the combined context to the local
-      FastAPI + Ollama backend.
+    The frontend sends the research resource context to the FastAPI
+    backend. The backend is responsible for:
+
+        TextChunker
+            -> HybridRetriever
+            -> relevance/query-aware reranking
+            -> complementarity-aware selection
+            -> Qwen via Ollama
+
+    The frontend only displays the answer and the retrieved evidence.
     """
 
     result_id = str(result.id)
 
-    with st.expander(
-        "🤖 Ask AI about this result"
-    ):
+    with st.expander("🤖 Ask AI about this result"):
 
         st.caption(
-            "Ask questions about this research "
-            "resource using the available metadata "
-            "and repository information."
+            "Ask questions about this research resource. "
+            "The AI uses the research content retrieved for this result "
+            "and the Hybrid RAG backend."
         )
 
         ai_question = st.text_input(
             "Your question",
             placeholder=(
-                "e.g. What is this research about?"
+                "e.g. How does this approach work?"
             ),
             key=f"ai_question_{result_id}",
         )
@@ -433,45 +434,31 @@ def display_ask_ai(result):
         if ask_button:
 
             if not ai_question.strip():
-
-                st.warning(
-                    "Please enter a question."
-                )
+                st.warning("Please enter a question.")
 
             else:
 
                 try:
 
                     with st.spinner(
-                        "AI is analyzing the research..."
+                        "AI is retrieving relevant evidence and asking Qwen..."
                     ):
 
                         # =================================================
                         # FASTAPI BACKEND
                         # =================================================
 
-                        backend_url = (
-                            "http://127.0.0.1:8000/ask"
-                        )
+                        backend_url = "http://127.0.0.1:8000/ask"
 
                         # =================================================
                         # BUILD BASIC RESEARCH CONTEXT
                         # =================================================
 
                         context_parts = [
-                            f"Title: "
-                            f"{getattr(result, 'title', '')}",
-
-                            f"Source: "
-                            f"{getattr(result, 'source', '')}",
-
-                            f"URL: "
-                            f"{getattr(result, 'url', '')}",
+                            f"Title: {getattr(result, 'title', '')}",
+                            f"Source: {getattr(result, 'source', '')}",
+                            f"URL: {getattr(result, 'url', '')}",
                         ]
-
-                        # -------------------------------------------------
-                        # Description
-                        # -------------------------------------------------
 
                         description = getattr(
                             result,
@@ -480,15 +467,9 @@ def display_ask_ai(result):
                         )
 
                         if description:
-
                             context_parts.append(
-                                f"Description: "
-                                f"{description}"
+                                f"Description: {description}"
                             )
-
-                        # -------------------------------------------------
-                        # Authors
-                        # -------------------------------------------------
 
                         authors = getattr(
                             result,
@@ -497,7 +478,6 @@ def display_ask_ai(result):
                         )
 
                         if authors:
-
                             context_parts.append(
                                 "Authors: "
                                 + ", ".join(
@@ -506,10 +486,6 @@ def display_ask_ai(result):
                                 )
                             )
 
-                        # -------------------------------------------------
-                        # Tags
-                        # -------------------------------------------------
-
                         tags = getattr(
                             result,
                             "tags",
@@ -517,7 +493,6 @@ def display_ask_ai(result):
                         )
 
                         if tags:
-
                             context_parts.append(
                                 "Tags: "
                                 + ", ".join(
@@ -526,10 +501,6 @@ def display_ask_ai(result):
                                 )
                             )
 
-                        # -------------------------------------------------
-                        # Published
-                        # -------------------------------------------------
-
                         published = getattr(
                             result,
                             "published",
@@ -537,15 +508,9 @@ def display_ask_ai(result):
                         )
 
                         if published:
-
                             context_parts.append(
-                                f"Published: "
-                                f"{published}"
+                                f"Published: {published}"
                             )
-
-                        # -------------------------------------------------
-                        # Updated
-                        # -------------------------------------------------
 
                         updated = getattr(
                             result,
@@ -554,10 +519,8 @@ def display_ask_ai(result):
                         )
 
                         if updated:
-
                             context_parts.append(
-                                f"Updated: "
-                                f"{updated}"
+                                f"Updated: {updated}"
                             )
 
                         # =================================================
@@ -571,10 +534,8 @@ def display_ask_ai(result):
                         )
 
                         if stars is not None:
-
                             context_parts.append(
-                                f"GitHub stars: "
-                                f"{stars}"
+                                f"GitHub stars: {stars}"
                             )
 
                         forks = getattr(
@@ -584,10 +545,8 @@ def display_ask_ai(result):
                         )
 
                         if forks is not None:
-
                             context_parts.append(
-                                f"GitHub forks: "
-                                f"{forks}"
+                                f"GitHub forks: {forks}"
                             )
 
                         language = getattr(
@@ -597,10 +556,8 @@ def display_ask_ai(result):
                         )
 
                         if language:
-
                             context_parts.append(
-                                f"Programming language: "
-                                f"{language}"
+                                f"Programming language: {language}"
                             )
 
                         # =================================================
@@ -614,10 +571,8 @@ def display_ask_ai(result):
                         )
 
                         if downloads is not None:
-
                             context_parts.append(
-                                f"Downloads: "
-                                f"{downloads}"
+                                f"Downloads: {downloads}"
                             )
 
                         likes = getattr(
@@ -627,10 +582,8 @@ def display_ask_ai(result):
                         )
 
                         if likes is not None:
-
                             context_parts.append(
-                                f"Likes: "
-                                f"{likes}"
+                                f"Likes: {likes}"
                             )
 
                         library = getattr(
@@ -640,10 +593,8 @@ def display_ask_ai(result):
                         )
 
                         if library:
-
                             context_parts.append(
-                                f"Library: "
-                                f"{library}"
+                                f"Library: {library}"
                             )
 
                         pipeline_tag = getattr(
@@ -653,10 +604,8 @@ def display_ask_ai(result):
                         )
 
                         if pipeline_tag:
-
                             context_parts.append(
-                                f"Pipeline tag: "
-                                f"{pipeline_tag}"
+                                f"Pipeline tag: {pipeline_tag}"
                             )
 
                         # =================================================
@@ -670,7 +619,6 @@ def display_ask_ai(result):
                         )
 
                         if tasks:
-
                             context_parts.append(
                                 "Tasks: "
                                 + ", ".join(
@@ -686,10 +634,8 @@ def display_ask_ai(result):
                         )
 
                         if conference:
-
                             context_parts.append(
-                                f"Conference: "
-                                f"{conference}"
+                                f"Conference: {conference}"
                             )
 
                         # =================================================
@@ -701,41 +647,33 @@ def display_ask_ai(result):
                         )
 
                         # =================================================
-                        # PHASE 2 - GITHUB CONTEXT
+                        # GITHUB REPOSITORY CONTEXT
                         # =================================================
 
-                        source = (
-                            str(
-                                getattr(
-                                    result,
-                                    "source",
-                                    "",
-                                )
+                        source = str(
+                            getattr(
+                                result,
+                                "source",
+                                "",
                             )
-                            .strip()
-                            .lower()
-                        )
+                            or ""
+                        ).strip().lower()
 
                         github_url = getattr(
                             result,
                             "url",
                             None,
                         )
-                        
-                        if github_url:
-                            github_url = str(
-                                github_url)
-                            
 
-                        if (
-                            source == "github"
-                            and github_url
-                        ):
+                        if github_url:
+                            github_url = str(github_url).strip()
+
+                        if source == "github" and github_url:
 
                             try:
 
                                 with st.spinner(
-                                    "Reading GitHub repository..."
+                                    "Reading GitHub repository content..."
                                 ):
 
                                     github_context = (
@@ -745,38 +683,67 @@ def display_ask_ai(result):
                                         )
                                     )
 
-                                research_context = (
-                                    research_context
-                                    + "\n\n"
-                                    + "==================================================\n"
-                                    + "GITHUB REPOSITORY CONTENT\n"
-                                    + "==================================================\n\n"
-                                    + github_context
-                                )
+                                if github_context:
+                                    research_context = (
+                                        research_context
+                                        + "\n\n"
+                                        + "==================================================\n"
+                                        + "GITHUB REPOSITORY CONTENT\n"
+                                        + "==================================================\n\n"
+                                        + str(github_context)
+                                    )
 
                             except Exception as github_error:
 
                                 st.warning(
-                                    "Could not fetch additional "
-                                    "GitHub repository content. "
-                                    "The AI will answer using "
-                                    "the available research metadata."
+                                    "Could not fetch additional GitHub "
+                                    "repository content. The AI will answer "
+                                    "using the available research metadata."
                                 )
 
                                 st.caption(
-                                    f"GitHub error: "
-                                    f"{github_error}"
+                                    f"GitHub error: {github_error}"
                                 )
+
+                        # =================================================
+                        # CONVERSATION HISTORY
+                        # =================================================
+
+                        previous = st.session_state.ai_answers.get(
+                            result_id,
+                            {},
+                        )
+
+                        history = []
+
+                        previous_question = previous.get("question")
+                        previous_answer = previous.get("answer")
+
+                        if previous_question:
+                            history.append(
+                                {
+                                    "role": "user",
+                                    "content": previous_question,
+                                }
+                            )
+
+                        if previous_answer:
+                            history.append(
+                                {
+                                    "role": "assistant",
+                                    "content": previous_answer,
+                                }
+                            )
 
                         # =================================================
                         # BUILD FASTAPI REQUEST
                         # =================================================
 
                         payload = {
-                            "question": (
-                                ai_question.strip()
-                            ),
+                            "question": ai_question.strip(),
                             "context": research_context,
+                            "history": history,
+                            "top_k": 5,
                         }
 
                         # =================================================
@@ -804,24 +771,32 @@ def display_ask_ai(result):
                         )
 
                         if not answer:
-
                             raise ValueError(
                                 "FastAPI returned no AI answer. "
                                 f"Response: {data}"
                             )
 
                     # =====================================================
-                    # SAVE ANSWER
+                    # SAVE COMPLETE AI RESPONSE
                     # =====================================================
 
-                    st.session_state.ai_answers[
-                        result_id
-                    ] = {
-                        "question":
-                            ai_question.strip(),
-
-                        "answer":
-                            answer,
+                    st.session_state.ai_answers[result_id] = {
+                        "question": ai_question.strip(),
+                        "answer": answer,
+                        "sources": data.get("sources", []),
+                        "retrieval": data.get("retrieval", {}),
+                        "chunks_created": data.get(
+                            "chunks_created",
+                            0,
+                        ),
+                        "chunks_retrieved": data.get(
+                            "chunks_retrieved",
+                            0,
+                        ),
+                        "model": data.get(
+                            "model",
+                            "",
+                        ),
                     }
 
                 # =========================================================
@@ -850,8 +825,8 @@ def display_ask_ai(result):
                     )
 
                     st.info(
-                        "Qwen may still be processing the "
-                        "request. Try again if necessary."
+                        "Qwen may still be processing the request. "
+                        "Try again if necessary."
                     )
 
                 # =========================================================
@@ -865,14 +840,13 @@ def display_ask_ai(result):
                     )
 
                     try:
-
-                        st.code(
-                            exc.response.text
-                        )
-
+                        error_data = exc.response.json()
+                        st.json(error_data)
                     except Exception:
-
-                        st.exception(exc)
+                        try:
+                            st.code(exc.response.text)
+                        except Exception:
+                            st.exception(exc)
 
                 # =========================================================
                 # OTHER ERROR
@@ -890,24 +864,147 @@ def display_ask_ai(result):
         # DISPLAY PREVIOUS ANSWER
         # ================================================================
 
-        if (
+        previous_answer = st.session_state.ai_answers.get(
             result_id
-            in st.session_state.ai_answers
-        ):
+        )
 
-            previous_answer = (
-                st.session_state.ai_answers[
-                    result_id
-                ]
-            )
+        if previous_answer:
 
-            st.markdown(
-                "### 🤖 AI Answer"
-            )
+            st.markdown("### 🤖 AI Answer")
 
             st.markdown(
                 previous_answer["answer"]
             )
+
+            # ------------------------------------------------------------
+            # MODEL / RETRIEVAL SUMMARY
+            # ------------------------------------------------------------
+
+            model = previous_answer.get("model")
+            chunks_created = previous_answer.get(
+                "chunks_created",
+                0,
+            )
+            chunks_retrieved = previous_answer.get(
+                "chunks_retrieved",
+                0,
+            )
+
+            summary_parts = []
+
+            if model:
+                summary_parts.append(
+                    f"Model: `{model}`"
+                )
+
+            if chunks_created:
+                summary_parts.append(
+                    f"Chunks indexed: {chunks_created}"
+                )
+
+            if chunks_retrieved:
+                summary_parts.append(
+                    f"Evidence retrieved: {chunks_retrieved}"
+                )
+
+            if summary_parts:
+                st.caption(
+                    " • ".join(summary_parts)
+                )
+
+            # ------------------------------------------------------------
+            # RETRIEVED EVIDENCE
+            # ------------------------------------------------------------
+
+            sources = previous_answer.get(
+                "sources",
+                [],
+            )
+
+            if sources:
+
+                with st.expander(
+                    f"📚 Retrieved evidence ({len(sources)} chunks)"
+                ):
+
+                    for index, source_info in enumerate(
+                        sources,
+                        start=1,
+                    ):
+
+                        source_path = (
+                            source_info.get("source")
+                            or "Unknown source"
+                        )
+
+                        section = (
+                            source_info.get("section")
+                            or "Unknown section"
+                        )
+
+                        st.markdown(
+                            f"**Evidence {index}**"
+                        )
+
+                        st.caption(
+                            f"Source: {source_path}  •  "
+                            f"Section: {section}"
+                        )
+
+                        content = source_info.get(
+                            "content",
+                            "",
+                        )
+
+                        if content:
+                            st.code(
+                                content,
+                                language="text",
+                            )
+
+                        # Useful diagnostics while we validate the
+                        # production RAG integration.
+                        diagnostic_columns = st.columns(4)
+
+                        with diagnostic_columns[0]:
+                            score = source_info.get(
+                                "query_relevance_score"
+                            )
+                            if score is not None:
+                                st.caption(
+                                    f"Relevance: {score:.3f}"
+                                )
+
+                        with diagnostic_columns[1]:
+                            score = source_info.get(
+                                "semantic_score"
+                            )
+                            if score is not None:
+                                st.caption(
+                                    f"Semantic: {score:.3f}"
+                                )
+
+                        with diagnostic_columns[2]:
+                            score = source_info.get(
+                                "mmr_score"
+                            )
+                            if score is not None:
+                                st.caption(
+                                    f"MMR: {score:.3f}"
+                                )
+
+                        with diagnostic_columns[3]:
+                            score = source_info.get(
+                                "complementarity_score"
+                            )
+                            if score is not None:
+                                st.caption(
+                                    f"Complementarity: {score:.3f}"
+                                )
+
+                        if index < len(sources):
+                            st.divider()
+
 
 # ============================================================
 # RESULT CARD
