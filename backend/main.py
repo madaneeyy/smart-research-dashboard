@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import ollama
@@ -21,6 +22,7 @@ except ImportError:
 
 from src.services.rag.chunker import DocumentChunker
 from src.services.rag.hybrid_retriever import HybridRetriever
+from src.services.github_content import GitHubContentService
 
 
 # ============================================================
@@ -91,7 +93,7 @@ ollama_client = ollama.Client(host=OLLAMA_HOST)
 app = FastAPI(
     title="Smart Research AI API",
     description="Structure-aware RAG with HybridRetriever and Qwen.",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 
@@ -132,10 +134,25 @@ class AskRequest(BaseModel):
         description="Question asked by the user.",
     )
 
-    context: str = Field(
-        ...,
-        min_length=1,
-        description="Research/repository content to retrieve from.",
+    # New preferred input for GitHub chat.
+    # When provided, the backend fetches and prepares repository context
+    # through GitHubContentService instead of requiring the frontend to
+    # construct the context itself.
+    github_url: Optional[str] = Field(
+        default=None,
+        description="GitHub repository URL to research.",
+    )
+
+    branch: Optional[str] = Field(
+        default=None,
+        description="Optional Git branch. Uses the repository default branch when omitted.",
+    )
+
+    # Backward-compatible path: an already-built research/repository context
+    # can still be supplied by existing callers.
+    context: Optional[str] = Field(
+        default=None,
+        description="Optional pre-built research/repository context.",
     )
 
     history: List[Dict[str, str]] = Field(
@@ -149,15 +166,120 @@ class AskRequest(BaseModel):
         le=10,
     )
 
-    # Optional metadata from the frontend. These allow the backend
-    # to preserve meaningful source information in chunk metadata.
+    # Optional metadata for callers that already have a single source.
     source_path: Optional[str] = None
     source_category: Optional[str] = None
+
 
 
 # ============================================================
 # HELPERS
 # ============================================================
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 2)
+
+
+def _ollama_stat(response: Any, name: str) -> Optional[float]:
+    value = getattr(response, name, None)
+    if value is None and isinstance(response, dict):
+        value = response.get(name)
+    if value is None:
+        return None
+    try:
+        return round(float(value) / 1_000_000, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_github_documents(
+    github_url: str,
+    question: str,
+    branch: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build structured GitHub documents for the RAG pipeline.
+
+    IMPORTANT:
+    GitHubContentService must expose build_documents_for_query().
+    This keeps repository discovery/file ranking in the GitHub service
+    while allowing the backend to chunk each selected file separately.
+    """
+    try:
+        builder = getattr(
+            GitHubContentService,
+            "build_documents_for_query",
+            None,
+        )
+
+        if not callable(builder):
+            raise RuntimeError(
+                "GitHubContentService.build_documents_for_query() "
+                "is missing. Add the query-aware document builder to "
+                "src/services/github_content.py before starting the backend."
+            )
+
+        documents = builder(
+            github_url=github_url,
+            query=question,
+            branch=branch,
+        )
+
+        if not isinstance(documents, list):
+            raise TypeError(
+                "build_documents_for_query() must return a list of documents."
+            )
+
+        cleaned: List[Dict[str, Any]] = []
+
+        for document in documents:
+            if not isinstance(document, dict):
+                continue
+
+            content = str(
+                document.get("content") or ""
+            ).strip()
+
+            path = str(
+                document.get("path") or ""
+            ).strip()
+
+            if not content or not path:
+                continue
+
+            cleaned.append(
+                {
+                    **document,
+                    "content": content,
+                    "path": path,
+                    "category": str(
+                        document.get("category")
+                        or "source"
+                    ),
+                }
+            )
+
+        return cleaned
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Invalid GitHub repository request.",
+                "error": str(exc),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Failed to build GitHub repository documents.",
+                "error": str(exc),
+                "github_url": github_url,
+            },
+        )
 
 def clean_history(
     history: List[Dict[str, str]],
@@ -562,6 +684,13 @@ def serialize_chunk(
         "chunk_type": chunk.get("chunk_type"),
         "language": chunk.get("language"),
         "char_count": chunk.get("char_count"),
+        "category": chunk.get("category"),
+        "github_score": chunk.get("github_score"),
+        "github_rank": chunk.get("github_rank"),
+        "github_reasons": chunk.get("github_reasons"),
+        "github_matched_terms": chunk.get(
+            "github_matched_terms"
+        ),
     }
 
     diagnostic_fields = [
@@ -582,6 +711,12 @@ def serialize_chunk(
         "primary_protected",
         "candidate_pool_size",
         "post_filter_pool_size",
+
+        # GitHub file-selection diagnostics.
+        "github_score",
+        "github_rank",
+        "github_reasons",
+        "github_matched_terms",
     ]
 
     for field_name in diagnostic_fields:
@@ -633,6 +768,7 @@ def health() -> Dict[str, Any]:
             "models": models,
             "retriever": "HybridRetriever",
             "chunker": "DocumentChunker",
+            "github_content": "GitHubContentService",
         }
 
     except Exception as exc:
@@ -655,8 +791,10 @@ def health() -> Dict[str, Any]:
 @app.post("/ask")
 def ask_ai(request: AskRequest) -> Dict[str, Any]:
 
+    request_start = time.perf_counter()
+    timings: Dict[str, float] = {}
+
     question = request.question.strip()
-    context = request.context.strip()
 
     if not question:
         raise HTTPException(
@@ -664,19 +802,92 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
             detail="Question must not be empty.",
         )
 
-    if not context:
+    # ========================================================
+    # 0. BUILD / ACCEPT RESEARCH CONTEXT
+    # ========================================================
+    #
+    # Preferred flow:
+    #
+    #   frontend -> github_url + question
+    #             -> GitHubContentService
+    #             -> query-aware repository context
+    #
+    # Backward-compatible flow:
+    #
+    #   frontend -> pre-built context + question
+    #
+    # This keeps GitHub acquisition out of Streamlit and keeps the
+    # existing RAG pipeline unchanged after context creation.
+    # ========================================================
+
+    github_url = (
+        request.github_url.strip()
+        if request.github_url
+        else ""
+    )
+
+    context_start = time.perf_counter()
+
+    documents: List[Dict[str, Any]] = []
+
+    if github_url:
+        documents = build_github_documents(
+            github_url=github_url,
+            question=question,
+            branch=request.branch,
+        )
+        context_origin = "github"
+    elif request.context:
+        context = request.context.strip()
+        context_origin = "provided_context"
+
+        if not context:
+            raise HTTPException(
+                status_code=400,
+                detail="Research context must not be empty.",
+            )
+
+        if len(context) > MAX_CONTEXT_CHARACTERS:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Research context is too large. "
+                    f"Maximum allowed size: "
+                    f"{MAX_CONTEXT_CHARACTERS:,} characters."
+                ),
+            )
+
+        documents = [
+            {
+                "content": context,
+                "path": (
+                    request.source_path
+                    or "research/repository_context.md"
+                ),
+                "category": (
+                    request.source_category
+                    or "documentation"
+                ),
+            }
+        ]
+    else:
         raise HTTPException(
             status_code=400,
-            detail="Research context must not be empty.",
+            detail=(
+                "Provide either 'github_url' or 'context'. "
+                "For chat-with-GitHub, use 'github_url'."
+            ),
         )
 
-    if len(context) > MAX_CONTEXT_CHARACTERS:
+    timings["github_or_context_ms"] = _elapsed_ms(context_start)
+
+    if not documents:
         raise HTTPException(
-            status_code=413,
+            status_code=502 if github_url else 400,
             detail=(
-                "Research context is too large. "
-                f"Maximum allowed size: "
-                f"{MAX_CONTEXT_CHARACTERS:,} characters."
+                "GitHubContentService returned no usable documents."
+                if github_url
+                else "Research context must not be empty."
             ),
         )
 
@@ -695,28 +906,29 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     # 1. STRUCTURE-AWARE CHUNKING
     # ========================================================
 
-    source_path = (
-        request.source_path
-        or "research/repository_context.md"
-    )
+    # ========================================================
+    # 1. STRUCTURE-AWARE CHUNKING
+    # ========================================================
+    #
+    # GitHub repositories are now chunked file-by-file.
+    # We deliberately DO NOT concatenate selected files into one
+    # giant document before chunking.
+    # ========================================================
 
-    source_category = (
-        request.source_category
-        or "documentation"
-    )
+    chunk_start = time.perf_counter()
 
     try:
-        chunks = document_chunker.chunk_document(
-            content=context,
-            path=source_path,
-            category=source_category,
+        chunks = document_chunker.chunk_documents(
+            documents
         )
+
+        timings["chunking_ms"] = _elapsed_ms(chunk_start)
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail={
-                "message": "Failed to chunk research context.",
+                "message": "Failed to chunk research documents.",
                 "error": str(exc),
             },
         )
@@ -731,6 +943,8 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     # 2. HYBRID RETRIEVAL
     # ========================================================
 
+    retrieval_start = time.perf_counter()
+
     try:
         retrieved_chunks = hybrid_retriever.retrieve(
             question=question,
@@ -740,6 +954,8 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
                 len(chunks),
             ),
         )
+
+        timings["hybrid_retrieval_ms"] = _elapsed_ms(retrieval_start)
 
     except Exception as exc:
         raise HTTPException(
@@ -780,6 +996,8 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     # 4. BUILD QWEN PROMPT
     # ========================================================
 
+    prompt_start = time.perf_counter()
+
     system_prompt = build_system_prompt(
         retrieved_context
     )
@@ -790,9 +1008,13 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
         system_prompt=system_prompt,
     )
 
+    timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
+
     # ========================================================
     # 5. QWEN / OLLAMA
     # ========================================================
+
+    llm_start = time.perf_counter()
 
     try:
         response = ollama_client.chat(
@@ -805,6 +1027,8 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
             },
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
+
+        timings["qwen_wall_ms"] = _elapsed_ms(llm_start)
 
     except Exception as exc:
         raise HTTPException(
@@ -859,6 +1083,59 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
         else {}
     )
 
+    ollama_metrics = {
+        "total_duration_ms": _ollama_stat(response, "total_duration"),
+        "load_duration_ms": _ollama_stat(response, "load_duration"),
+        "prompt_eval_duration_ms": _ollama_stat(
+            response, "prompt_eval_duration"
+        ),
+        "eval_duration_ms": _ollama_stat(
+            response, "eval_duration"
+        ),
+        "prompt_eval_count": getattr(
+            response, "prompt_eval_count", None
+        ),
+        "eval_count": getattr(
+            response, "eval_count", None
+        ),
+    }
+
+    eval_count = ollama_metrics.get("eval_count")
+    eval_duration_ms = ollama_metrics.get("eval_duration_ms")
+
+    if (
+        isinstance(eval_count, (int, float))
+        and isinstance(eval_duration_ms, (int, float))
+        and eval_duration_ms > 0
+    ):
+        ollama_metrics["generation_tokens_per_second"] = round(
+            float(eval_count) / (float(eval_duration_ms) / 1000),
+            2,
+        )
+
+    timings["total_ms"] = _elapsed_ms(request_start)
+
+    print("\n" + "=" * 72)
+    print("RAG REQUEST PERFORMANCE")
+    print("=" * 72)
+    print(f"Question: {question}")
+    print(f"Model: {OLLAMA_MODEL}")
+    print(f"Context origin: {context_origin}")
+    print(f"Documents acquired: {len(documents)}")
+    document_chars = sum(
+        len(str(document.get("content") or ""))
+        for document in documents
+    )
+    print(f"Document chars: {document_chars:,}")
+    print(f"Chunks created: {len(chunks)}")
+    print(f"Chunks retrieved: {len(retrieved_chunks)}")
+    for name, value in timings.items():
+        print(f"{name:28s}: {value:,.2f} ms")
+    for name, value in ollama_metrics.items():
+        if value is not None:
+            print(f"ollama.{name:19s}: {value}")
+    print("=" * 72 + "\n")
+
     return {
         "question": question,
         "answer": answer,
@@ -866,9 +1143,27 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
 
         "retriever": "HybridRetriever",
         "chunker": "DocumentChunker",
+        "context_origin": context_origin,
+        "github_url": github_url or None,
 
         "chunks_created": len(chunks),
         "chunks_retrieved": len(retrieved_chunks),
+
+        "performance": {
+            "timings_ms": timings,
+            "ollama": ollama_metrics,
+            "documents": len(documents),
+            "document_characters": sum(
+                len(str(document.get("content") or ""))
+                for document in documents
+            ),
+            "system_prompt_characters": len(system_prompt),
+            "retrieved_context_characters": len(retrieved_context),
+            "message_characters": sum(
+                len(str(message.get("content", "")))
+                for message in messages
+            ),
+        },
 
         "sources": serialized_sources,
 

@@ -8,7 +8,6 @@ import requests
 import streamlit as st
 
 from src.services.research import ResearchService
-from src.services.github_content import GitHubContentService
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -395,16 +394,14 @@ def display_ask_ai(result):
     """
     Display the Ask AI interface for a research result.
 
-    The frontend sends the research resource context to the FastAPI
-    backend. The backend is responsible for:
-
-        TextChunker
-            -> HybridRetriever
-            -> relevance/query-aware reranking
-            -> complementarity-aware selection
-            -> Qwen via Ollama
-
-    The frontend only displays the answer and the retrieved evidence.
+    Architecture:
+        Streamlit
+            -> FastAPI /ask
+                -> GitHubContentService (GitHub results only)
+                -> DocumentChunker
+                -> HybridRetriever
+                -> Qwen / Ollama
+            -> answer + retrieval diagnostics
     """
 
     result_id = str(result.id)
@@ -413,8 +410,8 @@ def display_ask_ai(result):
 
         st.caption(
             "Ask questions about this research resource. "
-            "The AI uses the research content retrieved for this result "
-            "and the Hybrid RAG backend."
+            "For GitHub repositories, the backend analyzes the repository "
+            "for your specific question before running Hybrid RAG."
         )
 
         ai_question = st.text_input(
@@ -451,8 +448,26 @@ def display_ask_ai(result):
                         backend_url = "http://127.0.0.1:8000/ask"
 
                         # =================================================
-                        # BUILD BASIC RESEARCH CONTEXT
+                        # RESOURCE METADATA
                         # =================================================
+
+                        source = str(
+                            getattr(
+                                result,
+                                "source",
+                                "",
+                            )
+                            or ""
+                        ).strip().lower()
+
+                        result_url = getattr(
+                            result,
+                            "url",
+                            None,
+                        )
+
+                        if result_url:
+                            result_url = str(result_url).strip()
 
                         context_parts = [
                             f"Title: {getattr(result, 'title', '')}",
@@ -638,72 +653,9 @@ def display_ask_ai(result):
                                 f"Conference: {conference}"
                             )
 
-                        # =================================================
-                        # INITIAL CONTEXT
-                        # =================================================
-
                         research_context = "\n".join(
                             context_parts
                         )
-
-                        # =================================================
-                        # GITHUB REPOSITORY CONTEXT
-                        # =================================================
-
-                        source = str(
-                            getattr(
-                                result,
-                                "source",
-                                "",
-                            )
-                            or ""
-                        ).strip().lower()
-
-                        github_url = getattr(
-                            result,
-                            "url",
-                            None,
-                        )
-
-                        if github_url:
-                            github_url = str(github_url).strip()
-
-                        if source == "github" and github_url:
-
-                            try:
-
-                                with st.spinner(
-                                    "Reading GitHub repository content..."
-                                ):
-
-                                    github_context = (
-                                        GitHubContentService
-                                        .build_context(
-                                            github_url
-                                        )
-                                    )
-
-                                if github_context:
-                                    research_context = (
-                                        research_context
-                                        + "\n\n"
-                                        + "==================================================\n"
-                                        + "GITHUB REPOSITORY CONTENT\n"
-                                        + "==================================================\n\n"
-                                        + str(github_context)
-                                    )
-
-                            except Exception as github_error:
-
-                                st.warning(
-                                    "Could not fetch additional GitHub "
-                                    "repository content. The AI will answer "
-                                    "using the available research metadata."
-                                )
-
-                                st.caption(
-                                    f"GitHub error: {github_error}"
-                                )
 
                         # =================================================
                         # CONVERSATION HISTORY
@@ -716,8 +668,13 @@ def display_ask_ai(result):
 
                         history = []
 
-                        previous_question = previous.get("question")
-                        previous_answer = previous.get("answer")
+                        previous_question = previous.get(
+                            "question"
+                        )
+
+                        previous_answer = previous.get(
+                            "answer"
+                        )
 
                         if previous_question:
                             history.append(
@@ -738,13 +695,25 @@ def display_ask_ai(result):
                         # =================================================
                         # BUILD FASTAPI REQUEST
                         # =================================================
+                        #
+                        # IMPORTANT:
+                        # GitHubContentService now lives in the backend.
+                        # The frontend sends the GitHub URL + question.
+                        #
+                        # For non-GitHub sources, we keep the existing
+                        # metadata-context flow.
+                        # =================================================
 
                         payload = {
                             "question": ai_question.strip(),
-                            "context": research_context,
                             "history": history,
                             "top_k": 5,
                         }
+
+                        if source == "github" and result_url:
+                            payload["github_url"] = result_url
+                        else:
+                            payload["context"] = research_context
 
                         # =================================================
                         # SEND TO FASTAPI
@@ -797,6 +766,14 @@ def display_ask_ai(result):
                             "model",
                             "",
                         ),
+                        "context_origin": data.get(
+                            "context_origin",
+                            "",
+                        ),
+                        "github_url": data.get(
+                            "github_url",
+                            None,
+                        ),
                     }
 
                 # =========================================================
@@ -825,8 +802,8 @@ def display_ask_ai(result):
                     )
 
                     st.info(
-                        "Qwen may still be processing the request. "
-                        "Try again if necessary."
+                        "Qwen or GitHub retrieval may still be processing "
+                        "the request. Try again if necessary."
                     )
 
                 # =========================================================
@@ -881,13 +858,19 @@ def display_ask_ai(result):
             # ------------------------------------------------------------
 
             model = previous_answer.get("model")
+
             chunks_created = previous_answer.get(
                 "chunks_created",
                 0,
             )
+
             chunks_retrieved = previous_answer.get(
                 "chunks_retrieved",
                 0,
+            )
+
+            context_origin = previous_answer.get(
+                "context_origin"
             )
 
             summary_parts = []
@@ -895,6 +878,11 @@ def display_ask_ai(result):
             if model:
                 summary_parts.append(
                     f"Model: `{model}`"
+                )
+
+            if context_origin:
+                summary_parts.append(
+                    f"Context: `{context_origin}`"
                 )
 
             if chunks_created:
@@ -962,7 +950,7 @@ def display_ask_ai(result):
                                 language="text",
                             )
 
-                        # Useful diagnostics while we validate the
+                        # Useful diagnostics while validating the
                         # production RAG integration.
                         diagnostic_columns = st.columns(4)
 

@@ -1,0 +1,17 @@
+{
+  "owner": "justmarkham",
+  "repository": "scikit-learn-videos",
+  "default_branch": "master",
+  "description": "Jupyter notebooks from the scikit-learn video series",
+  "language": "Jupyter Notebook",
+  "stars": 3807,
+  "forks": 2527,
+  "url": "https://github.com/justmarkham/scikit-learn-videos",
+  "updated_at": "2026-08-15T01:13:35Z",
+  "pushed_at": "2024-03-05T19:22:42Z",
+  "repo_url": "https://github.com/justmarkham/scikit-learn-videos",
+  "branch": "default",
+  "cached_at": 1786957014.2186022,
+  "tree_branch": "master",
+  "tree_file_count": 34
+}

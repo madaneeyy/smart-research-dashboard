@@ -1,0 +1,17 @@
+{
+  "owner": "scikit-learn",
+  "repository": "scikit-learn",
+  "default_branch": "main",
+  "description": "scikit-learn: machine learning in Python",
+  "language": "Python",
+  "stars": 66963,
+  "forks": 27292,
+  "url": "https://github.com/scikit-learn/scikit-learn",
+  "updated_at": "2026-08-17T06:43:31Z",
+  "pushed_at": "2026-08-16T05:03:27Z",
+  "repo_url": "https://github.com/scikit-learn/scikit-learn",
+  "branch": "default",
+  "cached_at": 1786956321.7342212,
+  "tree_branch": "main",
+  "tree_file_count": 1818
+}
