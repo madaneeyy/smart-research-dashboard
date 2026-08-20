@@ -1,0 +1,1 @@
+"#include \"ctranslate2/ops/log.h\"\n\n#include \"dispatch.h\"\n\nnamespace ctranslate2 {\n  namespace ops {\n\n    void Log::operator()(const StorageView& x, StorageView& y) const {\n      PROFILE(\"Log\");\n      DEVICE_AND_FLOAT_DISPATCH(\"Log\", x.device(), x.dtype(), (compute<D, T>(x, y)));\n    }\n\n  }\n}\n"

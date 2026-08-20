@@ -23,7 +23,25 @@ except ImportError:
 from src.services.rag.chunker import DocumentChunker
 from src.services.rag.hybrid_retriever import HybridRetriever
 from src.services.github_content import GitHubContentService
+import inspect
 
+print("=" * 80)
+print("GITHUB CONTENT SERVICE LOADED")
+print("=" * 80)
+print("CLASS FILE:", inspect.getfile(GitHubContentService))
+print("HAS _path_category:", hasattr(GitHubContentService, "_path_category"))
+print(
+    "HAS build_documents_for_query:",
+    hasattr(GitHubContentService, "build_documents_for_query"),
+)
+print(
+    "BUILD METHOD REFERENCES _path_category:",
+    "_path_category"
+    in inspect.getsource(
+        GitHubContentService.build_documents_for_query
+    ),
+)
+print("=" * 80)
 
 # ============================================================
 # CONFIGURATION
@@ -1177,6 +1195,7 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
                 "post_filter_pool_size"
             ),
         },
+
     }
 
 

@@ -1,0 +1,1 @@
+"#pragma once\n\n#include \"ctranslate2/storage_view.h\"\n\nnamespace ctranslate2 {\n\n  // Dynamic time wrapping function, but x values are negated.\n  std::vector<std::pair<dim_t, dim_t>> negative_dtw(const StorageView& x);\n\n}\n"

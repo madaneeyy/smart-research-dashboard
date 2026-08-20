@@ -97,6 +97,9 @@ class HybridRetriever:
         # Final result safety
         # ------------------------------------------------------------
         minimum_results: int = 1,
+
+        max_chunks_per_source: int = 2,
+        same_source_penalty: float = 0.10,
     ) -> None:
 
         # ============================================================
@@ -177,6 +180,12 @@ class HybridRetriever:
                 "minimum_results cannot be negative."
             )
 
+        if max_chunks_per_source <= 0:
+            raise ValueError("max_chunks_per_source must be greater than 0.")
+
+        if same_source_penalty < 0:
+            raise ValueError("same_source_penalty cannot be negative.")
+
         # ============================================================
         # STORE CONFIGURATION
         # ============================================================
@@ -231,6 +240,14 @@ class HybridRetriever:
 
         self.minimum_results = int(
             minimum_results
+        )
+
+        self.max_chunks_per_source = int(
+            max_chunks_per_source
+        )
+
+        self.same_source_penalty = float(
+            same_source_penalty
         )
 
     # ================================================================
@@ -442,13 +459,11 @@ class HybridRetriever:
             for candidate in candidates
         ]
 
-        candidate_embeddings = np.asarray(
-            model.encode(
-                candidate_texts,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            ),
-            dtype=np.float32,
+        # Reuse the same persistent per-chunk embedding cache used by
+        # SimpleRetriever.retrieve(). Do NOT call model.encode() directly
+        # here, otherwise the RRF candidate set gets embedded a second time.
+        candidate_embeddings = SimpleRetriever.get_embeddings(
+            candidates
         )
 
         if len(candidate_embeddings) != len(candidates):
@@ -490,6 +505,12 @@ class HybridRetriever:
         filtered_indices = self._remove_exact_duplicates(
             candidates=candidates,
             indices=filtered_indices,
+        )
+
+        filtered_indices = self._remove_near_duplicates(
+            candidates=candidates,
+            indices=filtered_indices,
+            candidate_embeddings=candidate_embeddings,
         )
 
         if not filtered_indices:
@@ -591,6 +612,14 @@ class HybridRetriever:
             for index in remaining_indices:
 
                 relevance = query_scores[index]
+
+                candidate_source = self._source(candidates[index])
+                same_source_count = sum(
+                    1
+                    for selected_index in selected_indices
+                    if candidate_source
+                    and candidate_source == self._source(candidates[selected_index])
+                )
 
                 # ------------------------------------------------
                 # Redundancy against already-selected chunks.
@@ -697,6 +726,11 @@ class HybridRetriever:
                     + self.complementarity_bonus_weight
                     * complementarity
                 )
+
+                if same_source_count >= self.max_chunks_per_source:
+                    mmr_score -= self.same_source_penalty * (
+                        1.0 + same_source_count - self.max_chunks_per_source
+                    )
 
                 # ------------------------------------------------
                 # Do not allow a much weaker chunk to win solely
@@ -943,6 +977,13 @@ class HybridRetriever:
                 )
             )
 
+            result["symbol_path_match"] = float(
+                self._symbol_path_match(
+                    query_terms=query_terms,
+                    candidate=candidates[index],
+                )
+            )
+
             results.append(result)
 
         # ============================================================
@@ -1107,6 +1148,36 @@ class HybridRetriever:
         return result
 
     # ================================================================
+    # NEAR-DUPLICATE REMOVAL
+    # ================================================================
+
+    @classmethod
+    def _remove_near_duplicates(
+        cls,
+        candidates: List[Dict[str, Any]],
+        indices: List[int],
+        candidate_embeddings: np.ndarray,
+    ) -> List[int]:
+        if len(indices) <= 1:
+            return list(indices)
+
+        kept: List[int] = []
+        for index in indices:
+            duplicate = False
+            for kept_index in kept:
+                similarity = float(np.dot(
+                    candidate_embeddings[index],
+                    candidate_embeddings[kept_index],
+                ))
+                if similarity >= 0.97:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(index)
+
+        return kept
+
+    # ================================================================
     # QUERY-AWARE RELEVANCE SCORE
     # ================================================================
 
@@ -1146,6 +1217,16 @@ class HybridRetriever:
         ):
 
             score += 0.08
+
+        # ------------------------------------------------------------
+        # Symbol/path matching
+        # ------------------------------------------------------------
+
+        symbol_match = self._symbol_path_match(
+            query_terms=query_terms,
+            candidate=candidate,
+        )
+        score += 0.12 * symbol_match
 
         # ------------------------------------------------------------
         # BM25 presence
@@ -1428,6 +1509,55 @@ class HybridRetriever:
         )
 
     # ================================================================
+    # SYMBOL / PATH MATCHING
+    # ================================================================
+
+    @classmethod
+    def _symbol_path_match(
+        cls,
+        query_terms: Set[str],
+        candidate: Dict[str, Any],
+    ) -> float:
+        if not query_terms:
+            return 0.0
+
+        path = str(candidate.get("path") or candidate.get("file") or "").lower()
+        path_tokens = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", path))
+
+        symbols = candidate.get("symbols") or []
+        symbol_tokens = set()
+        exact_symbols = set()
+        for symbol in symbols:
+            if isinstance(symbol, dict):
+                value = str(
+                    symbol.get("symbol")
+                    or symbol.get("qualified_name")
+                    or symbol.get("name")
+                    or ""
+                ).lower()
+            else:
+                value = str(symbol).lower()
+            if value:
+                exact_symbols.add(value)
+                symbol_tokens.update(
+                    re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", value)
+                )
+
+        exact_hits = 0
+        token_hits = 0
+        for term in query_terms:
+            if term in exact_symbols:
+                exact_hits += 1
+            elif term in symbol_tokens or term in path_tokens:
+                token_hits += 1
+
+        return float(min(
+            1.0,
+            exact_hits / max(len(query_terms), 1)
+            + 0.5 * token_hits / max(len(query_terms), 1),
+        ))
+
+    # ================================================================
     # TECHNICAL MATCH
     # ================================================================
 
@@ -1442,15 +1572,17 @@ class HybridRetriever:
         if query_type != "technical":
             return False
 
-        if candidate.get("bm25_rank") is None:
-            return False
-
         overlap = cls._lexical_overlap(
             query_terms,
             candidate,
         )
 
-        return overlap >= 0.50
+        symbol_path_match = cls._symbol_path_match(
+            query_terms=query_terms,
+            candidate=candidate,
+        )
+
+        return overlap >= 0.50 or symbol_path_match >= 0.75
 
     # ================================================================
     # LEXICAL OVERLAP

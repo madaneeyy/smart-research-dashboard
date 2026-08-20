@@ -1,0 +1,1 @@
+".. _impute_examples:\n\nMissing Value Imputation\n------------------------\n\nExamples concerning the :mod:`sklearn.impute` module.\n"

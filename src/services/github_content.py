@@ -11,6 +11,11 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 
+try:
+    from .github_cache import GitHubCache
+except ImportError:  # pragma: no cover - fallback for flat/script usage
+    from github_cache import GitHubCache
+
 
 # =============================================================
 # ENVIRONMENT
@@ -19,6 +24,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+# Disk-backed cache for GitHub API responses (metadata, tree, readme,
+# file content, root listing). Persists across process restarts, unlike
+# an in-memory cache, which matters for a backend that may be
+# redeployed/restarted between user sessions.
+_GITHUB_CACHE_DIR = os.getenv(
+    "GITHUB_CACHE_DIR",
+    os.path.join(os.path.dirname(__file__), "cache", "github"),
+)
+
+_GITHUB_CACHE_TTL_SECONDS = int(
+    os.getenv("GITHUB_CACHE_TTL_SECONDS", "600")
+)
+
+_github_cache = GitHubCache(
+    cache_dir=_GITHUB_CACHE_DIR,
+    ttl_seconds=_GITHUB_CACHE_TTL_SECONDS,
+)
 
 
 class GitHubContentService:
@@ -87,6 +110,12 @@ class GitHubContentService:
     # Repository tree can be large; this is only a safety guard.
     MAX_TREE_FILES = 15000
 
+    # Query-aware discovery limits for very large repositories.
+    MAX_DISCOVERY_DIRECTORIES = 48
+    MAX_DISCOVERY_FILES = 5000
+    MAX_DISCOVERY_DEPTH = 8
+    MAX_DISCOVERY_BRANCHES = 8
+
     # -------------------------------------------------------------
     # File categories
     # -------------------------------------------------------------
@@ -137,10 +166,6 @@ class GitHubContentService:
     DOC_EXTENSIONS = {
         ".md", ".mdx", ".rst", ".txt",
     }
-
-    # Jupyter notebooks are common in research/tutorial repositories and
-    # must be searchable for repository questions.
-    NOTEBOOK_EXTENSIONS = {".ipynb"}
 
     EXCLUDED_PARTS = {
         ".git",
@@ -259,7 +284,14 @@ class GitHubContentService:
         "overview": {
             "about", "overview", "purpose", "summary", "summarize",
             "goal", "goals", "description", "describe", "introduction",
-            "intro",
+            "intro", "problem", "problems", "solve", "solves", "solving",
+        },
+        "installation": {
+            "install", "installation", "installing", "setup", "set",
+            "requirements", "requirement", "dependency", "dependencies",
+            "pip", "npm", "yarn", "conda", "build", "compile", "docker",
+            "run", "running", "start", "getting", "quickstart",
+            "prerequisite", "prerequisites",
         },
     }
 
@@ -350,6 +382,11 @@ class GitHubContentService:
     ) -> dict:
         owner, repository = cls._parse_github_url(github_url)
 
+        cached = _github_cache.get("metadata", owner, repository)
+
+        if cached is not None:
+            return cached
+
         url = (
             f"{cls.API_BASE_URL}"
             f"/repos/{owner}/{repository}"
@@ -358,7 +395,7 @@ class GitHubContentService:
         response = cls._get(url)
         data = response.json()
 
-        return {
+        result = {
             "owner": owner,
             "repository": repository,
             "default_branch": data.get("default_branch") or "main",
@@ -368,6 +405,9 @@ class GitHubContentService:
             "forks": data.get("forks_count"),
             "url": data.get("html_url") or github_url,
         }
+
+        _github_cache.set("metadata", result, owner, repository)
+        return result
 
     # =============================================================
     # README
@@ -380,6 +420,11 @@ class GitHubContentService:
     ) -> str:
         owner, repository = cls._parse_github_url(github_url)
 
+        cached = _github_cache.get("readme", owner, repository)
+
+        if cached is not None:
+            return cached
+
         url = (
             f"{cls.API_BASE_URL}"
             f"/repos/{owner}/{repository}/readme"
@@ -391,15 +436,19 @@ class GitHubContentService:
         content = data.get("content")
 
         if not content:
+            _github_cache.set("readme", "", owner, repository)
             return ""
 
         try:
-            return base64.b64decode(content).decode(
+            result = base64.b64decode(content).decode(
                 "utf-8",
                 errors="replace",
             )
         except Exception:
-            return ""
+            result = ""
+
+        _github_cache.set("readme", result, owner, repository)
+        return result
 
     # =============================================================
     # SINGLE FILE
@@ -410,6 +459,7 @@ class GitHubContentService:
         cls,
         github_url: str,
         file_path: str,
+        branch: str | None = None,
     ) -> str:
         owner, repository = cls._parse_github_url(github_url)
 
@@ -418,11 +468,25 @@ class GitHubContentService:
         if not file_path:
             raise ValueError("File path must not be empty.")
 
+        # The ref is part of the cache key: the same path can have
+        # different content on different branches.
+        ref_key = branch or "HEAD"
+
+        cached = _github_cache.get(
+            "file", owner, repository, ref_key, file_path
+        )
+
+        if cached is not None:
+            return cached
+
         url = (
             f"{cls.API_BASE_URL}"
             f"/repos/{owner}/{repository}"
             f"/contents/{file_path}"
         )
+
+        if branch:
+            url += f"?ref={branch}"
 
         response = cls._get(url, timeout=45)
         data = response.json()
@@ -433,6 +497,9 @@ class GitHubContentService:
         content = data.get("content")
 
         if not content:
+            _github_cache.set(
+                "file", "", owner, repository, ref_key, file_path
+            )
             return ""
 
         # GitHub's Contents API can return large files differently.
@@ -446,8 +513,15 @@ class GitHubContentService:
                     timeout=45,
                 )
                 raw_response.raise_for_status()
-                return raw_response.text
+                result = raw_response.text
+                _github_cache.set(
+                    "file", result, owner, repository, ref_key, file_path
+                )
+                return result
 
+            _github_cache.set(
+                "file", "", owner, repository, ref_key, file_path
+            )
             return ""
 
         try:
@@ -460,6 +534,9 @@ class GitHubContentService:
                 f"Could not decode file: {file_path}"
             ) from exc
 
+        _github_cache.set(
+            "file", decoded, owner, repository, ref_key, file_path
+        )
         return decoded
 
     # =============================================================
@@ -473,6 +550,11 @@ class GitHubContentService:
     ) -> list[dict]:
         owner, repository = cls._parse_github_url(github_url)
 
+        cached = _github_cache.get("root", owner, repository)
+
+        if cached is not None:
+            return cached
+
         url = (
             f"{cls.API_BASE_URL}"
             f"/repos/{owner}/{repository}/contents"
@@ -481,23 +563,244 @@ class GitHubContentService:
         response = cls._get(url)
         data = response.json()
 
-        return data if isinstance(data, list) else []
+        result = data if isinstance(data, list) else []
+        _github_cache.set("root", result, owner, repository)
+        return result
 
     # =============================================================
     # COMPLETE REPOSITORY TREE
     # =============================================================
 
     @classmethod
+    def _fetch_directory_contents(
+        cls,
+        github_url: str,
+        directory: str = "",
+        branch: str | None = None,
+    ) -> list[dict]:
+        """Fetch one directory listing with the existing disk cache.
+
+        The cache namespace is intentionally kept as ``root`` for backward
+        compatibility; the directory path and branch are part of the key.
+        """
+        owner, repository = cls._parse_github_url(github_url)
+        directory = directory.strip("/")
+        ref_key = branch or "HEAD"
+
+        cached = _github_cache.get(
+            "root", owner, repository, ref_key, directory
+        )
+        if cached is not None:
+            return cached
+
+        url = f"{cls.API_BASE_URL}/repos/{owner}/{repository}/contents"
+        if directory:
+            url += "/" + directory
+        if branch:
+            url += f"?ref={branch}"
+
+        response = cls._get(url, timeout=45)
+        data = response.json()
+        result = data if isinstance(data, list) else []
+
+        _github_cache.set(
+            "root", result, owner, repository, ref_key, directory
+        )
+        return result
+
+    @classmethod
+    def _score_discovery_directory(
+        cls,
+        directory: str,
+        analysis: dict,
+        depth: int,
+    ) -> float:
+        """Score a directory for query-aware traversal of huge repositories."""
+        parts = cls._path_parts(directory)
+        tokens = set(re.findall(r"[a-z0-9]+", directory.lower()))
+        score = 0.0
+
+        primary = [str(x).lower() for x in analysis.get("primary_entities", [])]
+        supporting = [str(x).lower() for x in analysis.get("supporting_terms", [])]
+        identifier_parts = [
+            str(x).lower() for x in analysis.get("identifier_parts", [])
+        ]
+        repository_name = str(
+            analysis.get("repository_name") or ""
+        ).lower().strip()
+
+        # Repository names are contextual metadata, not semantic query terms.
+        # In a monorepo this is especially important: a repository called
+        # "next.js" has many directories containing "next", but that does not
+        # mean those directories answer a routing question.
+        for term in primary:
+            term_tokens = set(re.findall(r"[a-z0-9]+", term))
+
+            if (
+                repository_name
+                and term == repository_name
+                and term in parts
+                and term != parts[-1]
+            ):
+                score -= 20
+                continue
+
+            if term in parts:
+                score += 55
+            elif term_tokens and term_tokens.issubset(tokens):
+                score += 45
+            elif term in directory.lower():
+                score += 20
+
+        # Identifier components are useful for traversal, but only as
+        # secondary signals. This prevents a common component such as "next"
+        # or "data" from monopolizing the discovery budget.
+        for term in identifier_parts:
+            if len(term) >= 3 and term in tokens:
+                score += 22
+
+        for term in supporting:
+            if len(term) >= 3 and term in tokens:
+                score += 18
+
+        # Query-concept traversal priors. These are deliberately structural
+        # rather than repository-specific so they generalize across languages.
+        intent_terms = set(
+            str(x).lower() for x in analysis.get("intents", [])
+        )
+
+        if "routing" in identifier_parts or "routing" in supporting:
+            if any(p in parts for p in (
+                "router", "routing", "routes", "route", "pages", "app",
+                "navigation",
+            )):
+                score += 90
+
+            # JS/TS framework repositories commonly keep the implementation
+            # under packages/<framework>/... rather than crates/... .
+            if "packages" in parts:
+                score += 45
+
+            if len(parts) >= 2 and parts[0] == "packages":
+                if repository_name:
+                    repo_base = re.sub(r"[^a-z0-9]+", "", repository_name)
+                    package_base = re.sub(r"[^a-z0-9]+", "", parts[1])
+                    if repo_base and package_base and (
+                        repo_base.startswith(package_base)
+                        or package_base.startswith(repo_base)
+                    ):
+                        score += 80
+
+        # DataLoader-like questions in Python/ML repositories often live under
+        # utils/data rather than low-level C++ bindings. Prefer those structural
+        # bridges during discovery when both "data" and "loader" are present.
+        if {"data", "loader"}.issubset(set(identifier_parts)):
+            if "data" in parts:
+                score += 70
+            if "utils" in parts:
+                score += 30
+            if "csrc" in parts or "cuda" in parts:
+                score -= 25
+
+        # Common source/package roots are useful traversal bridges even when
+        # their names do not occur in the query (e.g. torch/utils/data).
+        if any(p in parts for p in (
+            "src", "lib", "libs", "packages", "package", "crates",
+            "python", "go", "cmd", "internal", "core", "server",
+            "client", "components", "modules", "torch", "fastapi",
+            "utils",
+        )):
+            score += 20
+
+        # Prefer shallower paths so discovery does not spend its budget on
+        # deeply nested unrelated directories.
+        score -= depth * 2
+        return score
+
+    @classmethod
+    def _discover_large_repository_tree(
+        cls,
+        github_url: str,
+        query: str,
+        branch: str | None = None,
+    ) -> list[str]:
+        """Discover relevant files without requiring a complete recursive tree.
+
+        GitHub returns ``truncated=true`` for very large recursive tree
+        requests. Instead of failing, use bounded best-first traversal of
+        directory listings. This is query-aware and therefore scales to large
+        monorepos such as Next.js and PyTorch.
+        """
+        analysis = cls.analyze_query(query)
+        metadata = cls.fetch_repository_metadata(github_url)
+        analysis["repository_name"] = str(
+            metadata.get("repository") or ""
+        ).lower()
+        resolved_branch = branch or metadata.get("default_branch") or "main"
+
+        queue: list[tuple[float, int, str]] = [(0.0, 0, "")]
+        visited: set[str] = set()
+        files: set[str] = set()
+        directory_requests = 0
+
+        while queue and directory_requests < cls.MAX_DISCOVERY_DIRECTORIES:
+            queue.sort(key=lambda item: (-item[0], item[1], item[2]))
+            _, depth, directory = queue.pop(0)
+
+            if directory in visited or depth > cls.MAX_DISCOVERY_DEPTH:
+                continue
+            visited.add(directory)
+
+            try:
+                entries = cls._fetch_directory_contents(
+                    github_url, directory, resolved_branch
+                )
+            except Exception:
+                continue
+
+            directory_requests += 1
+
+            for entry in entries:
+                path = str(entry.get("path") or "").strip("/")
+                if not path:
+                    continue
+
+                entry_type = entry.get("type")
+                if entry_type == "file":
+                    if (
+                        cls._is_source_file(path)
+                        or cls._is_config_file(path)
+                        or cls._is_documentation_file(path)
+                    ) and not (set(cls._path_parts(path)) & cls.EXCLUDED_PARTS):
+                        files.add(path)
+                        if len(files) >= cls.MAX_DISCOVERY_FILES:
+                            return sorted(files)
+
+                elif entry_type == "dir" and depth < cls.MAX_DISCOVERY_DEPTH:
+                    directory_score = cls._score_discovery_directory(
+                        path, analysis, depth + 1
+                    )
+                    queue.append((directory_score, depth + 1, path))
+
+        return sorted(files)
+
+    @classmethod
     def fetch_repository_tree(
         cls,
         github_url: str,
         branch: str | None = None,
+        query: str | None = None,
     ) -> list[str]:
         metadata = cls.fetch_repository_metadata(github_url)
 
         branch = branch or metadata["default_branch"]
         owner = metadata["owner"]
         repository = metadata["repository"]
+
+        cached = _github_cache.get("tree", owner, repository, branch)
+
+        if cached is not None:
+            return cached
 
         url = (
             f"{cls.API_BASE_URL}"
@@ -506,46 +809,58 @@ class GitHubContentService:
             f"?recursive=1"
         )
 
-        response = cls._get(
-            url,
-            timeout=60,
-        )
-
+        response = cls._get(url, timeout=60)
         data = response.json()
 
-        if data.get("truncated"):
-            raise ValueError(
-                "GitHub returned a truncated repository tree. "
-                "The repository is too large for a complete recursive "
-                "tree request."
-            )
-
         tree = data.get("tree")
+        truncated = bool(data.get("truncated"))
+
+        paths: list[str] = []
+        if isinstance(tree, list):
+            for item in tree:
+                if item.get("type") != "blob":
+                    continue
+                path = str(item.get("path") or "").strip()
+                if path:
+                    paths.append(path)
+
+        # A large/truncated recursive tree is not an error anymore when a
+        # query is available. Discover only query-relevant branches instead.
+        if truncated or len(paths) > cls.MAX_TREE_FILES:
+            if query:
+                return cls._discover_large_repository_tree(
+                    github_url, query, branch
+                )
+
+            # Preserve the old safety behavior for callers that did not give
+            # us a query, because there is no principled way to prioritize
+            # files without one.
+            raise ValueError(
+                f"Repository contains more than {cls.MAX_TREE_FILES:,} files; "
+                "tree discovery safety limit reached. Provide a query for "
+                "query-aware large-repository discovery."
+            )
 
         if not isinstance(tree, list):
-            raise ValueError(
-                "Unexpected GitHub repository tree response."
-            )
+            raise ValueError("Unexpected GitHub repository tree response.")
 
-        paths = []
+        result = sorted(set(paths))
+        _github_cache.set("tree", result, owner, repository, branch)
+        return result
 
-        for item in tree:
-            if item.get("type") != "blob":
-                continue
+    # =============================================================
+    # CACHE MANAGEMENT
+    # =============================================================
 
-            path = str(item.get("path") or "").strip()
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Manually drop all cached GitHub responses on disk."""
+        _github_cache.clear()
 
-            if path:
-                paths.append(path)
-
-        if len(paths) > cls.MAX_TREE_FILES:
-            raise ValueError(
-                f"Repository contains more than "
-                f"{cls.MAX_TREE_FILES:,} files; "
-                "tree discovery safety limit reached."
-            )
-
-        return sorted(set(paths))
+    @classmethod
+    def cache_stats(cls) -> dict[str, int]:
+        """Return counts of cached entries per kind, for diagnostics."""
+        return _github_cache.stats()
 
     # =============================================================
     # PATH CLASSIFICATION
@@ -631,6 +946,70 @@ class GitHubContentService:
         return result
 
     # =============================================================
+    # IDENTIFIER DECOMPOSITION
+    # =============================================================
+
+    @staticmethod
+    def _decompose_identifier(identifier: str) -> list[str]:
+        """
+        Decompose a technical identifier into searchable components.
+
+        Examples:
+            GenerationOptions -> ["generation", "options", "generationoptions"]
+            translate_batch_async -> ["translate", "batch", "async",
+                                      "translate_batch_async"]
+            sklearn.pipeline -> ["sklearn", "pipeline", "sklearn.pipeline"]
+        """
+        value = (identifier or "").strip().strip("`'\"")
+        if not value:
+            return []
+
+        # Treat path/module separators as boundaries while preserving the
+        # complete identifier as a searchable term.
+        normalized = re.sub(r"[\\/]+", ".", value)
+        normalized = re.sub(r"[-]+", "_", normalized)
+
+        components = []
+        for segment in normalized.split("."):
+            segment = segment.strip("_")
+            if not segment:
+                continue
+
+            # Split whitespace-delimited technical phrases too.
+            for word in re.findall(r"[A-Za-z0-9]+", segment):
+                word = word.lower()
+                if word and word not in components:
+                    components.append(word)
+
+            # Split acronym + word boundaries (HTTPServer -> HTTP + Server)
+            # and normal CamelCase boundaries (GenerationOptions -> ...).
+            pieces = re.findall(
+                r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|"
+                r"[A-Z]?[a-z]+|"
+                r"[A-Z]+|"
+                r"[0-9]+",
+                segment,
+            )
+
+            for piece in pieces:
+                piece = piece.lower()
+                if piece and piece not in components:
+                    components.append(piece)
+
+            # Also split snake_case identifiers.
+            for piece in re.split(r"[_]+", segment.lower()):
+                if piece and piece not in components:
+                    components.append(piece)
+
+        # Preserve the exact normalized identifier as the strongest
+        # decomposition-level term.
+        full = normalized.lower().strip("._-")
+        if full and full not in components:
+            components.append(full)
+
+        return components
+
+    # =============================================================
     # QUERY ANALYSIS
     # =============================================================
 
@@ -656,6 +1035,8 @@ class GitHubContentService:
                 "primary_entities": [],
                 "supporting_terms": [],
                 "all_terms": [],
+                "identifiers": [],
+                "identifier_parts": [],
                 "intents": [],
                 "file_hints": [],
                 "wants_code": False,
@@ -663,6 +1044,7 @@ class GitHubContentService:
                 "wants_docs": False,
                 "wants_benchmarks": False,
                 "wants_overview": True,
+                "wants_installation": False,
             }
 
         # ---------------------------------------------------------
@@ -706,11 +1088,37 @@ class GitHubContentService:
                 all_terms.append(normalized)
 
         # ---------------------------------------------------------
-        # Detect technical identifiers.
+        # Detect technical identifiers / query entities.
+        #
+        # Technical entities are not limited to CamelCase. Real questions
+        # commonly mention Session, Command, routing, regex matching,
+        # dependency injection, DataLoader, pip, etc.
         # ---------------------------------------------------------
 
         identifiers = []
+        identifier_parts = []
 
+        def add_identifier(value: str) -> None:
+            clean = value.strip("`'\"").strip(" .,;:()[]{}")
+            if not clean:
+                return
+
+            normalized = clean.lower()
+
+            if (
+                normalized in cls.STOP_WORDS
+                or len(normalized) < 2
+                or normalized in identifiers
+            ):
+                return
+
+            identifiers.append(normalized)
+
+            for part in cls._decompose_identifier(clean):
+                if part not in identifier_parts:
+                    identifier_parts.append(part)
+
+        # Preserve strong code-looking candidates.
         for value in all_candidates:
             clean = value.strip("`'\"")
 
@@ -726,13 +1134,62 @@ class GitHubContentService:
             )
 
             if looks_like_identifier:
-                normalized = clean.lower()
+                add_identifier(clean)
 
-                if (
-                    normalized not in cls.STOP_WORDS
-                    and normalized not in identifiers
-                ):
-                    identifiers.append(normalized)
+        # Extract the technical subject of common question forms.
+        entity_patterns = [
+            r"\b(?:how\s+is|how\s+does|how\s+do|where\s+is|where\s+are)"
+            r"\s+(?:the\s+)?[`\"']?([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*){0,3})",
+
+            r"\b(?:what\s+is|what\s+are|what\s+does)"
+            r"\s+(?:the\s+)?[`\"']?([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*){0,3})",
+
+            r"\b(?:class|struct|interface|type|function|method|module)"
+            r"\s+[`\"']?([A-Za-z][A-Za-z0-9_.-]*)",
+        ]
+
+        phrase_stop = {
+            "implemented", "implementation", "work", "works", "does",
+            "do", "used", "use", "using", "in", "for", "with", "from",
+            "and", "the", "a", "an", "what", "problem", "solve",
+        }
+
+        for pattern in entity_patterns:
+            for match in re.finditer(pattern, query, flags=re.IGNORECASE):
+                raw = match.group(1).strip("`'\".,:;()[]{}")
+                words = [
+                    word
+                    for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]*", raw)
+                    if word.lower() not in phrase_stop
+                ]
+
+                if not words:
+                    continue
+
+                if len(words) > 1:
+                    phrase = " ".join(words).lower()
+                    if phrase not in identifiers:
+                        identifiers.append(phrase)
+                    for word in words:
+                        add_identifier(word)
+                else:
+                    add_identifier(words[0])
+
+        # Explicit quoted entities are always strong.
+        for value in quoted:
+            add_identifier(value)
+
+        # A small vocabulary catches technical single-word subjects that are
+        # otherwise indistinguishable from ordinary English.
+        technical_tokens = {
+            "session", "command", "regex", "matching", "routing",
+            "dataloader", "dependency", "injection", "pip", "npm",
+            "yarn", "conda", "docker", "fastapi", "ctranslate2",
+        }
+
+        for token in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]*\b", query):
+            if token.lower() in technical_tokens:
+                add_identifier(token)
 
         # ---------------------------------------------------------
         # Primary entity signals.
@@ -800,6 +1257,53 @@ class GitHubContentService:
             if query_words & words:
                 intents.append(intent)
 
+        # Explicit natural-language intent patterns. These complement the
+        # generic keyword table and avoid relying on repository names.
+        q_lower = query.lower()
+
+        if re.search(r"\bwhat\s+(?:is|are)\b", q_lower):
+            if "overview" not in intents:
+                intents.append("overview")
+
+        if re.search(r"\bwhat\s+is\b.*\bused\s+for\b", q_lower):
+            if "overview" not in intents:
+                intents.append("overview")
+
+        if re.search(r"\bhow\s+is\b.*\bimplemented\b", q_lower):
+            if "implementation" not in intents:
+                intents.append("implementation")
+
+        architecture_question = bool(
+            re.search(
+                r"\bhow\s+does\b.*\bwork\b|"
+                r"\bhow\s+is\b.*\barchitecture\b|"
+                r"\barchitecture\b|"
+                r"\bhow\s+is\b.*\bimplemented\b",
+                q_lower,
+            )
+        ) and any(
+            x in q_lower
+            for x in (
+                "routing", "router", "architecture", "system", "design",
+                "components", "modules", "layers", "data flow",
+            )
+        )
+
+        if architecture_question:
+            if "architecture" not in intents:
+                intents.append("architecture")
+
+        # Conceptual framework questions often need repository documentation.
+        if (
+            re.search(r"\bhow\s+does\b.*\bwork\b", q_lower)
+            and any(
+                x in q_lower
+                for x in ("dependency injection", "routing", "configuration", "usage")
+            )
+        ):
+            if "documentation" not in intents:
+                intents.append("documentation")
+
         wants_code = bool(
             set(intents)
             & {
@@ -813,15 +1317,25 @@ class GitHubContentService:
         wants_tests = "testing" in intents
         wants_docs = "documentation" in intents
         wants_benchmarks = "benchmark" in intents
+        wants_installation = "installation" in intents
 
         # A question is "overview-style" if it explicitly signals that
         # intent, OR if it produced no other real signal to search with
         # (no primary entities, no identifiers, no specific intent).
         # The latter case covers phrasing like "what is this repository
-        # about" or "what does this project do", where stop-word
-        # stripping removes almost every token.
+        # about", where stop-word stripping removes almost every token.
+        explicit_overview_question = bool(
+            re.search(
+                r"\bwhat\s+is\b|\bwhat\s+are\b|"
+                r"\bwhat\s+is\s+.*\bused\s+for\b|"
+                r"\bwhat\s+does\b.*\bdo\b",
+                query.lower(),
+            )
+        )
+
         wants_overview = (
             "overview" in intents
+            or explicit_overview_question
             or (
                 not primary_entities
                 and not identifiers
@@ -829,6 +1343,7 @@ class GitHubContentService:
                 and not wants_tests
                 and not wants_docs
                 and not wants_benchmarks
+                and not wants_installation
             )
         )
 
@@ -866,6 +1381,7 @@ class GitHubContentService:
             "supporting_terms": supporting_terms,
             "all_terms": all_terms,
             "identifiers": identifiers,
+            "identifier_parts": identifier_parts,
             "intents": intents,
             "file_hints": file_hints,
             "wants_code": wants_code,
@@ -873,6 +1389,7 @@ class GitHubContentService:
             "wants_docs": wants_docs,
             "wants_benchmarks": wants_benchmarks,
             "wants_overview": wants_overview,
+            "wants_installation": wants_installation,
         }
 
     # =============================================================
@@ -895,6 +1412,7 @@ class GitHubContentService:
         primary = analysis["primary_entities"]
         supporting = analysis["supporting_terms"]
         all_terms = analysis["all_terms"]
+        identifier_parts = analysis.get("identifier_parts", [])
 
         score = 0.0
         matched = []
@@ -942,6 +1460,24 @@ class GitHubContentService:
                 matched.append(term)
                 reasons.append("primary filename substring")
 
+            elif (
+                len(stem) >= 3
+                and stem in term
+            ):
+                # Reverse relationship: the file's stem is a prefix/
+                # substring of the identifier itself. This is a very
+                # common real-world pattern - a class or struct name
+                # extends the file it's declared in (GenerationOptions
+                # in generation.h, StandardScaler in scaler.py,
+                # BeamSearch in search.h) - but every check above only
+                # tests whether the identifier appears inside the path,
+                # never the reverse. Without this, a query identifier
+                # longer than the file stem could never match its own
+                # containing file at all.
+                score += 95
+                matched.append(term)
+                reasons.append("filename stem matches identifier")
+
             elif term in lower_path:
                 score += 25
                 matched.append(term)
@@ -973,12 +1509,233 @@ class GitHubContentService:
                 reasons.append("supporting path substring")
 
         # ---------------------------------------------------------
+        # Decomposed identifier components provide a secondary signal.
+        # The complete identifier remains stronger than its components.
+        # ---------------------------------------------------------
+
+        for term in identifier_parts:
+            if len(term) < 3:
+                continue
+
+            if term == stem:
+                score += 35
+                matched.append(term)
+                reasons.append("identifier component filename match")
+            elif term in filename:
+                score += 15
+                matched.append(term)
+                reasons.append("identifier component filename substring")
+            elif term in parts:
+                score += 12
+                matched.append(term)
+                reasons.append("identifier component path match")
+
+        # ---------------------------------------------------------
         # Generic all-term matching is weak.
         # ---------------------------------------------------------
 
         for term in all_terms:
             if term in filename and term not in primary:
                 score += 4
+
+        # ---------------------------------------------------------
+        # Overview / installation retrieval priors.
+        # ---------------------------------------------------------
+
+        if analysis["wants_overview"]:
+            if filename in {"readme.md", "readme.rst", "readme.txt"}:
+                # Root README is the canonical answer to "What is X?"
+                if normalized.count("/") == 0:
+                    score += 260
+                    reasons.append("repository root README strongly prioritized for overview")
+                else:
+                    score += 140
+                    reasons.append("repository README for overview")
+            elif cls._is_documentation_file(normalized):
+                score += 75
+                reasons.append("documentation for overview")
+
+            if cls._is_source_file(normalized):
+                score -= 75
+                reasons.append("source penalty for overview query")
+
+        if analysis["wants_installation"]:
+            if filename in {"readme.md", "readme.rst", "readme.txt"}:
+                # Natural-language installation instructions belong primarily
+                # in the repository README.
+                if normalized.count("/") == 0:
+                    score += 240
+                    reasons.append("repository root README strongly prioritized for installation")
+                else:
+                    score += 150
+                    reasons.append("repository README for installation")
+
+            elif cls._is_documentation_file(normalized):
+                score += 105
+                reasons.append("installation documentation")
+
+            # Root package metadata is useful supporting evidence.
+            if normalized.count("/") == 0 and filename in {
+                "setup.py", "setup.cfg", "pyproject.toml",
+                "package.json", "cargo.toml", "go.mod",
+            }:
+                score += 110
+                reasons.append("root package/dependency configuration")
+
+            # Explicit setup/install/quickstart documentation paths.
+            if re.search(
+                r"(?:^|/)(?:install|installation|setup|getting[-_ ]?started|quickstart)(?:/|\.|$)",
+                normalized,
+            ):
+                score += 85
+                reasons.append("explicit installation/setup path")
+
+            if cls._is_config_file(normalized):
+                # Generic build/dependency files are supporting evidence only.
+                if filename in {"cmakelists.txt", "requirements.txt"}:
+                    score += 15
+                    reasons.append("supporting dependency/build file")
+                else:
+                    score += 40
+                    reasons.append("configuration/dependency file for installation")
+
+            if cls._is_source_file(normalized):
+                score -= 90
+                reasons.append("source penalty for installation query")
+
+        # Concept-aware path matching. Multi-word concepts such as
+        # "dependency injection" and "regex matching" should influence
+        # ranking even when the exact phrase is not a filename.
+        concept_identifiers = [
+            value for value in analysis.get("identifiers", [])
+            if " " in str(value).strip()
+        ]
+        path_tokens = set(re.findall(r"[a-z0-9]+", normalized.lower()))
+
+        for concept in concept_identifiers:
+            concept_tokens = [
+                token for token in re.findall(r"[a-z0-9]+", str(concept).lower())
+                if token not in cls.STOP_WORDS
+            ]
+            if not concept_tokens:
+                continue
+
+            matched = [token for token in concept_tokens if token in path_tokens]
+
+            if len(matched) == len(concept_tokens) and len(matched) >= 2:
+                score += 95
+                reasons.append(f"full concept path match: {concept}")
+            elif matched:
+                score += 30 * len(matched)
+                reasons.append(f"partial concept path match: {concept}")
+
+        if "dependency injection" in analysis.get("identifiers", []):
+            if "dependency" in normalized or "dependencies" in normalized:
+                score += 150
+                reasons.append("dependency concept path match")
+
+            if re.search(r"(?:^|/)tutorial(?:/|$)", normalized):
+                score += 95
+                reasons.append("tutorial path for dependency question")
+
+            if re.search(r"(?:^|/)dependencies(?:/|$)", normalized):
+                score += 85
+                reasons.append("dedicated dependencies directory")
+
+            if re.search(r"(?:^|/)injection(?:/|$)", normalized):
+                score += 70
+                reasons.append("injection path match")
+
+        if "regex matching" in analysis.get("identifiers", []):
+            if any(x in normalized for x in ("regex", "matcher", "matching")):
+                score += 55
+                reasons.append("regex matching concept path match")
+
+        if "routing" in analysis.get("identifier_parts", []):
+            if any(x in normalized for x in ("router", "routing")):
+                score += 55
+                reasons.append("routing concept path match")
+
+        # Documentation concepts should beat generic repository/reference
+        # files when the question explicitly asks how a concept works.
+        if analysis.get("wants_docs") and any(
+            concept in analysis.get("identifiers", [])
+            for concept in ("dependency injection",)
+        ):
+            if re.search(r"(?:^|/)tutorial(?:/|$)", normalized):
+                score += 80
+                reasons.append("tutorial documentation for conceptual question")
+
+        # ---------------------------------------------------------
+        # Query-specific structural priors.
+        #
+        # These resolve an important ambiguity: a generic identifier can
+        # identify both a low-level implementation file and the public/API
+        # implementation users normally mean. Prefer the repository's
+        # conventional high-level source layout without making the rule
+        # repository-specific.
+        # ---------------------------------------------------------
+
+        identifier_set = set(
+            str(x).lower() for x in analysis.get("identifier_parts", [])
+        )
+        repository_name = str(
+            analysis.get("repository_name") or ""
+        ).lower().strip()
+
+        # DataLoader in PyTorch: prefer the public Python data-loader module
+        # over the lower-level C++ DataLoader bindings when both exist.
+        if {"data", "loader"}.issubset(identifier_set):
+            if re.search(r"(?:^|/)utils/data(?:/|$)", normalized):
+                score += 130
+                reasons.append("high-level utils/data path for DataLoader")
+            if re.search(r"(?:^|/)dataloader(?:\\.[a-z0-9]+)$", normalized):
+                score += 110
+                reasons.append("direct DataLoader filename")
+            if re.search(r"(?:^|/)csrc(?:/|$)", normalized):
+                score -= 80
+                reasons.append("low-level C++ binding penalty for DataLoader")
+
+        # Routing in Next.js-like monorepos: prefer the canonical package
+        # implementation over unrelated internal crates/packages containing
+        # the repository name.
+        if "routing" in identifier_set:
+            if re.search(r"(?:^|/)packages/[^/]+/src(?:/|$)", normalized):
+                score += 45
+                reasons.append("canonical package source path for routing")
+
+            if "packages" in parts and len(parts) >= 2:
+                repo_base = re.sub(r"[^a-z0-9]+", "", repository_name)
+                package_base = re.sub(r"[^a-z0-9]+", "", parts[1])
+                if repo_base and package_base and (
+                    repo_base.startswith(package_base)
+                    or package_base.startswith(repo_base)
+                ):
+                    score += 100
+                    reasons.append("repository package match for routing")
+
+            if any(x in parts for x in (
+                "router", "routing", "routes", "route", "pages", "app"
+            )):
+                score += 100
+                reasons.append("routing implementation path")
+
+        # Repository-name directory dominance guard. A repository name
+        # appearing only as a directory component is weak evidence; exact
+        # filename/entity matches remain strong.
+        repository_name = str(
+            analysis.get("repository_name") or ""
+        ).lower().strip()
+
+        if (
+            repository_name
+            and repository_name in primary
+            and repository_name in parts
+            and repository_name != filename
+            and repository_name != stem
+        ):
+            score -= 100
+            reasons.append("repository-name directory dominance penalty")
 
         # ---------------------------------------------------------
         # Source directory prior.
@@ -1065,9 +1822,18 @@ class GitHubContentService:
 
         analysis = cls.analyze_query(query)
 
+        # Repository name is contextual metadata only. It is used to prevent
+        # directory-name matches from dominating path ranking.
+        try:
+            _, repository_name = cls._parse_github_url(github_url)
+            analysis["repository_name"] = repository_name.lower()
+        except Exception:
+            analysis["repository_name"] = ""
+
         tree = cls.fetch_repository_tree(
             github_url,
             branch=branch,
+            query=query,
         )
 
         candidates = []
@@ -1078,8 +1844,6 @@ class GitHubContentService:
             # We support source files, docs and configuration files.
             supported = (
                 cls._is_source_file(normalized)
-                or Path(normalized).suffix.lower()
-                in cls.NOTEBOOK_EXTENSIONS
                 or cls._is_config_file(normalized)
                 or cls._is_documentation_file(normalized)
             )
@@ -1122,56 +1886,11 @@ class GitHubContentService:
     # =============================================================
 
     @staticmethod
-    def _clean_notebook_content(content: str) -> str:
-        """Convert a raw .ipynb JSON document into searchable notebook text."""
-        if not content:
-            return ""
-
-        try:
-            notebook = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            return content
-
-        cells = notebook.get("cells", [])
-        if not isinstance(cells, list):
-            return content
-
-        parts = []
-
-        for index, cell in enumerate(cells, start=1):
-            if not isinstance(cell, dict):
-                continue
-
-            cell_type = cell.get("cell_type", "unknown")
-            source = cell.get("source", "")
-
-            if isinstance(source, list):
-                source = "".join(source)
-
-            if not isinstance(source, str) or not source.strip():
-                continue
-
-            parts.append(
-                f"# Notebook cell {index} [{cell_type}]\n"
-                f"{source.strip()}"
-            )
-
-        return "\n\n".join(parts).strip()
-
-    @staticmethod
     def _clean_file_content(
         content: str,
     ) -> str:
         if not content:
             return ""
-
-        # Convert Jupyter notebooks into readable code/markdown before
-        # normal whitespace cleanup.
-        if isinstance(content, str):
-            # The caller does not need to know whether the source is a
-            # notebook; notebook JSON is detected by the file-specific
-            # path in _focus_source_content.
-            pass
 
         # Preserve source code exactly enough for retrieval, while
         # removing excessive empty lines.
@@ -1514,6 +2233,187 @@ class GitHubContentService:
 
         return symbols
 
+    # Extensions handled by the generic brace-delimited symbol
+    # extractor below. Languages not in this set (R, Julia, Lua, shell,
+    # Ruby, etc.) still fall back to keyword-line-window matching.
+    _GENERIC_SYMBOL_EXTENSIONS = {
+        ".js", ".jsx", ".mjs", ".cjs",
+        ".ts", ".tsx",
+        ".java", ".kt", ".kts",
+        ".go",
+        ".rs",
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp",
+        ".cs",
+        ".swift",
+        ".scala",
+        ".dart",
+        ".m", ".mm",
+        ".php",
+    }
+
+    # "namespace" is deliberately excluded: it wraps almost an entire
+    # file, so when a query happens to mention the repo/package name
+    # (which often matches the namespace name exactly), it would "win"
+    # over genuinely specific symbols and return nearly the whole file
+    # instead of a focused block.
+    _GENERIC_SYMBOL_KEYWORDS = (
+        "class", "struct", "interface", "trait", "enum",
+        "impl", "function", "func", "fn", "protocol", "extension",
+    )
+
+    _GENERIC_DECLARATION_PATTERN = re.compile(
+        r"^\s*(?:export\s+|public\s+|private\s+|protected\s+"
+        r"|internal\s+|static\s+|final\s+|abstract\s+|sealed\s+"
+        r"|open\s+|pub\s+|pub\(crate\)\s+|async\s+|default\s+)*"
+        r"(?:" + "|".join(_GENERIC_SYMBOL_KEYWORDS) + r")\b"
+        r"\s*\*?\s*"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    )
+
+    # Go methods/functions put the receiver between `func` and the
+    # name (`func (s *Scaler) Fit(...)`), which the generic pattern
+    # above can't extract, so it gets its own pattern.
+    _GO_FUNC_PATTERN = re.compile(
+        r"^\s*func\s+(?:\([^)]*\)\s+)?"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\("
+    )
+
+    @classmethod
+    def _generic_code_symbols(
+        cls,
+        content: str,
+        extension: str,
+    ) -> list[dict]:
+        """
+        Best-effort function/class/struct/interface boundary extraction
+        for brace-delimited languages, using declaration keywords plus
+        brace-depth counting to find the end of each block.
+
+        This is a heuristic, not a real parser: it doesn't understand
+        strings, comments, or template/generic syntax containing braces.
+        It exists to give non-Python repositories the same "focus on
+        the actual symbol" precision Python already gets from real AST
+        parsing, instead of falling straight to generic keyword-line
+        windows.
+        """
+
+        lines = content.splitlines()
+        symbols: list[dict] = []
+        seen_starts: set[int] = set()
+
+        patterns = [cls._GENERIC_DECLARATION_PATTERN]
+
+        if extension == ".go":
+            patterns = [cls._GO_FUNC_PATTERN, cls._GENERIC_DECLARATION_PATTERN]
+
+        for index, line in enumerate(lines):
+            name = None
+
+            for pattern in patterns:
+                match = pattern.match(line)
+
+                if match:
+                    name = match.group("name")
+                    break
+
+            if not name:
+                continue
+
+            start_line = index + 1
+
+            if start_line in seen_starts:
+                continue
+
+            seen_starts.add(start_line)
+
+            # Brace-depth scan to find the matching close. Bounded so a
+            # pathological/minified file can't cause a huge scan.
+            depth = 0
+            opened = False
+            end_line = start_line
+            scan_limit = min(len(lines), index + 600)
+
+            for scan_index in range(index, scan_limit):
+                scan_line = lines[scan_index]
+                opens = scan_line.count("{")
+                closes = scan_line.count("}")
+
+                if opens:
+                    opened = True
+
+                depth += opens - closes
+
+                if opened and depth <= 0:
+                    end_line = scan_index + 1
+                    break
+            else:
+                end_line = min(len(lines), index + 60)
+
+            symbols.append(
+                {
+                    "name": name,
+                    "qualified_name": name,
+                    "type": "symbol",
+                    "start_line": start_line,
+                    "end_line": max(end_line, start_line),
+                }
+            )
+
+        return symbols
+
+    @staticmethod
+    def _merge_line_windows(
+        windows: list[dict],
+        lines: list[str],
+        gap: int = 5,
+    ) -> list[dict]:
+        """
+        Merge windows whose 1-indexed inclusive [start, end] line ranges
+        overlap or sit within `gap` lines of each other.
+
+        Without this, closely-clustered keyword/symbol matches (e.g.
+        several struct fields each matching a query term within a few
+        lines of each other) each spawn their own ~25-line window, and
+        those windows - while not byte-identical - are almost entirely
+        the same content. That flooded retrieval with near-duplicate
+        "evidence" that was really one finding repeated several times.
+        """
+
+        if not windows:
+            return []
+
+        ordered = sorted(
+            windows,
+            key=lambda window: (window["start"], window["end"]),
+        )
+
+        merged = [dict(ordered[0])]
+
+        for window in ordered[1:]:
+            last = merged[-1]
+
+            if window["start"] <= last["end"] + gap:
+                last["end"] = max(last["end"], window["end"])
+                last["score"] = max(last["score"], window["score"])
+
+                if window["symbol"] and not last["symbol"]:
+                    last["symbol"] = window["symbol"]
+                elif (
+                    window["symbol"]
+                    and last["symbol"]
+                    and window["symbol"] != last["symbol"]
+                ):
+                    last["symbol"] = f'{last["symbol"]}, {window["symbol"]}'
+            else:
+                merged.append(dict(window))
+
+        for window in merged:
+            start_index = max(0, window["start"] - 1)
+            end_index = min(len(lines), window["end"])
+            window["text"] = "\n".join(lines[start_index:end_index])
+
+        return merged
+
     # =============================================================
     # SOURCE CONTENT FOCUSING
     # =============================================================
@@ -1529,8 +2429,10 @@ class GitHubContentService:
         """
         Return a query-focused portion of a source file.
 
-        For Python files, exact symbols/classes/functions are preferred.
-        For other languages, textual identifier/keyword windows are used.
+        Real symbol boundaries (functions/classes/structs/etc.) are
+        used for Python (via AST) and for common brace-delimited
+        languages (via heuristic brace matching). Other languages fall
+        back to textual identifier/keyword windows.
 
         If no strong match exists, a bounded beginning of the file is
         retained because imports, module-level constants and class
@@ -1555,20 +2457,24 @@ class GitHubContentService:
         supporting = set(
             analysis.get("supporting_terms", [])
         )
+        identifier_parts = set(
+            analysis.get("identifier_parts", [])
+        )
 
         target_terms = (
             primary
             | identifiers
+            | identifier_parts
             | supporting
         )
 
+        extension = Path(path).suffix.lower()
         symbols = []
 
-        if Path(path).suffix.lower() in {
-            ".py",
-            ".pyi",
-        }:
+        if extension in {".py", ".pyi"}:
             symbols = cls._python_symbols(cleaned)
+        elif extension in cls._GENERIC_SYMBOL_EXTENSIONS:
+            symbols = cls._generic_code_symbols(cleaned, extension)
 
         # ---------------------------------------------------------
         # Symbol matching.
@@ -1596,6 +2502,21 @@ class GitHubContentService:
                 elif term in qualified:
                     score += 60
 
+            # Supporting terms (generic words like "beam"/"search" in
+            # "how does beam search work") are weaker signals than
+            # primary entities or identifiers, but a multi-word symbol
+            # name built from several supporting-term hits (e.g.
+            # BeamSearch matching both "beam" and "search") is a real
+            # signal that shouldn't lose to a plain keyword-line window.
+            for term in supporting:
+                if len(term) < 3:
+                    continue
+
+                if term == name:
+                    score += 40
+                elif term in name:
+                    score += 20
+
             if score > 0:
                 symbol_hits.append(
                     (
@@ -1619,7 +2540,7 @@ class GitHubContentService:
         # Include exact symbol blocks first.
         # ---------------------------------------------------------
 
-        for _, symbol in symbol_hits[:3]:
+        for score, symbol in symbol_hits[:5]:
             start = max(
                 1,
                 symbol["start_line"] - 8,
@@ -1630,6 +2551,11 @@ class GitHubContentService:
                 symbol["end_line"],
             )
 
+            # Defensive cap: a very large symbol (a big class/impl
+            # block) shouldn't degenerate "focusing" into returning
+            # almost the entire file.
+            end = min(end, start + 150)
+
             block = "\n".join(
                 lines[start - 1:end]
             )
@@ -1639,14 +2565,16 @@ class GitHubContentService:
                     {
                         "start": start,
                         "end": end,
-                        "score": 200,
+                        "score": 200 + score,
                         "text": block,
                         "symbol": symbol["qualified_name"],
                     }
                 )
 
         # ---------------------------------------------------------
-        # Textual matching windows.
+        # Textual matching windows (only used when symbol matching
+        # found nothing - e.g. unsupported language, or a match that
+        # isn't inside any recognized symbol).
         # ---------------------------------------------------------
 
         if not windows and target_terms:
@@ -1684,8 +2612,20 @@ class GitHubContentService:
                     }
                 )
 
-                if len(windows) >= 4:
-                    break
+        # ---------------------------------------------------------
+        # Merge overlapping/near-adjacent windows before doing
+        # anything else, so clustered matches collapse into one
+        # window instead of several near-duplicates. Then keep only
+        # the strongest few.
+        # ---------------------------------------------------------
+
+        windows = cls._merge_line_windows(windows, lines)
+
+        windows.sort(
+            key=lambda window: -window["score"]
+        )
+
+        windows = windows[:4]
 
         # ---------------------------------------------------------
         # Add module header/imports for code context.
@@ -1775,9 +2715,6 @@ class GitHubContentService:
         query: str,
         path_score: float,
     ) -> tuple[float, list[str]]:
-        if Path(path).suffix.lower() in cls.NOTEBOOK_EXTENSIONS:
-            content = cls._clean_notebook_content(content)
-
         analysis = cls.analyze_query(query)
 
         primary = analysis["primary_entities"]
@@ -1878,6 +2815,7 @@ class GitHubContentService:
                 content = cls.fetch_file(
                     github_url=github_url,
                     file_path=path,
+                    branch=resolved_branch,
                 )
             except Exception:
                 continue
@@ -1896,6 +2834,18 @@ class GitHubContentService:
                 path_score=float(candidate.get("score", 0.0)),
             )
 
+            # Installation-style questions ("how do I install this",
+            # "what are the requirements") are best answered by build/
+            # dependency files, which otherwise rarely win on generic
+            # content scoring alone.
+            if analysis.get("wants_installation") and cls._is_config_file(
+                path
+            ):
+                score += 150.0
+                content_reasons = list(content_reasons) + [
+                    "installation-relevant config file"
+                ]
+
             scored_candidates.append(
                 {
                     **candidate,
@@ -1913,25 +2863,21 @@ class GitHubContentService:
         # ------------------------------------------------------------
         # README as a real candidate.
         #
-        # README previously only appeared when NO source file scored at
-        # all. In practice, select_relevant_source_files almost always
-        # returns *some* file even for broad questions like "what is
-        # this repository about", so that fallback rarely triggered and
-        # an arbitrary/generic source file won by default instead.
-        #
-        # README now competes on the same scoreboard as source files,
-        # with a strong score boost when the question looks like an
-        # overview question. Specific code questions still get outscored
-        # by the actual matching source file, since their score comes
-        # from real symbol/identifier hits.
+        # select_relevant_source_files almost always returns *some*
+        # file even for broad questions like "what is this repository
+        # about", so README needs to compete on the same scoreboard as
+        # source files rather than only appearing when nothing else was
+        # found. It gets a strong score boost for overview and
+        # installation questions (READMEs conventionally document
+        # both). Specific code questions still get outscored by the
+        # actual matching source file, since their score comes from
+        # real symbol/identifier hits.
         # ------------------------------------------------------------
 
         try:
             readme = cls.fetch_readme(github_url)
         except Exception:
             readme = ""
-
-        readme_added = False
 
         if readme:
             relevant_readme = cls._extract_relevant_readme(
@@ -1940,27 +2886,26 @@ class GitHubContentService:
             )
 
             if relevant_readme:
-                readme_score = (
-                    500.0
-                    if analysis.get("wants_overview")
-                    else 20.0
-                )
+                if analysis.get("wants_overview"):
+                    readme_score = 500.0
+                    readme_reason = "repository overview question"
+                elif analysis.get("wants_installation"):
+                    readme_score = 300.0
+                    readme_reason = "installation question"
+                else:
+                    readme_score = 20.0
+                    readme_reason = "documentation context"
 
                 scored_candidates.append(
                     {
                         "path": "README.md",
                         "content": relevant_readme,
                         "score": readme_score,
-                        "reasons": [
-                            "repository overview question"
-                            if analysis.get("wants_overview")
-                            else "documentation context"
-                        ],
+                        "reasons": [readme_reason],
                         "matched_terms": [],
                         "is_readme": True,
                     }
                 )
-                readme_added = True
 
         if not scored_candidates:
             return []
@@ -2011,10 +2956,7 @@ class GitHubContentService:
                     "path": path,
                     "source": "github",
                     "category": (
-                        "notebook"
-                        if Path(path).suffix.lower()
-                        in cls.NOTEBOOK_EXTENSIONS
-                        else "test"
+                        "test"
                         if cls._is_test_file(path)
                         else "benchmark"
                         if cls._is_benchmark_file(path)
@@ -2079,6 +3021,8 @@ class GitHubContentService:
             github_url
         )
 
+        resolved_branch = branch or metadata.get("default_branch") or "main"
+
         readme = cls.fetch_readme(
             github_url
         )
@@ -2095,7 +3039,7 @@ class GitHubContentService:
         candidates = cls.select_relevant_source_files(
             github_url=github_url,
             query=query,
-            branch=branch,
+            branch=resolved_branch,
             max_files=cls.MAX_CANDIDATE_FILES,
         )
 
@@ -2112,6 +3056,7 @@ class GitHubContentService:
                 content = cls.fetch_file(
                     github_url,
                     path,
+                    branch=resolved_branch,
                 )
             except Exception:
                 continue

@@ -1,0 +1,1 @@
+".. _unsupervised-learning:\n\nUnsupervised learning\n-----------------------\n\n.. toctree::\n    :maxdepth: 2\n\n    modules/mixture\n    modules/manifold\n    modules/clustering\n    modules/biclustering\n    modules/decomposition\n    modules/covariance\n    modules/outlier_detection\n    modules/density\n    modules/neural_networks_unsupervised\n"

@@ -1,0 +1,1 @@
+{"owner":"BurntSushi","repository":"ripgrep","default_branch":"master","description":"ripgrep recursively searches directories for a regex pattern while respecting your gitignore","language":"Rust","stars":67420,"forks":2727,"url":"https://github.com/BurntSushi/ripgrep"}
