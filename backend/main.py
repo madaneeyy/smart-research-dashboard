@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 
 import os
 import time
@@ -111,7 +112,7 @@ ollama_client = ollama.Client(host=OLLAMA_HOST)
 app = FastAPI(
     title="Smart Research AI API",
     description="Structure-aware RAG with HybridRetriever and Qwen.",
-    version="2.2.0",
+    version="2.4.0",
 )
 
 
@@ -177,6 +178,8 @@ class AskRequest(BaseModel):
         default_factory=list,
         description="Optional previous user/assistant messages.",
     )
+    chat_id: Optional[str] = Field(default=None, description="Stable chat/session identifier.")
+
 
     top_k: Optional[int] = Field(
         default=None,
@@ -803,8 +806,175 @@ def health() -> Dict[str, Any]:
 
 
 # ============================================================
+# GITHUB URL DETECTION
+# ============================================================
+
+# Matches GitHub repository URLs embedded anywhere in a message. It accepts:
+#   https://github.com/owner/repo
+#   http://github.com/owner/repo
+#   https://www.github.com/owner/repo.git
+#   github.com/owner/repo/tree/main
+#   github.com/owner/repo/blob/main/file.py
+#   github.com/owner/repo/issues/123
+#   github.com/owner/repo/pull/123
+#   github.com/owner/repo/discussions/123
+#   git@github.com:owner/repo.git
+#   ssh://git@github.com/owner/repo.git
+#
+# The current GitHubContentService operates at repository level, so all
+# repository resource URLs are normalized to https://github.com/owner/repo.
+import re
+
+GITHUB_HTTPS_RE = re.compile(
+    r"(?P<url>https?://(?:www\.)?github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?P<path>/[^\s<>'\"`\]]*)?)",
+    re.IGNORECASE,
+)
+
+GITHUB_BARE_RE = re.compile(
+    r"(?P<url>(?:www\.)?github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?P<path>/[^\s<>'\"`\]]*)?)",
+    re.IGNORECASE,
+)
+
+GITHUB_SSH_RE = re.compile(
+    r"(?P<url>(?:ssh://git@|git@)github\.com[:/](?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?P<path>/[^\s<>'\"`]*)?)",
+    re.IGNORECASE,
+)
+
+GITHUB_RESOURCE_TYPES = {
+    "tree", "blob", "raw", "commit", "commits", "issues", "issue",
+    "pull", "pulls", "discussions", "releases", "actions", "wiki",
+    "projects", "security", "settings", "compare", "tags", "branches",
+}
+
+
+def extract_github_reference(text: str) -> Dict[str, Optional[str]]:
+    """Extract and normalize a GitHub repository reference from free text."""
+    empty: Dict[str, Optional[str]] = {
+        "original_url": None,
+        "repository_url": None,
+        "owner": None,
+        "repo": None,
+        "resource_type": None,
+    }
+    if not text:
+        return empty
+
+    match = (
+        GITHUB_HTTPS_RE.search(text)
+        or GITHUB_SSH_RE.search(text)
+        or GITHUB_BARE_RE.search(text)
+    )
+    if not match:
+        return empty
+
+    owner = match.group("owner")
+    repo = match.group("repo").rstrip(".,;:!?)]}")
+    path = (match.groupdict().get("path") or "").rstrip(".,;:!?)]}")
+
+    # .git is a transport suffix, not part of the repository name.
+    repo = repo[:-4] if repo.lower().endswith(".git") else repo
+
+    resource_type = None
+    path_parts = [part for part in path.split("/") if part]
+    if path_parts and path_parts[0].lower() in GITHUB_RESOURCE_TYPES:
+        resource_type = path_parts[0].lower()
+
+    original = match.group("url").rstrip(".,;:!?)]}")
+    repository_url = f"https://github.com/{owner}/{repo}"
+
+    resource_path = None
+    if path_parts:
+        if resource_type:
+            resource_path = "/".join(path_parts[1:]) or None
+        else:
+            resource_path = "/".join(path_parts)
+
+    return {
+        "original_url": original,
+        "repository_url": repository_url,
+        "owner": owner,
+        "repo": repo,
+        "resource_type": resource_type,
+        "resource_path": resource_path,
+    }
+
+
+def extract_github_url(text: str) -> Dict[str, Optional[str]]:
+    """Compatibility wrapper for callers expecting extract_github_url()."""
+    return extract_github_reference(text)
+
+
+def remove_github_reference(text: str, reference: Dict[str, Optional[str]]) -> str:
+    """Remove the detected URL so the RAG query contains only the question."""
+    original = reference.get("original_url")
+    if not original:
+        return text.strip()
+
+    cleaned = text.replace(original, " ")
+    # Also remove the normalized repository URL if the input was a bare URL
+    # or if punctuation/transport syntax made the exact replacement differ.
+    repository_url = reference.get("repository_url")
+    if repository_url:
+        cleaned = re.sub(re.escape(repository_url), " ", cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or "What is this repository about?"
+
+# ============================================================
 # ASK
 # ============================================================
+
+
+# ============================================================
+# CONVERSATION-AWARE QUERY RESOLUTION
+# ============================================================
+_CONVERSATIONAL_PATTERNS = (
+    r"\bwhat about\b",
+    r"\bhow about\b",
+    r"\bwhat does (?:it|this|that)\b",
+    r"\bhow does (?:it|this|that)\b",
+    r"\bhow is (?:it|this|that)\b",
+    r"\bwhere is (?:it|this|that)\b",
+    r"\bwhere are (?:it|this|that)\b",
+    r"\bwhy does (?:it|this|that)\b",
+    r"\b(?:its|their)\s+(?:tests?|implementation|usage|code|files?|architecture)\b",
+    r"\bthe implementation\b",
+    r"\bthe tests?\b",
+)
+
+def _extract_conversation_terms(history: List[Dict[str, str]]) -> List[str]:
+    terms=[]; seen=set()
+    for msg in reversed(clean_history(history, max_messages=8)):
+        if msg.get('role')!='user': continue
+        content=str(msg.get('content') or '')
+        for groups in re.findall(r'`([^`]+)`|(?<![\w])([A-Z][A-Za-z0-9_]{2,})|(?<![\w])([A-Za-z_][A-Za-z0-9_]*\(\))', content):
+            candidate=next((g for g in groups if g), '').strip('`.,:;!?()[]{}')
+            if len(candidate)<3 or candidate.lower() in seen: continue
+            seen.add(candidate.lower()); terms.append(candidate)
+            if len(terms)>=6: return terms
+    return terms
+
+def resolve_conversational_query(question: str, history: List[Dict[str, str]]) -> Dict[str, Any]:
+    original=question.strip(); recent=clean_history(history, max_messages=8)
+    base={"original_query":original,"resolved_query":original,"was_resolved":False,"resolution_type":"none","referenced_terms":[]}
+    if not recent: return base
+    low=original.lower(); followup=any(re.search(p,low) for p in _CONVERSATIONAL_PATTERNS)
+    short=len(re.findall(r'\w+',low))<=5
+    if not followup and not short: return base
+    previous=next((str(m.get('content') or '').strip() for m in reversed(recent) if m.get('role')=='user' and str(m.get('content') or '').strip()!=original),'')
+    terms=_extract_conversation_terms(recent)
+    parts=[original]
+    if terms: parts.append('Conversation entities: '+', '.join(terms))
+    if previous: parts.append('Previous user question: '+previous)
+    return {"original_query":original,"resolved_query":"\n".join(parts),"was_resolved":True,"resolution_type":"reference_followup" if followup else "short_followup","referenced_terms":terms}
+
+ACTIVE_GITHUB_CONTEXT: Dict[str, Dict[str, Optional[str]]] = {}
+def get_active_github_context(chat_id: Optional[str]):
+    return ACTIVE_GITHUB_CONTEXT.get(chat_id) if chat_id else None
+def set_active_github_context(chat_id: Optional[str], reference: Dict[str, Optional[str]]):
+    if chat_id and reference.get('repository_url'):
+        ACTIVE_GITHUB_CONTEXT[chat_id]=dict(reference)
+
 
 @app.post("/ask")
 def ask_ai(request: AskRequest) -> Dict[str, Any]:
@@ -813,6 +983,82 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     timings: Dict[str, float] = {}
 
     question = request.question.strip()
+
+    # ------------------------------------------------------------
+    # GITHUB CONTEXT PRIORITY
+    # ------------------------------------------------------------
+    # A URL written in the current message always wins. This allows
+    # repository switching inside the same chat.
+    #
+    # Priority:
+    #   1. current-message GitHub URL
+    #   2. explicit request.github_url
+    #   3. active repository for this chat
+    #   4. no GitHub context
+    # ------------------------------------------------------------
+
+    active_github = get_active_github_context(request.chat_id)
+    current_reference = extract_github_reference(question)
+
+    if current_reference.get("repository_url"):
+        github_reference = current_reference
+        github_url = current_reference["repository_url"]
+
+        question = remove_github_reference(
+            question,
+            current_reference,
+        )
+
+        set_active_github_context(
+            request.chat_id,
+            current_reference,
+        )
+
+    elif request.github_url:
+        explicit_reference = extract_github_reference(
+            request.github_url.strip()
+        )
+
+        if explicit_reference.get("repository_url"):
+            github_reference = explicit_reference
+            github_url = explicit_reference["repository_url"]
+
+            set_active_github_context(
+                request.chat_id,
+                explicit_reference,
+            )
+        else:
+            github_reference = {}
+            github_url = ""
+
+    elif active_github and active_github.get("repository_url"):
+        github_url = active_github["repository_url"]
+
+        github_reference = {
+            "original_url": active_github.get("repository_url"),
+            "repository_url": active_github.get("repository_url"),
+            "owner": active_github.get("owner"),
+            "repo": active_github.get("repo"),
+            "resource_type": active_github.get("resource_type"),
+            "resource_path": active_github.get("resource_path"),
+        }
+
+    else:
+        github_reference = {}
+        github_url = ""
+
+    # ------------------------------------------------------------
+    # CONVERSATION-AWARE QUERY RESOLUTION
+    # ------------------------------------------------------------
+    # Only the retrieval query is enriched. The original question
+    # remains unchanged for the final LLM response.
+    # ------------------------------------------------------------
+
+    resolution = resolve_conversational_query(
+        question=question,
+        history=request.history,
+    )
+    retrieval_query = resolution["resolved_query"]
 
     if not question:
         raise HTTPException(
@@ -838,12 +1084,8 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     # existing RAG pipeline unchanged after context creation.
     # ========================================================
 
-    github_url = (
-        request.github_url.strip()
-        if request.github_url
-        else ""
-    )
-
+    # github_url has already been normalized above. Do not overwrite the
+    # automatically detected value here.
     context_start = time.perf_counter()
 
     documents: List[Dict[str, Any]] = []
@@ -851,7 +1093,7 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     if github_url:
         documents = build_github_documents(
             github_url=github_url,
-            question=question,
+            question=retrieval_query,
             branch=request.branch,
         )
         context_origin = "github"
@@ -889,17 +1131,15 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
             }
         ]
     else:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Provide either 'github_url' or 'context'. "
-                "For chat-with-GitHub, use 'github_url'."
-            ),
-        )
+        # General chat mode: no GitHub repository or research context.
+        # Skip document acquisition and retrieval; Qwen answers using
+        # general knowledge plus conversation history.
+        context_origin = "general_chat"
+        documents = []
 
     timings["github_or_context_ms"] = _elapsed_ms(context_start)
 
-    if not documents:
+    if context_origin != "general_chat" and not documents:
         raise HTTPException(
             status_code=502 if github_url else 400,
             detail=(
@@ -921,112 +1161,74 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     )
 
     # ========================================================
-    # 1. STRUCTURE-AWARE CHUNKING
+    # 1-4. CONTEXT PREPARATION / RETRIEVAL / PROMPT
     # ========================================================
 
-    # ========================================================
-    # 1. STRUCTURE-AWARE CHUNKING
-    # ========================================================
-    #
-    # GitHub repositories are now chunked file-by-file.
-    # We deliberately DO NOT concatenate selected files into one
-    # giant document before chunking.
-    # ========================================================
+    chunks: List[Dict[str, Any]] = []
+    retrieved_chunks: List[Dict[str, Any]] = []
+    retrieved_context = ""
 
-    chunk_start = time.perf_counter()
+    if context_origin == "general_chat":
+        prompt_start = time.perf_counter()
+        system_prompt = """
+You are a helpful AI assistant.
 
-    try:
-        chunks = document_chunker.chunk_documents(
-            documents
+Answer the user's question clearly and accurately.
+Use the conversation history when relevant. Do not invent facts,
+sources, files, repository details, or citations.
+For technical questions, explain concepts accurately and preserve
+technical terminology. Answer directly and appropriately concisely.
+""".strip()
+        messages = build_messages(
+            question=question,
+            history=request.history,
+            system_prompt=system_prompt,
         )
-
-        timings["chunking_ms"] = _elapsed_ms(chunk_start)
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail={
+        timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
+    else:
+        # Existing GitHub/research RAG pipeline.
+        chunk_start = time.perf_counter()
+        try:
+            chunks = document_chunker.chunk_documents(documents)
+            timings["chunking_ms"] = _elapsed_ms(chunk_start)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail={
                 "message": "Failed to chunk research documents.",
                 "error": str(exc),
-            },
-        )
+            })
 
-    if not chunks:
-        raise HTTPException(
-            status_code=400,
-            detail="No usable research chunks were created.",
-        )
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No usable research chunks were created.")
 
-    # ========================================================
-    # 2. HYBRID RETRIEVAL
-    # ========================================================
-
-    retrieval_start = time.perf_counter()
-
-    try:
-        retrieved_chunks = hybrid_retriever.retrieve(
-            question=question,
-            chunks=chunks,
-            top_k=min(
-                requested_top_k,
-                len(chunks),
-            ),
-        )
-
-        timings["hybrid_retrieval_ms"] = _elapsed_ms(retrieval_start)
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail={
+        retrieval_start = time.perf_counter()
+        try:
+            retrieved_chunks = hybrid_retriever.retrieve(
+                question=retrieval_query,
+                chunks=chunks,
+                top_k=min(requested_top_k, len(chunks)),
+            )
+            timings["hybrid_retrieval_ms"] = _elapsed_ms(retrieval_start)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail={
                 "message": "Hybrid retrieval failed.",
                 "error": str(exc),
-            },
+            })
+
+        if not retrieved_chunks:
+            raise HTTPException(status_code=404, detail="HybridRetriever did not find any relevant evidence for this question.")
+
+        retrieved_context = format_retrieved_context(retrieved_chunks)
+        if not retrieved_context.strip():
+            raise HTTPException(status_code=500, detail="Retriever returned chunks but their content was empty.")
+
+        prompt_start = time.perf_counter()
+        system_prompt = build_system_prompt(retrieved_context)
+        messages = build_messages(
+            question=question,
+            history=request.history,
+            system_prompt=system_prompt,
         )
-
-    if not retrieved_chunks:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "HybridRetriever did not find any relevant "
-                "evidence for this question."
-            ),
-        )
-
-    # ========================================================
-    # 3. FORMAT RETRIEVED EVIDENCE
-    # ========================================================
-
-    retrieved_context = format_retrieved_context(
-        retrieved_chunks
-    )
-
-    if not retrieved_context.strip():
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Retriever returned chunks but their content "
-                "was empty."
-            ),
-        )
-
-    # ========================================================
-    # 4. BUILD QWEN PROMPT
-    # ========================================================
-
-    prompt_start = time.perf_counter()
-
-    system_prompt = build_system_prompt(
-        retrieved_context
-    )
-
-    messages = build_messages(
-        question=question,
-        history=request.history,
-        system_prompt=system_prompt,
-    )
-
-    timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
+        timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
 
     # ========================================================
     # 5. QWEN / OLLAMA
@@ -1162,7 +1364,22 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
         "retriever": "HybridRetriever",
         "chunker": "DocumentChunker",
         "context_origin": context_origin,
+        "github_resource_type": github_reference.get("resource_type"),
+        "github_detected": bool(github_reference.get("repository_url")),
+        "chat_mode": (
+            "general" if context_origin == "general_chat"
+            else "github" if context_origin == "github"
+            else "research"
+        ),
         "github_url": github_url or None,
+        "query_resolution": {
+            "original_query": resolution["original_query"],
+            "resolved_query": resolution["resolved_query"],
+            "was_resolved": resolution["was_resolved"],
+            "resolution_type": resolution["resolution_type"],
+            "referenced_terms": resolution["referenced_terms"],
+        },
+        "query_resolution": resolution,
 
         "chunks_created": len(chunks),
         "chunks_retrieved": len(retrieved_chunks),

@@ -1,0 +1,1 @@
+".PHONY: all clean ca server\n\nca:\n\tmake -C $@ all\n\nserver:\n\tmake -C $@ all\n\nall: ca server\n\nclean:\n\tmake -C ca clean\n\tmake -C server clean\n"

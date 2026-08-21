@@ -1,0 +1,1 @@
+"#include <gtest/gtest.h>\n\n#include \"test_utils.h\"\n\nstd::string g_data_dir;\n\nint main(int argc, char *argv[]) {\n  testing::InitGoogleTest(&argc, argv);\n  if (argc < 2)\n    throw std::invalid_argument(\"missing data directory\");\n  g_data_dir = argv[1];\n  return RUN_ALL_TESTS();\n}\n"

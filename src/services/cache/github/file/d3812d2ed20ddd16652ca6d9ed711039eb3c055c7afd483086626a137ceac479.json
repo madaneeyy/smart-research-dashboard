@@ -1,0 +1,1 @@
+"#pragma once\n\nnamespace ctranslate2 {\n\n  enum class LogLevel {\n    Off = -3,\n    Critical = -2,\n    Error = -1,\n    Warning = 0,\n    Info = 1,\n    Debug = 2,\n    Trace = 3,\n  };\n\n  void init_logger();\n  void set_log_level(const LogLevel level);\n  LogLevel get_log_level();\n\n}\n"

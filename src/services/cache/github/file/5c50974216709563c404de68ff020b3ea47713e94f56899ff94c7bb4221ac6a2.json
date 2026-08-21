@@ -1,0 +1,1 @@
+"#pragma once\n\n#include \"op.h\"\n\nnamespace ctranslate2 {\n  namespace ops {\n\n    class Cos : public UnaryOp {\n    public:\n      void operator()(const StorageView& x, StorageView& y) const;\n    };\n\n  }\n}\n"

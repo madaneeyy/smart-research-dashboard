@@ -1,0 +1,1 @@
+"#pragma once\n\n#include <random>\n\nnamespace ctranslate2 {\n\n  void set_random_seed(const unsigned int seed);\n  unsigned int get_random_seed();\n  std::mt19937& get_random_generator();\n\n}\n"

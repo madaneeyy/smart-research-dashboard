@@ -1,0 +1,1 @@
+"# Certificate Examples for mTLS\n\nThis has some generated certificates for mTLS utilization. The idea is to be\nable to have testing around how Requests handles client certificates.\n"

@@ -1,0 +1,1 @@
+"transformers==5.9.0.*;platform_system=='Linux'\nsentencepiece;platform_system=='Linux'\nprotobuf;platform_system=='Linux'\npytest\nwurlitzer==3.1.*;sys_platform=='linux'\ntorch==2.12\n"

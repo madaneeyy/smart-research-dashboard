@@ -1,0 +1,1 @@
+"fairseq==0.12.2\ntensorflow>=2.11,<2.14\nOpenNMT-tf\nOpenNMT-py==2.2.*\npytest\nwurlitzer==3.1.*\ntorch==2.12\n"

@@ -1,0 +1,1 @@
+".PHONY: all clean\n\nall:\n\tmake -C client all\n\nclean:\n\tmake -C client clean\n"

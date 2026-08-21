@@ -1,0 +1,1 @@
+"# Expired Certificates and Configuration for Testing\n\nThis has a valid certificate authority in [ca](./ca) and an invalid server\ncertificate in [server](./server).\n\nThis can all be regenerated with:\n\n```\nmake clean\nmake all\n```\n"

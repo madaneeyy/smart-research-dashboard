@@ -1,0 +1,1 @@
+".PHONY: all clean\n\nroot_files = ca-private.key ca.crt\n\nca-private.key:\n\topenssl genrsa -out ca-private.key 2048\n\nall: ca-private.key\n\topenssl req -x509 -sha256 -days 7300 -key ca-private.key -out ca.crt -config ca.cnf\n\tln -s ca.crt cacert.pem\n\nclean:\n\trm -f cacert.pem ca.crt ca-private.key *.csr\n"
