@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import ollama
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,11 @@ except ImportError:
 from src.services.rag.chunker import DocumentChunker
 from src.services.rag.hybrid_retriever import HybridRetriever
 from src.services.github_content import GitHubContentService
+from src.services.document_service import DocumentService
+from src.services.document_cache import DocumentCache
+from src.services.context_router import ContextRouter
+from src.services.document_rag.document_chunker import UploadedDocumentChunker
+from src.services.document_rag.document_retriever import DocumentRetriever
 import inspect
 
 print("=" * 80)
@@ -100,6 +105,20 @@ document_chunker = DocumentChunker(
     max_chars=1800,
     min_chars=250,
     overlap_chars=250,
+)
+
+uploaded_document_chunker = UploadedDocumentChunker(
+    target_chars=1000,
+    max_chars=1600,
+    overlap_chars=180,
+    min_chunk_chars=20,
+)
+
+document_retriever = DocumentRetriever(
+    overview_top_k=7,
+    focused_top_k=6,
+    candidate_multiplier=5,
+    mmr_lambda=0.72,
 )
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
@@ -180,6 +199,12 @@ class AskRequest(BaseModel):
     )
     chat_id: Optional[str] = Field(default=None, description="Stable chat/session identifier.")
 
+    # Uploaded document IDs attached to this chat/request.
+    # Optional so existing GitHub/general-chat clients remain compatible.
+    document_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Uploaded document IDs to use as RAG context.",
+    )
 
     top_k: Optional[int] = Field(
         default=None,
@@ -386,6 +411,14 @@ def format_retrieved_context(
             f"Section: {section}",
         ]
 
+        page = chunk.get("page")
+        if page is not None:
+            metadata_lines.append(f"Page: {page}")
+
+        filename = str(chunk.get("filename") or "").strip()
+        if filename and filename != source:
+            metadata_lines.append(f"Document: {filename}")
+
         if parent_section:
             metadata_lines.append(
                 f"Parent section: {parent_section}"
@@ -419,7 +452,7 @@ You are a technical research assistant.
 Answer the user's question using the retrieved evidence provided below.
 
 Your goal is to give a clear, useful, technically accurate answer while
-staying faithful to the retrieved source.
+staying faithful to the retrieved source. Treat the active source as authoritative for source-specific claims.
 
 ============================================================
 GROUNDING RULES
@@ -706,6 +739,12 @@ def serialize_chunk(
         "language": chunk.get("language"),
         "char_count": chunk.get("char_count"),
         "category": chunk.get("category"),
+        "document_id": chunk.get("document_id"),
+        "filename": chunk.get("filename"),
+        "page": chunk.get("page"),
+        "pages": chunk.get("pages"),
+        "retrieval_source": chunk.get("retrieval_source"),
+        "retriever_name": chunk.get("retriever_name"),
         "github_score": chunk.get("github_score"),
         "github_rank": chunk.get("github_rank"),
         "github_reasons": chunk.get("github_reasons"),
@@ -732,6 +771,17 @@ def serialize_chunk(
         "primary_protected",
         "candidate_pool_size",
         "post_filter_pool_size",
+
+        # Uploaded-document retrieval diagnostics.
+        "relevance_score",
+        "similarity_score",
+        "lexical_score",
+        "phrase_score",
+        "section_score",
+        "intent_score",
+        "redundancy_score",
+        "retrieval_source",
+        "retriever_name",
 
         # GitHub file-selection diagnostics.
         "github_score",
@@ -760,6 +810,8 @@ def root() -> Dict[str, Any]:
         "ollama_host": OLLAMA_HOST,
         "retriever": "HybridRetriever",
         "chunker": "DocumentChunker",
+        "document_chunker": "UploadedDocumentChunker",
+        "document_retriever": "DocumentRetriever",
         "top_k": DEFAULT_TOP_K,
     }
 
@@ -787,8 +839,10 @@ def health() -> Dict[str, Any]:
             "model": OLLAMA_MODEL,
             "model_available": OLLAMA_MODEL in models,
             "models": models,
-            "retriever": "HybridRetriever",
-            "chunker": "DocumentChunker",
+            "github_retriever": "HybridRetriever",
+            "github_chunker": "DocumentChunker",
+            "document_retriever": "DocumentRetriever",
+            "document_chunker": "UploadedDocumentChunker",
             "github_content": "GitHubContentService",
         }
 
@@ -926,6 +980,68 @@ def remove_github_reference(text: str, reference: Dict[str, Optional[str]]) -> s
 
 
 # ============================================================
+# UPLOADED DOCUMENT CONTEXT
+# ============================================================
+
+# Runtime document store. The document bytes are not kept after extraction;
+# only normalized text is retained. This is intentionally in-memory for the
+# first document-RAG phase and can later be replaced by persistent storage.
+UPLOADED_DOCUMENTS: Dict[str, Dict[str, Any]] = {}
+
+ACTIVE_DOCUMENT_CONTEXT: Dict[str, List[str]] = {}
+
+
+def set_active_documents(
+    chat_id: Optional[str],
+    document_ids: List[str],
+) -> None:
+    if not chat_id:
+        return
+
+    valid_ids = [
+        document_id
+        for document_id in document_ids
+        if document_id in UPLOADED_DOCUMENTS
+    ]
+
+    ACTIVE_DOCUMENT_CONTEXT[chat_id] = valid_ids
+
+
+def get_active_document_ids(
+    chat_id: Optional[str],
+) -> List[str]:
+    if not chat_id:
+        return []
+
+    return list(
+        ACTIVE_DOCUMENT_CONTEXT.get(chat_id, [])
+    )
+
+
+def get_documents_for_chat(
+    chat_id: Optional[str],
+    document_ids: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    ids = (
+        document_ids
+        if document_ids is not None
+        else get_active_document_ids(chat_id)
+    )
+
+    documents = []
+
+    for document_id in ids:
+        document = UPLOADED_DOCUMENTS.get(document_id)
+
+        if not document:
+            continue
+
+        documents.append(document)
+
+    return documents
+
+
+# ============================================================
 # CONVERSATION-AWARE QUERY RESOLUTION
 # ============================================================
 _CONVERSATIONAL_PATTERNS = (
@@ -969,11 +1085,91 @@ def resolve_conversational_query(question: str, history: List[Dict[str, str]]) -
     return {"original_query":original,"resolved_query":"\n".join(parts),"was_resolved":True,"resolution_type":"reference_followup" if followup else "short_followup","referenced_terms":terms}
 
 ACTIVE_GITHUB_CONTEXT: Dict[str, Dict[str, Optional[str]]] = {}
+ACTIVE_SOURCE_CONTEXT: Dict[str, str] = {}
+
+def get_active_source_scope(chat_id: Optional[str]) -> Optional[str]:
+    return ACTIVE_SOURCE_CONTEXT.get(chat_id) if chat_id else None
+
+def set_active_source_scope(chat_id: Optional[str], scope: str) -> None:
+    if chat_id:
+        ACTIVE_SOURCE_CONTEXT[chat_id] = scope
 def get_active_github_context(chat_id: Optional[str]):
     return ACTIVE_GITHUB_CONTEXT.get(chat_id) if chat_id else None
 def set_active_github_context(chat_id: Optional[str], reference: Dict[str, Optional[str]]):
     if chat_id and reference.get('repository_url'):
         ACTIVE_GITHUB_CONTEXT[chat_id]=dict(reference)
+
+
+@app.get("/document-cache-stats")
+def document_cache_stats() -> Dict[str, Any]:
+    return DocumentCache.stats()
+
+
+@app.post("/upload-document")
+async def upload_document(
+    file: UploadFile = File(...),
+    chat_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Extract an uploaded document and attach it to the current chat.
+
+    The endpoint intentionally stores normalized text rather than raw bytes.
+    Uploaded documents are later processed by the independent
+    UploadedDocumentChunker + DocumentRetriever pipeline.
+    """
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file must have a filename.",
+        )
+
+    try:
+        raw_bytes = await file.read()
+
+        document = DocumentCache.get_or_extract(
+            filename=file.filename,
+            raw_bytes=raw_bytes,
+            content_type=file.content_type,
+            extractor=DocumentService.extract,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    document_id = document["document_id"]
+
+    UPLOADED_DOCUMENTS[document_id] = document
+
+    if chat_id:
+        current_ids = get_active_document_ids(chat_id)
+
+        if document_id not in current_ids:
+            current_ids.append(document_id)
+
+        set_active_documents(
+            chat_id,
+            current_ids,
+        )
+
+    return {
+        "document_id": document_id,
+        "filename": document["filename"],
+        "pages": document.get("pages"),
+        "characters": document["characters"],
+        "size_bytes": document["size_bytes"],
+        "context_origin": "upload",
+        "active_document_ids": (
+            get_active_document_ids(chat_id)
+            if chat_id
+            else [document_id]
+        ),
+    }
 
 
 @app.post("/ask")
@@ -1000,6 +1196,21 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     active_github = get_active_github_context(request.chat_id)
     current_reference = extract_github_reference(question)
 
+    # A new repository in the current message starts a new repository
+    # context for the LLM. The persisted chat history is NOT deleted;
+    # it is simply not used as model history for this request.
+    previous_repo = str(
+        (active_github or {}).get("repository_url") or ""
+    ).rstrip("/").lower()
+    current_repo = str(
+        current_reference.get("repository_url") or ""
+    ).rstrip("/").lower()
+
+    repository_switched = bool(
+        current_repo
+        and current_repo != previous_repo
+    )
+
     if current_reference.get("repository_url"):
         github_reference = current_reference
         github_url = current_reference["repository_url"]
@@ -1020,6 +1231,15 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
         )
 
         if explicit_reference.get("repository_url"):
+            explicit_repo = str(
+                explicit_reference.get("repository_url") or ""
+            ).rstrip("/").lower()
+
+            repository_switched = bool(
+                explicit_repo
+                and explicit_repo != previous_repo
+            )
+
             github_reference = explicit_reference
             github_url = explicit_reference["repository_url"]
 
@@ -1060,6 +1280,12 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     )
     retrieval_query = resolution["resolved_query"]
 
+    # Important distinction:
+    # - request.history is still used by the resolver.
+    # - model_history controls what Qwen sees.
+    # When switching repositories, old repository turns must not contaminate
+    # the answer. The active repository's retrieved evidence becomes the
+    # authoritative context.
     if not question:
         raise HTTPException(
             status_code=400,
@@ -1090,52 +1316,110 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
 
     documents: List[Dict[str, Any]] = []
 
-    if github_url:
-        documents = build_github_documents(
+    if request.document_ids is not None:
+        set_active_documents(request.chat_id, request.document_ids)
+
+    active_document_ids = get_active_document_ids(request.chat_id)
+    uploaded_documents = get_documents_for_chat(request.chat_id, request.document_ids)
+
+    route = ContextRouter.route(
+        question=question,
+        history=request.history,
+        github_reference=github_reference,
+        has_documents=bool(uploaded_documents),
+        resolved_query=retrieval_query,
+    )
+    context_scope = route["scope"]
+    previous_scope = get_active_source_scope(request.chat_id)
+    source_switched = bool(previous_scope and previous_scope != context_scope and context_scope != "general")
+    set_active_source_scope(request.chat_id, context_scope)
+
+    # Never carry retrieval terms from the previous source into a newly
+    # selected repository/document. Conversation-aware resolution is only
+    # useful once the source is stable.
+    if repository_switched or source_switched:
+        retrieval_query = question
+
+    model_history = [] if repository_switched or source_switched else request.history
+
+    if context_scope == "github":
+        if not github_url:
+            raise HTTPException(status_code=400, detail="No active GitHub repository is available for this question.")
+        documents = [
+            {
+                **document,
+                "source": "github",
+                "source_type": "github_repository",
+            }
+            for document in build_github_documents(
+                github_url=github_url,
+                question=retrieval_query,
+                branch=request.branch,
+            )
+        ]
+        context_origin = "github"
+
+    elif context_scope == "document":
+        if not uploaded_documents:
+            raise HTTPException(status_code=400, detail="No active uploaded document is available for this question.")
+        documents = [
+            {
+                **document,
+                "source": "upload",
+                "source_type": "uploaded_document",
+            }
+            for document in uploaded_documents
+        ]
+        context_origin = "upload"
+
+    elif context_scope == "hybrid":
+        if not github_url or not uploaded_documents:
+            raise HTTPException(status_code=400, detail="A hybrid question requires both an active GitHub repository and an uploaded document.")
+        github_documents = build_github_documents(
             github_url=github_url,
             question=retrieval_query,
             branch=request.branch,
         )
-        context_origin = "github"
-    elif request.context:
-        context = request.context.strip()
-        context_origin = "provided_context"
 
-        if not context:
-            raise HTTPException(
-                status_code=400,
-                detail="Research context must not be empty.",
-            )
-
-        if len(context) > MAX_CONTEXT_CHARACTERS:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    "Research context is too large. "
-                    f"Maximum allowed size: "
-                    f"{MAX_CONTEXT_CHARACTERS:,} characters."
-                ),
-            )
-
-        documents = [
+        upload_documents = [
             {
-                "content": context,
-                "path": (
-                    request.source_path
-                    or "research/repository_context.md"
-                ),
-                "category": (
-                    request.source_category
-                    or "documentation"
-                ),
+                **document,
+                "source": "upload",
+                "source_type": "uploaded_document",
             }
+            for document in uploaded_documents
         ]
+
+        github_documents = [
+            {
+                **document,
+                "source": "github",
+                "source_type": "github_repository",
+            }
+            for document in github_documents
+        ]
+
+        documents = upload_documents + github_documents
+        context_origin = "github+upload"
+
+    elif request.context and request.context.strip():
+        context = request.context.strip()
+        if len(context) > MAX_CONTEXT_CHARACTERS:
+            raise HTTPException(status_code=413, detail=f"Research context is too large. Maximum allowed size: {MAX_CONTEXT_CHARACTERS:,} characters.")
+        documents = [{
+            "content": context,
+            "path": request.source_path or "research/repository_context.md",
+            "category": request.source_category or "documentation",
+            "source": "provided_context",
+            "source_type": "provided_context",
+        }]
+        context_origin = "provided_context"
+        context_scope = "provided_context"
+
     else:
-        # General chat mode: no GitHub repository or research context.
-        # Skip document acquisition and retrieval; Qwen answers using
-        # general knowledge plus conversation history.
-        context_origin = "general_chat"
         documents = []
+        context_origin = "general_chat"
+        context_scope = "general"
 
     timings["github_or_context_ms"] = _elapsed_ms(context_start)
 
@@ -1167,6 +1451,8 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     chunks: List[Dict[str, Any]] = []
     retrieved_chunks: List[Dict[str, Any]] = []
     retrieved_context = ""
+    active_retriever_name = ""
+    active_chunker_name = ""
 
     if context_origin == "general_chat":
         prompt_start = time.perf_counter()
@@ -1181,41 +1467,118 @@ technical terminology. Answer directly and appropriately concisely.
 """.strip()
         messages = build_messages(
             question=question,
-            history=request.history,
+            history=model_history,
             system_prompt=system_prompt,
         )
         timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
     else:
-        # Existing GitHub/research RAG pipeline.
+        # IMPORTANT: GitHub and uploaded documents are retrieved independently.
+        # This prevents a document chunk from competing directly with repository
+        # chunks and makes the evidence provenance explicit.
         chunk_start = time.perf_counter()
         try:
-            chunks = document_chunker.chunk_documents(documents)
+            if context_scope == "github":
+                chunks = document_chunker.chunk_documents(documents)
+                active_chunker_name = "DocumentChunker"
+            elif context_scope == "document":
+                chunks = uploaded_document_chunker.chunk_documents(documents)
+                active_chunker_name = "UploadedDocumentChunker"
+            elif context_scope == "hybrid":
+                github_documents = [d for d in documents if d.get("source") == "github"]
+                upload_documents = [d for d in documents if d.get("source") == "upload"]
+                github_chunks = document_chunker.chunk_documents(github_documents)
+                upload_chunks = uploaded_document_chunker.chunk_documents(upload_documents)
+                chunks = github_chunks + upload_chunks
+                active_chunker_name = "DocumentChunker + UploadedDocumentChunker"
+            else:
+                chunks = document_chunker.chunk_documents(documents)
+                active_chunker_name = "DocumentChunker"
+
             timings["chunking_ms"] = _elapsed_ms(chunk_start)
         except Exception as exc:
-            raise HTTPException(status_code=500, detail={
-                "message": "Failed to chunk research documents.",
-                "error": str(exc),
-            })
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Failed to chunk research documents.",
+                    "error": str(exc),
+                    "context_origin": context_origin,
+                    "document_count": len(documents),
+                    "document_names": [
+                        document.get("filename")
+                        or document.get("path")
+                        or document.get("source")
+                        for document in documents
+                    ],
+                },
+            )
 
         if not chunks:
             raise HTTPException(status_code=400, detail="No usable research chunks were created.")
 
         retrieval_start = time.perf_counter()
         try:
-            retrieved_chunks = hybrid_retriever.retrieve(
-                question=retrieval_query,
-                chunks=chunks,
-                top_k=min(requested_top_k, len(chunks)),
-            )
-            timings["hybrid_retrieval_ms"] = _elapsed_ms(retrieval_start)
+            if context_scope == "github":
+                retrieved_chunks = hybrid_retriever.retrieve(
+                    question=retrieval_query,
+                    chunks=chunks,
+                    top_k=min(requested_top_k, len(chunks)),
+                )
+                active_retriever_name = "HybridRetriever"
+
+            elif context_scope == "document":
+                retrieved_chunks = document_retriever.retrieve(
+                    question=retrieval_query,
+                    chunks=chunks,
+                    top_k=min(requested_top_k, len(chunks)),
+                )
+                active_retriever_name = "DocumentRetriever"
+
+            elif context_scope == "hybrid":
+                github_chunks = [c for c in chunks if c.get("source") == "github"]
+                upload_chunks = [c for c in chunks if c.get("source") == "upload"]
+
+                # Retrieve independently, then merge. Each source gets its own
+                # relevance/MMR decision before the final evidence is assembled.
+                github_results = hybrid_retriever.retrieve(
+                    question=retrieval_query,
+                    chunks=github_chunks,
+                    top_k=min(requested_top_k, len(github_chunks)) if github_chunks else 0,
+                ) if github_chunks else []
+                upload_results = document_retriever.retrieve(
+                    question=retrieval_query,
+                    chunks=upload_chunks,
+                    top_k=min(requested_top_k, len(upload_chunks)) if upload_chunks else 0,
+                ) if upload_chunks else []
+
+                retrieved_chunks = (github_results + upload_results)[:requested_top_k]
+                active_retriever_name = "HybridRetriever + DocumentRetriever"
+
+            else:
+                retrieved_chunks = hybrid_retriever.retrieve(
+                    question=retrieval_query,
+                    chunks=chunks,
+                    top_k=min(requested_top_k, len(chunks)),
+                )
+                active_retriever_name = "HybridRetriever"
+
+            timings["retrieval_ms"] = _elapsed_ms(retrieval_start)
         except Exception as exc:
-            raise HTTPException(status_code=500, detail={
-                "message": "Hybrid retrieval failed.",
-                "error": str(exc),
-            })
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Document/GitHub retrieval failed.",
+                    "error": str(exc),
+                    "context_origin": context_origin,
+                    "chunk_count": len(chunks),
+                    "retriever": active_retriever_name,
+                },
+            )
 
         if not retrieved_chunks:
-            raise HTTPException(status_code=404, detail="HybridRetriever did not find any relevant evidence for this question.")
+            raise HTTPException(
+                status_code=404,
+                detail="No sufficiently relevant evidence was found in the active source.",
+            )
 
         retrieved_context = format_retrieved_context(retrieved_chunks)
         if not retrieved_context.strip():
@@ -1223,9 +1586,54 @@ technical terminology. Answer directly and appropriately concisely.
 
         prompt_start = time.perf_counter()
         system_prompt = build_system_prompt(retrieved_context)
+
+        if context_scope == "document":
+            system_prompt = (
+                "IMPORTANT SOURCE RULE: This request is document-only. Use "
+                "only the retrieved uploaded-document evidence. Ignore any "
+                "active GitHub repository unless the user explicitly asks "
+                "for a comparison.\n\n" + system_prompt
+            )
+        elif context_scope == "github":
+            system_prompt = (
+                "IMPORTANT SOURCE RULE: This request is GitHub-only. Use "
+                "only the active repository and retrieved GitHub evidence. "
+                "Ignore uploaded documents.\n\n" + system_prompt
+            )
+        elif context_scope == "hybrid":
+            system_prompt = (
+                "IMPORTANT SOURCE RULE: This request is hybrid. Use both "
+                "retrieved GitHub and uploaded-document evidence, keeping "
+                "claims tied to the correct source.\n\n" + system_prompt
+            )
+
+        if repository_switched:
+            system_prompt = (
+                "IMPORTANT CURRENT REPOSITORY CONTEXT:\n"
+                "A new GitHub repository was selected in the current "
+                "message. Answer this request using ONLY the current "
+                "repository and the retrieved evidence below. Do not use "
+                "facts, files, claims, or conclusions from a previously "
+                "discussed repository. Do not say that the previous "
+                "repository lacks information about this question. "
+                "If the current repository evidence is insufficient, "
+                "state that directly.\n\n"
+                + system_prompt
+            )
+        elif source_switched:
+            system_prompt = (
+                "IMPORTANT SOURCE CONTEXT:\n"
+                "The active source changed for this request. Use ONLY the "
+                "currently retrieved source evidence. Do not carry facts, "
+                "claims, files, or conclusions from the previous source into "
+                "this answer. If the current source evidence is insufficient, "
+                "state that directly.\n\n"
+                + system_prompt
+            )
+
         messages = build_messages(
             question=question,
-            history=request.history,
+            history=model_history,
             system_prompt=system_prompt,
         )
         timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
@@ -1340,8 +1748,16 @@ technical terminology. Answer directly and appropriately concisely.
     print("=" * 72)
     print(f"Question: {question}")
     print(f"Model: {OLLAMA_MODEL}")
+    print(f"Repository switched: {repository_switched}")
+    print(
+        f"LLM history turns: "
+        f"{len(model_history)}"
+    )
     print(f"Context origin: {context_origin}")
+    print(f"Context scope: {context_scope}")
+    print(f"Context route reason: {route.get('reason')}")
     print(f"Documents acquired: {len(documents)}")
+    print(f"Uploaded documents: {len(uploaded_documents)}")
     document_chars = sum(
         len(str(document.get("content") or ""))
         for document in documents
@@ -1361,17 +1777,29 @@ technical terminology. Answer directly and appropriately concisely.
         "answer": answer,
         "model": OLLAMA_MODEL,
 
-        "retriever": "HybridRetriever",
-        "chunker": "DocumentChunker",
+        "retriever": active_retriever_name or ("HybridRetriever" if context_origin != "general_chat" else "none"),
+        "chunker": active_chunker_name or ("DocumentChunker" if context_origin != "general_chat" else "none"),
         "context_origin": context_origin,
         "github_resource_type": github_reference.get("resource_type"),
         "github_detected": bool(github_reference.get("repository_url")),
-        "chat_mode": (
-            "general" if context_origin == "general_chat"
-            else "github" if context_origin == "github"
-            else "research"
-        ),
+        "chat_mode": context_scope,
+        "context_scope": context_scope,
+        "context_route": route,
+        "source_switched": source_switched,
         "github_url": github_url or None,
+        "active_document_ids": active_document_ids,
+        "uploaded_documents": [
+            {
+                "document_id": document.get("document_id"),
+                "filename": document.get("filename"),
+                "pages": document.get("pages"),
+                "characters": document.get("characters"),
+                "cache_hit": document.get("cache_hit", False),
+            }
+            for document in uploaded_documents
+        ],
+        "repository_switched": repository_switched,
+        "llm_history_turns": len(model_history),
         "query_resolution": {
             "original_query": resolution["original_query"],
             "resolved_query": resolution["resolved_query"],

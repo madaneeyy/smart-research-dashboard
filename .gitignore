@@ -227,3 +227,6 @@ src/services/github/cache/
 
 # RAG evaluation outputs
 evaluation/results/
+
+#Github Content Cache
+src/services/cache/
