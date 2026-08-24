@@ -1,15 +1,21 @@
 from __future__ import annotations
 import re
+import json
 
 import os
 import time
 from typing import Any, Dict, List, Optional
 
 import ollama
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
+from backend.routes.workspace import router as workspace_router
+from backend.routes.source import (
+    source_router,
+    workspace_source_router,
+)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -23,31 +29,13 @@ except ImportError:
 
 from src.services.rag.chunker import DocumentChunker
 from src.services.rag.hybrid_retriever import HybridRetriever
-from src.services.github_content import GitHubContentService
-from src.services.document_service import DocumentService
-from src.services.document_cache import DocumentCache
+from src.services.github.github_content import GitHubContentService
+from src.services.document_rag.document_service import DocumentService
+from src.services.document_rag.document_cache import DocumentCache
 from src.services.context_router import ContextRouter
 from src.services.document_rag.document_chunker import UploadedDocumentChunker
 from src.services.document_rag.document_retriever import DocumentRetriever
 import inspect
-
-print("=" * 80)
-print("GITHUB CONTENT SERVICE LOADED")
-print("=" * 80)
-print("CLASS FILE:", inspect.getfile(GitHubContentService))
-print("HAS _path_category:", hasattr(GitHubContentService, "_path_category"))
-print(
-    "HAS build_documents_for_query:",
-    hasattr(GitHubContentService, "build_documents_for_query"),
-)
-print(
-    "BUILD METHOD REFERENCES _path_category:",
-    "_path_category"
-    in inspect.getsource(
-        GitHubContentService.build_documents_for_query
-    ),
-)
-print("=" * 80)
 
 # ============================================================
 # CONFIGURATION
@@ -119,6 +107,7 @@ document_retriever = DocumentRetriever(
     focused_top_k=6,
     candidate_multiplier=5,
     mmr_lambda=0.72,
+     profiling_enabled=True,
 )
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
@@ -133,8 +122,9 @@ app = FastAPI(
     description="Structure-aware RAG with HybridRetriever and Qwen.",
     version="2.4.0",
 )
-
-
+app.include_router(workspace_router)
+app.include_router(source_router)
+app.include_router(workspace_source_router)
 # ============================================================
 # CORS
 # ============================================================
@@ -237,6 +227,42 @@ def _ollama_stat(response: Any, name: str) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
+
+
+def _profile_start() -> float:
+    return time.perf_counter()
+
+
+def _profile_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 2)
+
+
+def _print_stage_timings(
+    timings: Dict[str, float],
+    ollama_metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Print the slowest request stages first."""
+    print("\n" + "=" * 80)
+    print("LATENCY PROFILING")
+    print("=" * 80)
+
+    total = timings.get("total_ms", 0.0)
+
+    for name, value in sorted(
+        timings.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    ):
+        pct = (value / total * 100.0) if total > 0 else 0.0
+        print(f"{name:32s}: {value:10,.2f} ms  ({pct:6.1f}%)")
+
+    if ollama_metrics:
+        print("-" * 80)
+        for name, value in ollama_metrics.items():
+            if value is not None:
+                print(f"ollama.{name:27s}: {value}")
+
+    print("=" * 80 + "\n")
 
 def build_github_documents(
     github_url: str,
@@ -446,248 +472,57 @@ def format_retrieved_context(
 def build_system_prompt(
     retrieved_context: str,
 ) -> str:
+    """Build a compact, source-grounded prompt for RAG answers.
+
+    Keep instructions short because this prompt is sent to Qwen on every
+    request; retrieved evidence remains unchanged.
+    """
     return f"""
-You are a technical research assistant.
+You are a technical research assistant. Answer the user's question directly,
+accurately, and concisely using the retrieved evidence below.
 
-Answer the user's question using the retrieved evidence provided below.
+GROUNDING
+- Treat retrieved evidence as authoritative for source-specific claims.
+- Do not invent facts, files, functions, parameters, results, citations,
+  implementation details, or author intent.
+- Combine evidence from multiple chunks when they complement each other.
+- Preserve exact technical terminology, identifiers, filenames, APIs,
+  algorithms, architecture names, and configuration values.
+- Prefer claims explicitly supported by the evidence.
 
-Your goal is to give a clear, useful, technically accurate answer while
-staying faithful to the retrieved source. Treat the active source as authoritative for source-specific claims.
+INFERENCE
+- You may use general technical knowledge to explain what the evidence means,
+  but never turn that explanation into a source claim.
+- When interpreting, use wording such as "This means", "This can be
+  interpreted as", or "In practice".
+- For "why" questions, give the stated reason when available; otherwise
+  explain only what is reasonably implied. Do not invent author intent.
+- If an important part of the question cannot be answered from the evidence,
+  say so briefly. Do not add generic limitation/disclaimer sections.
 
-============================================================
-GROUNDING RULES
-============================================================
+CODE / IMPLEMENTATION
+- Describe only what the retrieved code supports.
+- Preserve exact identifiers and mention relevant files/modules when present.
+- If code is incomplete, state only the limitation that affects the answer.
 
-1. Use the retrieved evidence as the primary source for
-   repository-specific or research-specific claims.
-
-2. Answer the user's question directly. Do not begin by describing
-   what type of document or repository the evidence comes from unless
-   that information is directly relevant to the question.
-
-3. Do not invent repository-specific facts, implementation details,
-   filenames, functions, parameters, results, or conclusions.
-
-4. You may combine information from multiple retrieved chunks when
-   they provide complementary parts of the answer.
-
-5. Preserve the terminology used by the source, especially:
-   - class names
-   - function names
-   - filenames
-   - modules
-   - APIs
-   - parameters
-   - algorithms
-   - architecture names
-   - configuration values
-
-============================================================
-FACTS VS INFERENCE
-============================================================
-
-Prefer statements directly supported by the retrieved evidence.
-
-You may provide a reasonable technical interpretation when it helps
-explain the evidence, but do not present that interpretation as an
-explicit statement from the repository.
-
-For example:
-
-Source:
-"A window is applied on the attention map to limit backward attention
-and focus on short term patterns."
-
-Good:
-"The repository applies a window to the attention map to limit
-backward attention and focus on short-term patterns."
-
-Also acceptable:
-"This means the model is designed to place more emphasis on nearby
-historical time steps."
-
-Do NOT say:
-"The authors chose this approach because long-range dependencies are
-irrelevant."
-
-unless the retrieved evidence explicitly says that.
-
-When an explanation is an inference, use natural wording such as:
-
-"This means..."
-"This can be interpreted as..."
-"In practice, this allows..."
-"Conceptually..."
-
-Do not repeatedly announce that something is an inference unless the
-distinction is important.
-
-============================================================
-RATIONALE AND "WHY" QUESTIONS
-============================================================
-
-If the user asks why something was implemented:
-
-- Give the reason if the retrieved evidence states it.
-- If the reason is strongly implied by the evidence, you may explain
-  the implication naturally without attributing an unstated intention
-  to the authors.
-- If the evidence genuinely does not provide enough information,
-  briefly say that the repository does not specify the exact reason.
-
-Do not invent author intent.
-
-Avoid unnecessary disclaimers such as:
-
-"The retrieved evidence does not describe a research study..."
-
-unless the user specifically asked whether the source is a research
-study.
-
-============================================================
-CLAIM STRENGTH
-============================================================
-
-Do not unnecessarily strengthen claims.
-
-Prefer:
-
-"The repository applies..."
-"The implementation uses..."
-"The section describes..."
-"The model focuses on..."
-
-Avoid strong claims such as:
-
-"guarantees"
-"ensures"
-"proves"
-"eliminates"
-"always"
-"optimal"
-
-unless the evidence explicitly supports them.
-
-============================================================
-INCOMPLETE EVIDENCE
-============================================================
-
-If the evidence is sufficient to answer the question, simply answer it.
-
-If a small detail is missing, answer the rest of the question normally
-and briefly mention the missing detail at the end.
-
-Only say that the evidence is insufficient when the missing information
-actually prevents you from answering an important part of the question.
-
-Do not add a generic limitation section to every answer.
-
-============================================================
-CODE AND IMPLEMENTATION QUESTIONS
-============================================================
-
-For code questions:
-
-- describe what the retrieved code actually does
-- preserve exact identifiers
-- mention relevant files or modules when available
-- combine related implementation chunks when necessary
-- do not invent code that is not present in the evidence
-
-If the retrieved code is incomplete, explain only the limitation that
-actually matters to the user's question.
-
-============================================================
-GENERAL TECHNICAL KNOWLEDGE
-============================================================
-
-You may use general technical knowledge to make the retrieved evidence
-easier to understand.
-
-However, do not use general knowledge to invent repository-specific
-facts.
-
-When explaining something beyond what the repository explicitly states,
-phrase it as an explanation rather than attributing it to the authors.
-
-For example:
-
-"The repository uses a linear layer here. In a time-series setting,
-this acts as a projection from the input features into the model's
-representation space."
-
-This is an explanation of the implementation, not a claim about the
-authors' stated rationale.
-
-============================================================
 ANSWER STYLE
-============================================================
+- Start with the answer; do not begin with "The retrieved evidence...",
+  "The provided context...", or similar unless necessary.
+- Use bullets/numbered sections for multi-part questions.
+- Be concise for simple questions and detailed only when needed.
+- Avoid unnecessarily strong claims such as "guarantees", "proves",
+  "ensures", "always", or "optimal" unless explicitly supported.
+- Do not fabricate source sections, filenames, URLs, or citations.
 
-Start with the answer.
+FINAL CHECK
+Before answering: answer the actual question; keep source-specific claims
+grounded; distinguish inference from source statements; preserve terminology;
+avoid unnecessary disclaimers; keep the response no more complicated than
+necessary.
 
-Do not start with:
-
-"The retrieved evidence..."
-"The provided context..."
-"This is not a research paper..."
-"The source does not..."
-"Based on the retrieved evidence..."
-
-unless that information is necessary to answer the question.
-
-For straightforward questions, give a straightforward answer.
-
-For multi-part questions, use numbered sections or bullets.
-
-For implementation questions, explain the relevant flow clearly.
-
-For conceptual questions, explain the concept first and then connect it
-to the repository.
-
-Be concise when the question is simple and detailed when the question
-requires explanation.
-
-============================================================
-SOURCE REFERENCES
-============================================================
-
-When useful, naturally mention the relevant source section or file.
-
-Examples:
-
-"The repository's `Adaptations for time series` section states..."
-
-"The implementation in `model.py`..."
-
-"The README explains..."
-
-Do not fabricate filenames, sections, URLs, or citations.
-
-============================================================
-FINAL INTERNAL CHECK
-============================================================
-
-Before answering, check:
-
-- Did I answer the actual question?
-- Are repository-specific facts supported?
-- Did I accidentally invent author intent?
-- Did I turn an inference into a source claim?
-- Did I preserve technical terminology?
-- Am I adding an unnecessary disclaimer?
-- Am I making the answer more complicated than the question requires?
-
-If the answer is supported, answer confidently and directly.
-
-============================================================
-RETRIEVED RESEARCH EVIDENCE
-============================================================
-
+RETRIEVED EVIDENCE
 {retrieved_context}
-
-============================================================
-END RETRIEVED RESEARCH EVIDENCE
-============================================================
+END RETRIEVED EVIDENCE
 """.strip()
 
 def build_messages(
@@ -975,6 +810,144 @@ def remove_github_reference(text: str, reference: Dict[str, Optional[str]]) -> s
     return cleaned or "What is this repository about?"
 
 # ============================================================
+# RAG RESPONSE FINALIZATION
+# ============================================================
+
+def _build_rag_response_payload(
+    *,
+    question: str,
+    answer: str,
+    response: Any,
+    timings: Dict[str, float],
+    request_start: float,
+    model_history: List[Dict[str, str]],
+    context_origin: str,
+    context_scope: str,
+    route: Dict[str, Any],
+    documents: List[Dict[str, Any]],
+    uploaded_documents: List[Dict[str, Any]],
+    chunks: List[Dict[str, Any]],
+    retrieved_chunks: List[Dict[str, Any]],
+    retrieved_context: str,
+    active_retriever_name: str,
+    active_chunker_name: str,
+    github_reference: Dict[str, Any],
+    github_url: str,
+    repository_switched: bool,
+    source_switched: bool,
+    active_document_ids: List[str],
+    resolution: Dict[str, Any],
+    requested_top_k: int,
+    messages: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    serialized_sources = [
+        serialize_chunk(chunk, index)
+        for index, chunk in enumerate(retrieved_chunks, start=1)
+    ]
+    first_chunk = retrieved_chunks[0] if retrieved_chunks else {}
+
+    ollama_metrics = {
+        "total_duration_ms": _ollama_stat(response, "total_duration"),
+        "load_duration_ms": _ollama_stat(response, "load_duration"),
+        "prompt_eval_duration_ms": _ollama_stat(response, "prompt_eval_duration"),
+        "eval_duration_ms": _ollama_stat(response, "eval_duration"),
+        "prompt_eval_count": getattr(response, "prompt_eval_count", None),
+        "eval_count": getattr(response, "eval_count", None),
+    }
+    eval_count = ollama_metrics.get("eval_count")
+    eval_duration_ms = ollama_metrics.get("eval_duration_ms")
+    if (
+        isinstance(eval_count, (int, float))
+        and isinstance(eval_duration_ms, (int, float))
+        and eval_duration_ms > 0
+    ):
+        ollama_metrics["generation_tokens_per_second"] = round(
+            float(eval_count) / (float(eval_duration_ms) / 1000), 2
+        )
+
+    timings["total_ms"] = _profile_ms(request_start)
+    timings["pre_llm_ms"] = round(
+        max(0.0, timings["total_ms"] - timings.get("qwen_wall_ms", 0.0)), 2
+    )
+
+    _print_stage_timings(timings=timings, ollama_metrics=ollama_metrics)
+    print("\\n" + "=" * 72)
+    print("RAG REQUEST PERFORMANCE")
+    print("=" * 72)
+    print(f"Question: {question}")
+    print(f"Model: {OLLAMA_MODEL}")
+    print(f"Repository switched: {repository_switched}")
+    print(f"LLM history turns: {len(model_history)}")
+    print(f"Context origin: {context_origin}")
+    print(f"Context scope: {context_scope}")
+    print(f"Context route reason: {route.get('reason')}")
+    print(f"Documents acquired: {len(documents)}")
+    print(f"Uploaded documents: {len(uploaded_documents)}")
+    document_chars = sum(len(str(document.get("content") or "")) for document in documents)
+    print(f"Document chars: {document_chars:,}")
+    print(f"Chunks created: {len(chunks)}")
+    print(f"Chunks retrieved: {len(retrieved_chunks)}")
+    print(f"Retrieved context chars: {len(retrieved_context):,}")
+    print(f"System prompt chars: {len(messages[0].get('content', '')) if messages else 0}")
+    print(f"Total message chars: {sum(len(str(message.get('content', ''))) for message in messages):,}")
+    for name, value in timings.items():
+        print(f"{name:28s}: {value:,.2f} ms")
+    for name, value in ollama_metrics.items():
+        if value is not None:
+            print(f"ollama.{name:19s}: {value}")
+    print("=" * 72 + "\\n")
+
+    return {
+        "question": question,
+        "answer": answer,
+        "model": OLLAMA_MODEL,
+        "retriever": active_retriever_name or ("HybridRetriever" if context_origin != "general_chat" else "none"),
+        "chunker": active_chunker_name or ("DocumentChunker" if context_origin != "general_chat" else "none"),
+        "context_origin": context_origin,
+        "github_resource_type": github_reference.get("resource_type"),
+        "github_detected": bool(github_reference.get("repository_url")),
+        "chat_mode": context_scope,
+        "context_scope": context_scope,
+        "context_route": route,
+        "source_switched": source_switched,
+        "github_url": github_url or None,
+        "active_document_ids": active_document_ids,
+        "uploaded_documents": [
+            {
+                "document_id": document.get("document_id"),
+                "filename": document.get("filename"),
+                "pages": document.get("pages"),
+                "characters": document.get("characters"),
+                "cache_hit": document.get("cache_hit", False),
+            }
+            for document in uploaded_documents
+        ],
+        "repository_switched": repository_switched,
+        "llm_history_turns": len(model_history),
+        "query_resolution": resolution,
+        "chunks_created": len(chunks),
+        "chunks_retrieved": len(retrieved_chunks),
+        "performance": {
+            "timings_ms": timings,
+            "ollama": ollama_metrics,
+            "documents": len(documents),
+            "document_characters": sum(len(str(document.get("content") or "")) for document in documents),
+            "system_prompt_characters": len(messages[0].get("content", "")) if messages else 0,
+            "retrieved_context_characters": len(retrieved_context),
+            "message_characters": sum(len(str(message.get("content", ""))) for message in messages),
+            "latency_breakdown": dict(sorted(timings.items(), key=lambda item: item[1], reverse=True)),
+        },
+        "sources": serialized_sources,
+        "retrieval": {
+            "top_k": requested_top_k,
+            "query_type": first_chunk.get("query_type"),
+            "candidate_pool_size": first_chunk.get("candidate_pool_size"),
+            "post_filter_pool_size": first_chunk.get("post_filter_pool_size"),
+        },
+    }
+
+
+# ============================================================
 # ASK
 # ============================================================
 
@@ -1173,7 +1146,10 @@ async def upload_document(
 
 
 @app.post("/ask")
-def ask_ai(request: AskRequest) -> Dict[str, Any]:
+def ask_ai(
+    request: AskRequest,
+    stream: bool = Query(False, description="Stream Qwen output when true."),
+) -> Any:
 
     request_start = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -1455,7 +1431,7 @@ def ask_ai(request: AskRequest) -> Dict[str, Any]:
     active_chunker_name = ""
 
     if context_origin == "general_chat":
-        prompt_start = time.perf_counter()
+        prompt_start = _profile_start()
         system_prompt = """
 You are a helpful AI assistant.
 
@@ -1470,12 +1446,12 @@ technical terminology. Answer directly and appropriately concisely.
             history=model_history,
             system_prompt=system_prompt,
         )
-        timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
+        timings["prompt_build_ms"] = _profile_ms(prompt_start)
     else:
         # IMPORTANT: GitHub and uploaded documents are retrieved independently.
         # This prevents a document chunk from competing directly with repository
         # chunks and makes the evidence provenance explicit.
-        chunk_start = time.perf_counter()
+        chunk_start = _profile_start()
         try:
             if context_scope == "github":
                 chunks = document_chunker.chunk_documents(documents)
@@ -1494,7 +1470,7 @@ technical terminology. Answer directly and appropriately concisely.
                 chunks = document_chunker.chunk_documents(documents)
                 active_chunker_name = "DocumentChunker"
 
-            timings["chunking_ms"] = _elapsed_ms(chunk_start)
+            timings["chunking_ms"] = _profile_ms(chunk_start)
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
@@ -1515,7 +1491,7 @@ technical terminology. Answer directly and appropriately concisely.
         if not chunks:
             raise HTTPException(status_code=400, detail="No usable research chunks were created.")
 
-        retrieval_start = time.perf_counter()
+        retrieval_start = _profile_start()
         try:
             if context_scope == "github":
                 retrieved_chunks = hybrid_retriever.retrieve(
@@ -1561,7 +1537,7 @@ technical terminology. Answer directly and appropriately concisely.
                 )
                 active_retriever_name = "HybridRetriever"
 
-            timings["retrieval_ms"] = _elapsed_ms(retrieval_start)
+            timings["retrieval_ms"] = _profile_ms(retrieval_start)
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
@@ -1580,7 +1556,9 @@ technical terminology. Answer directly and appropriately concisely.
                 detail="No sufficiently relevant evidence was found in the active source.",
             )
 
+        context_format_start = _profile_start()
         retrieved_context = format_retrieved_context(retrieved_chunks)
+        timings["context_formatting_ms"] = _profile_ms(context_format_start)
         if not retrieved_context.strip():
             raise HTTPException(status_code=500, detail="Retriever returned chunks but their content was empty.")
 
@@ -1642,9 +1620,96 @@ technical terminology. Answer directly and appropriately concisely.
     # 5. QWEN / OLLAMA
     # ========================================================
 
-    llm_start = time.perf_counter()
+    llm_start = _profile_start()
 
     try:
+        if stream:
+            ollama_stream = ollama_client.chat(
+                model=OLLAMA_MODEL,
+                messages=messages,
+                options={
+                    "num_ctx": OLLAMA_NUM_CTX,
+                    "temperature": OLLAMA_TEMPERATURE,
+                    "num_predict": OLLAMA_NUM_PREDICT,
+                },
+                keep_alive=OLLAMA_KEEP_ALIVE,
+                stream=True,
+            )
+
+            def event_stream():
+                """Stream tokens, then send the unchanged RAG metadata as one final event."""
+                answer_parts: List[str] = []
+                last_response: Any = None
+
+                try:
+                    for chunk in ollama_stream:
+                        last_response = chunk
+                        content = getattr(getattr(chunk, "message", None), "content", None)
+                        if content:
+                            text = str(content)
+                            answer_parts.append(text)
+                            yield (
+                                "data: "
+                                + json.dumps({"type": "token", "content": text}, ensure_ascii=False)
+                                + "\n\n"
+                            )
+
+                    answer = "".join(answer_parts).strip()
+                    timings["qwen_wall_ms"] = _profile_ms(llm_start)
+
+                    if not answer:
+                        raise RuntimeError("Qwen returned an empty answer.")
+
+                    payload = _build_rag_response_payload(
+                        question=question,
+                        answer=answer,
+                        response=last_response,
+                        timings=timings,
+                        request_start=request_start,
+                        model_history=model_history,
+                        context_origin=context_origin,
+                        context_scope=context_scope,
+                        route=route,
+                        documents=documents,
+                        uploaded_documents=uploaded_documents,
+                        chunks=chunks,
+                        retrieved_chunks=retrieved_chunks,
+                        retrieved_context=retrieved_context,
+                        active_retriever_name=active_retriever_name,
+                        active_chunker_name=active_chunker_name,
+                        github_reference=github_reference,
+                        github_url=github_url,
+                        repository_switched=repository_switched,
+                        source_switched=source_switched,
+                        active_document_ids=active_document_ids,
+                        resolution=resolution,
+                        requested_top_k=requested_top_k,
+                        messages=messages,
+                    )
+
+                    yield (
+                        "data: "
+                        + json.dumps({"type": "done", "data": payload}, ensure_ascii=False)
+                        + "\n\n"
+                    )
+
+                except Exception as exc:
+                    yield (
+                        "data: "
+                        + json.dumps({"type": "error", "error": str(exc)}, ensure_ascii=False)
+                        + "\n\n"
+                    )
+
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
         response = ollama_client.chat(
             model=OLLAMA_MODEL,
             messages=messages,
@@ -1654,9 +1719,10 @@ technical terminology. Answer directly and appropriately concisely.
                 "num_predict": OLLAMA_NUM_PREDICT,
             },
             keep_alive=OLLAMA_KEEP_ALIVE,
+            stream=False,
         )
 
-        timings["qwen_wall_ms"] = _elapsed_ms(llm_start)
+        timings["qwen_wall_ms"] = _profile_ms(llm_start)
 
     except Exception as exc:
         raise HTTPException(
@@ -1697,151 +1763,32 @@ technical terminology. Answer directly and appropriately concisely.
     # 7. RETURN ANSWER + EVIDENCE
     # ========================================================
 
-    serialized_sources = [
-        serialize_chunk(chunk, index)
-        for index, chunk in enumerate(
-            retrieved_chunks,
-            start=1,
-        )
-    ]
-
-    first_chunk = (
-        retrieved_chunks[0]
-        if retrieved_chunks
-        else {}
+    return _build_rag_response_payload(
+        question=question,
+        answer=answer,
+        response=response,
+        timings=timings,
+        request_start=request_start,
+        model_history=model_history,
+        context_origin=context_origin,
+        context_scope=context_scope,
+        route=route,
+        documents=documents,
+        uploaded_documents=uploaded_documents,
+        chunks=chunks,
+        retrieved_chunks=retrieved_chunks,
+        retrieved_context=retrieved_context,
+        active_retriever_name=active_retriever_name,
+        active_chunker_name=active_chunker_name,
+        github_reference=github_reference,
+        github_url=github_url,
+        repository_switched=repository_switched,
+        source_switched=source_switched,
+        active_document_ids=active_document_ids,
+        resolution=resolution,
+        requested_top_k=requested_top_k,
+        messages=messages,
     )
-
-    ollama_metrics = {
-        "total_duration_ms": _ollama_stat(response, "total_duration"),
-        "load_duration_ms": _ollama_stat(response, "load_duration"),
-        "prompt_eval_duration_ms": _ollama_stat(
-            response, "prompt_eval_duration"
-        ),
-        "eval_duration_ms": _ollama_stat(
-            response, "eval_duration"
-        ),
-        "prompt_eval_count": getattr(
-            response, "prompt_eval_count", None
-        ),
-        "eval_count": getattr(
-            response, "eval_count", None
-        ),
-    }
-
-    eval_count = ollama_metrics.get("eval_count")
-    eval_duration_ms = ollama_metrics.get("eval_duration_ms")
-
-    if (
-        isinstance(eval_count, (int, float))
-        and isinstance(eval_duration_ms, (int, float))
-        and eval_duration_ms > 0
-    ):
-        ollama_metrics["generation_tokens_per_second"] = round(
-            float(eval_count) / (float(eval_duration_ms) / 1000),
-            2,
-        )
-
-    timings["total_ms"] = _elapsed_ms(request_start)
-
-    print("\n" + "=" * 72)
-    print("RAG REQUEST PERFORMANCE")
-    print("=" * 72)
-    print(f"Question: {question}")
-    print(f"Model: {OLLAMA_MODEL}")
-    print(f"Repository switched: {repository_switched}")
-    print(
-        f"LLM history turns: "
-        f"{len(model_history)}"
-    )
-    print(f"Context origin: {context_origin}")
-    print(f"Context scope: {context_scope}")
-    print(f"Context route reason: {route.get('reason')}")
-    print(f"Documents acquired: {len(documents)}")
-    print(f"Uploaded documents: {len(uploaded_documents)}")
-    document_chars = sum(
-        len(str(document.get("content") or ""))
-        for document in documents
-    )
-    print(f"Document chars: {document_chars:,}")
-    print(f"Chunks created: {len(chunks)}")
-    print(f"Chunks retrieved: {len(retrieved_chunks)}")
-    for name, value in timings.items():
-        print(f"{name:28s}: {value:,.2f} ms")
-    for name, value in ollama_metrics.items():
-        if value is not None:
-            print(f"ollama.{name:19s}: {value}")
-    print("=" * 72 + "\n")
-
-    return {
-        "question": question,
-        "answer": answer,
-        "model": OLLAMA_MODEL,
-
-        "retriever": active_retriever_name or ("HybridRetriever" if context_origin != "general_chat" else "none"),
-        "chunker": active_chunker_name or ("DocumentChunker" if context_origin != "general_chat" else "none"),
-        "context_origin": context_origin,
-        "github_resource_type": github_reference.get("resource_type"),
-        "github_detected": bool(github_reference.get("repository_url")),
-        "chat_mode": context_scope,
-        "context_scope": context_scope,
-        "context_route": route,
-        "source_switched": source_switched,
-        "github_url": github_url or None,
-        "active_document_ids": active_document_ids,
-        "uploaded_documents": [
-            {
-                "document_id": document.get("document_id"),
-                "filename": document.get("filename"),
-                "pages": document.get("pages"),
-                "characters": document.get("characters"),
-                "cache_hit": document.get("cache_hit", False),
-            }
-            for document in uploaded_documents
-        ],
-        "repository_switched": repository_switched,
-        "llm_history_turns": len(model_history),
-        "query_resolution": {
-            "original_query": resolution["original_query"],
-            "resolved_query": resolution["resolved_query"],
-            "was_resolved": resolution["was_resolved"],
-            "resolution_type": resolution["resolution_type"],
-            "referenced_terms": resolution["referenced_terms"],
-        },
-        "query_resolution": resolution,
-
-        "chunks_created": len(chunks),
-        "chunks_retrieved": len(retrieved_chunks),
-
-        "performance": {
-            "timings_ms": timings,
-            "ollama": ollama_metrics,
-            "documents": len(documents),
-            "document_characters": sum(
-                len(str(document.get("content") or ""))
-                for document in documents
-            ),
-            "system_prompt_characters": len(system_prompt),
-            "retrieved_context_characters": len(retrieved_context),
-            "message_characters": sum(
-                len(str(message.get("content", "")))
-                for message in messages
-            ),
-        },
-
-        "sources": serialized_sources,
-
-        "retrieval": {
-            "top_k": requested_top_k,
-            "query_type": first_chunk.get("query_type"),
-            "candidate_pool_size": first_chunk.get(
-                "candidate_pool_size"
-            ),
-            "post_filter_pool_size": first_chunk.get(
-                "post_filter_pool_size"
-            ),
-        },
-
-    }
 
 
 # ============================================================

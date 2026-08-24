@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 
-from src.services.github_content import GitHubContentService
+from src.services.github.github_content import GitHubContentService
 
 
 # ============================================================================

@@ -22,9 +22,11 @@ Public API is kept compatible with the current backend:
     DocumentRetriever.retrieve(question, chunks, top_k=5)
 """
 
+import hashlib
 import math
 import re
-from collections import Counter
+import time
+from collections import Counter, OrderedDict
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
 try:
@@ -110,6 +112,9 @@ class DocumentRetriever:
         mmr_lambda: float = 0.72,
         dense_model_name: str = "all-MiniLM-L6-v2",
         dense_enabled: bool = True,
+        dense_batch_size: int = 32,
+        dense_cache_size: int = 8,
+        query_embedding_cache_size: int = 32,
         reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         reranker_enabled: bool = True,
         reranker_candidate_count: int = 20,
@@ -119,8 +124,13 @@ class DocumentRetriever:
         context_budget_factual: int = 5000,
         min_score: float = 0.0,
         neighbor_window: int = 1,
-        max_expanded_per_result: int = 3,
+        max_expanded_per_result: int = 2,
         expand_same_section_only: bool = False,
+        expand_parents: bool = True,
+        max_total_expanded_chunks: int = 10,
+        min_neighbor_relevance: float = 0.18,
+        expand_factual_queries: bool = False,
+        profiling_enabled: bool = False,
     ) -> None:
         self.overview_top_k = max(1, int(overview_top_k))
         self.focused_top_k = max(1, int(focused_top_k))
@@ -129,8 +139,16 @@ class DocumentRetriever:
 
         self.dense_model_name = dense_model_name
         self.dense_enabled = bool(dense_enabled)
+        self.dense_batch_size = max(1, int(dense_batch_size))
+        self.dense_cache_size = max(1, int(dense_cache_size))
+        self.query_embedding_cache_size = max(1, int(query_embedding_cache_size))
         self._dense_model = None
         self._dense_failed = False
+
+        # In-memory only: no cache files are created.
+        # Document embeddings are reused across questions.
+        self._dense_embedding_cache: OrderedDict[str, Any] = OrderedDict()
+        self._query_embedding_cache: OrderedDict[str, Any] = OrderedDict()
 
         self.reranker_model_name = reranker_model_name
         self.reranker_enabled = bool(reranker_enabled)
@@ -150,6 +168,14 @@ class DocumentRetriever:
         self.neighbor_window = max(0, int(neighbor_window))
         self.max_expanded_per_result = max(1, int(max_expanded_per_result))
         self.expand_same_section_only = bool(expand_same_section_only)
+        self.expand_parents = bool(expand_parents)
+        self.max_total_expanded_chunks = max(1, int(max_total_expanded_chunks))
+        self.min_neighbor_relevance = max(
+            0.0, min(1.0, float(min_neighbor_relevance))
+        )
+        self.expand_factual_queries = bool(expand_factual_queries)
+        self.profiling_enabled = bool(profiling_enabled)
+        self.last_profile: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -161,7 +187,11 @@ class DocumentRetriever:
         chunks: Sequence[Dict[str, Any]],
         top_k: int = 5,
     ) -> List[Dict[str, Any]]:
+        _profile = {}
+        _t0 = time.perf_counter()
+        _stage = time.perf_counter()
         valid = self._prepare_chunks(chunks)
+        _profile["prepare_chunks_ms"] = (time.perf_counter() - _stage) * 1000
         if not valid:
             return []
 
@@ -183,15 +213,26 @@ class DocumentRetriever:
             budget = self.context_budget_focused
 
         # Build all retrieval signals once per request.
+        _stage = time.perf_counter()
         bm25_scores = self._bm25_scores(question, valid)
+        _profile["bm25_ms"] = (time.perf_counter() - _stage) * 1000
+        _stage = time.perf_counter()
         tfidf_scores = self._tfidf_scores(question, valid)
+        _profile["tfidf_ms"] = (time.perf_counter() - _stage) * 1000
+        _stage = time.perf_counter()
+        dense_texts = [self._retrieval_text(chunk) for chunk in valid]
+        dense_cache_key = self._embedding_cache_key(valid, dense_texts)
+        dense_cache_hit = dense_cache_key in self._dense_embedding_cache
         dense_scores = self._dense_scores(question, valid)
+        _profile["dense_ms"] = (time.perf_counter() - _stage) * 1000
+        _profile["dense_document_cache_hit"] = int(dense_cache_hit)
 
         # Rank separately with each retriever.
         bm25_rank = self._rank_indices(bm25_scores)
         tfidf_rank = self._rank_indices(tfidf_scores)
         dense_rank = self._rank_indices(dense_scores) if dense_scores else []
 
+        _stage = time.perf_counter()
         fused = self._fuse_ranks(
             bm25_rank=bm25_rank,
             tfidf_rank=tfidf_rank,
@@ -210,18 +251,26 @@ class DocumentRetriever:
             max(target_k * self.candidate_multiplier, target_k),
         )
         candidates = fused[:candidate_count]
+        _profile["fusion_ms"] = (time.perf_counter() - _stage) * 1000
 
+        _stage = time.perf_counter()
         candidates = self._query_aware_filter(
             question=question,
             candidates=candidates,
             query_type=query_type,
         )
 
+        _profile["query_filter_ms"] = (time.perf_counter() - _stage) * 1000
+
+        _stage = time.perf_counter()
         candidates = self._rerank_candidates(
             question=question,
             candidates=candidates,
         )
 
+        _profile["reranker_ms"] = (time.perf_counter() - _stage) * 1000
+
+        _stage = time.perf_counter()
         selected = self._mmr_select(
             candidates=candidates,
             top_k=target_k,
@@ -231,13 +280,22 @@ class DocumentRetriever:
         # Expand high-quality retrieved chunks with their immediate document
         # neighbors.  This happens after ranking so neighbors never outrank
         # the evidence selected by the retrieval/reranking pipeline.
+        _profile["mmr_ms"] = (time.perf_counter() - _stage) * 1000
+
+        _stage = time.perf_counter()
         selected = self._expand_with_neighbors(
             selected=selected,
             all_chunks=valid,
             question=question,
+            query_type=query_type,
+            max_total_chunks=self.max_total_expanded_chunks,
         )
 
+        _profile["parent_neighbor_expansion_ms"] = (time.perf_counter() - _stage) * 1000
+
+        _stage = time.perf_counter()
         selected = self._apply_context_budget(selected, budget)
+        _profile["context_budget_ms"] = (time.perf_counter() - _stage) * 1000
 
         if not selected and candidates:
             selected = [self._truncate(candidates[0], budget)]
@@ -288,6 +346,21 @@ class DocumentRetriever:
 
             results.append(result)
 
+        _profile["total_retrieval_ms"] = (time.perf_counter() - _t0) * 1000
+        _profile["input_chunks"] = len(valid)
+        _profile["candidate_chunks"] = len(candidates)
+        _profile["final_chunks"] = len(results)
+        self.last_profile = _profile
+        if self.profiling_enabled:
+            print("\n" + "=" * 72)
+            print("DOCUMENT RETRIEVER PERFORMANCE")
+            print("=" * 72)
+            for k, v in _profile.items():
+                if k.endswith("_ms"):
+                    print(f"{k:<34}: {v:,.2f} ms")
+                else:
+                    print(f"{k:<34}: {int(v)}")
+            print("=" * 72)
         return results
 
     # ------------------------------------------------------------------
@@ -471,36 +544,78 @@ class DocumentRetriever:
             return [0.0] * len(chunks)
 
         try:
-            texts = [
-                self._retrieval_text(chunk)
-                for chunk in chunks
-            ]
+            texts = [self._retrieval_text(chunk) for chunk in chunks]
 
-            embeddings = model.encode(
-                texts,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-            query_embedding = model.encode(
-                [question],
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )[0]
+            # Expensive document encoding is cached in memory. Subsequent
+            # questions only need the query embedding.
+            document_key = self._embedding_cache_key(chunks, texts)
+            embeddings = self._dense_embedding_cache.get(document_key)
 
-            # Because embeddings are normalized, dot product == cosine.
-            scores = [
-                float(embedding @ query_embedding)
-                for embedding in embeddings
-            ]
+            if embeddings is not None:
+                self._dense_embedding_cache.move_to_end(document_key)
+            else:
+                embeddings = model.encode(
+                    texts,
+                    batch_size=self.dense_batch_size,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+                self._dense_embedding_cache[document_key] = embeddings
+                self._dense_embedding_cache.move_to_end(document_key)
+                while len(self._dense_embedding_cache) > self.dense_cache_size:
+                    self._dense_embedding_cache.popitem(last=False)
 
-            # Cosine can be negative. Convert to [0, 1] for fusion.
+            # Small LRU for repeated questions.
+            query_key = question.strip()
+            query_embedding = self._query_embedding_cache.get(query_key)
+
+            if query_embedding is not None:
+                self._query_embedding_cache.move_to_end(query_key)
+            else:
+                query_embedding = model.encode(
+                    [question],
+                    batch_size=1,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )[0]
+                self._query_embedding_cache[query_key] = query_embedding
+                self._query_embedding_cache.move_to_end(query_key)
+                while len(self._query_embedding_cache) > self.query_embedding_cache_size:
+                    self._query_embedding_cache.popitem(last=False)
+
+            # Normalized embeddings make dot product equivalent to cosine.
+            scores = embeddings @ query_embedding
+
             return [
-                max(0.0, min(1.0, (score + 1.0) / 2.0))
+                max(0.0, min(1.0, (float(score) + 1.0) / 2.0))
                 for score in scores
             ]
 
         except Exception:
             return [0.0] * len(chunks)
+
+    @staticmethod
+    def _embedding_cache_key(
+        chunks: Sequence[Dict[str, Any]],
+        texts: Sequence[str],
+    ) -> str:
+        hasher = hashlib.sha256()
+
+        for index, (chunk, text) in enumerate(zip(chunks, texts)):
+            chunk_id = str(
+                chunk.get("chunk_id")
+                or chunk.get("id")
+                or chunk.get("document_chunk_index")
+                or index
+            )
+            hasher.update(chunk_id.encode("utf-8", errors="ignore"))
+            hasher.update(b"\\0")
+            hasher.update(text.encode("utf-8", errors="ignore"))
+            hasher.update(b"\\0")
+
+        return hasher.hexdigest()
 
     def _get_dense_model(self):
         if self._dense_model is not None:
@@ -518,8 +633,6 @@ class DocumentRetriever:
             return self._dense_model
 
         except Exception:
-            # Retrieval must never make the backend fail merely because the
-            # optional dense dependency/model is unavailable.
             self._dense_failed = True
             return None
 
@@ -1038,29 +1151,41 @@ class DocumentRetriever:
         selected: List[Dict[str, Any]],
         all_chunks: Sequence[Dict[str, Any]],
         question: str,
+        query_type: str = "focused",
+        max_total_chunks: int | None = None,
     ) -> List[Dict[str, Any]]:
         """
-        Add nearby chunks around selected evidence.
+        Add limited contextual evidence around already-selected primary chunks.
 
-        The original selected chunk remains the primary evidence. Neighbors
-        inherit a small contextual score and are marked as expansion chunks.
-        This supports answers whose context crosses chunk boundaries.
-
-        Ordering is document order rather than retrieval-score order inside
-        an expanded group, which makes the final LLM context read naturally.
+        Expansion is deliberately conservative:
+          1. Primary reranked/MMR results always remain authoritative.
+          2. Parent-section context is preferred when explicit structure exists.
+          3. Immediate neighbors are considered only when they have reasonable
+             lexical relevance to the query.
+          4. Expansion is skipped for factual queries by default because these
+             queries usually need a very small context.
+          5. A global expansion cap prevents 5 primary chunks from becoming
+             15-20 prompt chunks and increasing LLM latency.
         """
         if not selected or self.neighbor_window <= 0:
             return selected
+
+        if query_type == "factual" and not self.expand_factual_queries:
+            return selected
+
+        max_total = max(
+            len(selected),
+            int(max_total_chunks or self.max_total_expanded_chunks),
+        )
 
         index_map = self._build_neighbor_index(all_chunks)
         expanded: List[Dict[str, Any]] = []
         seen: Set[str] = set()
 
-        # Expand only the strongest retrieved chunks. This avoids exploding
-        # context for broad questions.
+        # Primary evidence first. This guarantees that context budgeting can
+        # never evict all of the actual retrieved evidence in favor of context.
         for primary in selected:
             primary_id = self._stable_chunk_id(primary)
-
             if primary_id in seen:
                 continue
 
@@ -1070,73 +1195,231 @@ class DocumentRetriever:
             expanded.append(primary_copy)
             seen.add(primary_id)
 
-            neighbors = self._find_neighbors(
-                primary=primary,
-                all_chunks=all_chunks,
-                index_map=index_map,
+        # Parent sections are useful for PDFs where a child chunk contains the
+        # answer but the parent heading establishes what the section means.
+        if self.expand_parents and len(expanded) < max_total:
+            for primary in selected:
+                if len(expanded) >= max_total:
+                    break
+
+                parent = self._find_parent_chunk(primary, all_chunks)
+                if parent is None:
+                    continue
+
+                parent_id = self._stable_chunk_id(parent)
+                if parent_id in seen:
+                    continue
+                if self._looks_like_duplicate(primary, parent):
+                    continue
+
+                parent_copy = dict(parent)
+                parent_copy["_hybrid_score"] = (
+                    float(primary.get("_hybrid_score", 0.0)) * 0.30
+                )
+                parent_copy["_reranker_score"] = (
+                    float(primary.get("_reranker_score", 0.0)) * 0.20
+                )
+                parent_copy["_mmr_score"] = 0.0
+                parent_copy["_redundancy_score"] = 0.0
+                parent_copy["evidence_role"] = "parent"
+                parent_copy["expanded_from"] = self._stable_chunk_id(primary)
+                parent_copy["retrieval_source"] = "document"
+                parent_copy["retriever_name"] = self.__class__.__name__
+
+                expanded.append(parent_copy)
+                seen.add(parent_id)
+
+        # Neighbors are evaluated individually instead of blindly adding both
+        # sides. This matters for arbitrary PDFs where adjacent chunks may be
+        # headers, page artifacts, unrelated tables, or a new section.
+        if len(expanded) < max_total:
+            for primary in selected:
+                if len(expanded) >= max_total:
+                    break
+
+                primary_id = self._stable_chunk_id(primary)
+                neighbors = self._find_neighbors(
+                    primary=primary,
+                    all_chunks=all_chunks,
+                    index_map=index_map,
+                )
+
+                scored_neighbors: List[Tuple[float, int, Dict[str, Any]]] = []
+                for neighbor in neighbors:
+                    if self.expand_same_section_only and not self._same_section(
+                        primary, neighbor
+                    ):
+                        continue
+
+                    if self._looks_like_duplicate(primary, neighbor):
+                        continue
+
+                    relevance = self._neighbor_relevance(
+                        question=question,
+                        primary=primary,
+                        neighbor=neighbor,
+                    )
+                    if relevance < self.min_neighbor_relevance:
+                        continue
+
+                    distance = self._neighbor_distance(primary, neighbor)
+                    scored_neighbors.append(
+                        (relevance, distance, neighbor)
+                    )
+
+                # Prefer relevance, then proximity.
+                scored_neighbors.sort(
+                    key=lambda item: (-item[0], item[1], self._chunk_position(item[2]))
+                )
+
+                added_for_primary = 0
+                for relevance, distance, neighbor in scored_neighbors:
+                    if len(expanded) >= max_total:
+                        break
+                    if added_for_primary >= self.max_expanded_per_result:
+                        break
+
+                    neighbor_id = self._stable_chunk_id(neighbor)
+                    if neighbor_id in seen:
+                        continue
+
+                    neighbor_copy = dict(neighbor)
+                    primary_score = float(primary.get("_hybrid_score", 0.0))
+                    neighbor_copy["_hybrid_score"] = (
+                        0.30 * primary_score + 0.70 * relevance
+                    )
+                    neighbor_copy["_reranker_score"] = (
+                        float(primary.get("_reranker_score", 0.0)) * 0.20
+                    )
+                    neighbor_copy["_mmr_score"] = 0.0
+                    neighbor_copy["_redundancy_score"] = 0.0
+                    neighbor_copy["evidence_role"] = "neighbor"
+                    neighbor_copy["expanded_from"] = primary_id
+                    neighbor_copy["neighbor_distance"] = distance
+                    neighbor_copy["neighbor_relevance"] = round(relevance, 4)
+                    neighbor_copy["retrieval_source"] = "document"
+                    neighbor_copy["retriever_name"] = self.__class__.__name__
+
+                    expanded.append(neighbor_copy)
+                    seen.add(neighbor_id)
+                    added_for_primary += 1
+
+        # Natural reading order helps the LLM understand split paragraphs.
+        expanded.sort(
+            key=lambda item: (
+                str(
+                    item.get("document_id")
+                    or item.get("file_id")
+                    or item.get("filename")
+                    or ""
+                ),
+                self._chunk_position(item),
             )
-
-            # Keep only a small number of useful neighbors.
-            useful_neighbors = []
-            for neighbor in neighbors:
-                if self.expand_same_section_only and not self._same_section(
-                    primary,
-                    neighbor,
-                ):
-                    continue
-
-                if self._looks_like_duplicate(primary, neighbor):
-                    continue
-
-                neighbor_copy = dict(neighbor)
-                neighbor_copy["_hybrid_score"] = (
-                    float(primary.get("_hybrid_score", 0.0)) * 0.35
-                )
-                neighbor_copy["_reranker_score"] = (
-                    float(primary.get("_reranker_score", 0.0)) * 0.25
-                )
-                neighbor_copy["_mmr_score"] = (
-                    float(primary.get("_mmr_score", 0.0)) * 0.15
-                )
-                neighbor_copy["_redundancy_score"] = 0.0
-                neighbor_copy["evidence_role"] = "neighbor"
-                neighbor_copy["expanded_from"] = primary_id
-                neighbor_copy["neighbor_distance"] = self._neighbor_distance(
-                    primary,
-                    neighbor,
-                )
-
-                # A neighbor is supporting context, not an independently
-                # retrieved answer. Keep its provenance explicit.
-                neighbor_copy["retrieval_source"] = "document"
-                neighbor_copy["retriever_name"] = self.__class__.__name__
-
-                useful_neighbors.append(neighbor_copy)
-
-            useful_neighbors.sort(
-                key=lambda item: (
-                    int(item.get("neighbor_distance", 999)),
-                    self._chunk_position(item),
-                )
-            )
-
-            useful_neighbors = useful_neighbors[
-                : self.max_expanded_per_result
-            ]
-
-            for neighbor in useful_neighbors:
-                neighbor_id = self._stable_chunk_id(neighbor)
-                if neighbor_id in seen:
-                    continue
-
-                expanded.append(neighbor)
-                seen.add(neighbor_id)
-
-        # Preserve document order. This is especially important when a
-        # sentence/paragraph was split across adjacent chunks.
-        expanded.sort(key=self._chunk_position)
+        )
 
         return expanded
+
+    def _find_parent_chunk(
+        self,
+        primary: Dict[str, Any],
+        all_chunks: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any] | None:
+        """Find an explicit parent-section chunk when the parser provides one."""
+        parent_name = str(
+            primary.get("parent_section")
+            or primary.get("parent_heading")
+            or ""
+        ).strip().lower()
+
+        if not parent_name:
+            return None
+
+        document_id = self._document_identity(primary)
+        candidates: List[Dict[str, Any]] = []
+
+        for chunk in all_chunks:
+            if self._document_identity(chunk) != document_id:
+                continue
+            if self._stable_chunk_id(chunk) == self._stable_chunk_id(primary):
+                continue
+
+            section = str(
+                chunk.get("section")
+                or chunk.get("heading")
+                or chunk.get("title")
+                or ""
+            ).strip().lower()
+
+            if section == parent_name:
+                candidates.append(chunk)
+
+        if not candidates:
+            return None
+
+        # Prefer the closest parent-like chunk before the primary chunk.
+        primary_pos = self._chunk_position(primary)
+        candidates.sort(
+            key=lambda chunk: (
+                0 if self._chunk_position(chunk) <= primary_pos else 1,
+                abs(self._chunk_position(chunk) - primary_pos),
+                -len(str(chunk.get("content") or "")),
+            )
+        )
+        return candidates[0]
+
+    def _neighbor_relevance(
+        self,
+        question: str,
+        primary: Dict[str, Any],
+        neighbor: Dict[str, Any],
+    ) -> float:
+        """Cheap lexical relevance test; avoids another embedding/reranker call."""
+        query_terms = self._query_terms(question)
+        if not query_terms:
+            return 0.5
+
+        content_tokens = set(
+            token
+            for token in self._tokens(
+                str(neighbor.get("content") or "")
+            )
+            if token not in self.STOPWORDS
+        )
+        if not content_tokens:
+            return 0.0
+
+        overlap = len(query_terms & content_tokens) / max(len(query_terms), 1)
+
+        primary_terms = set(
+            token
+            for token in self._tokens(
+                str(primary.get("content") or "")
+            )
+            if token not in self.STOPWORDS
+        )
+        continuity = (
+            len(content_tokens & primary_terms)
+            / max(len(content_tokens | primary_terms), 1)
+        )
+
+        section_bonus = 0.0
+        if self._same_section(primary, neighbor):
+            section_bonus = 0.15
+
+        # Query overlap is the main signal. Continuity catches split paragraphs.
+        return max(
+            0.0,
+            min(1.0, 0.70 * overlap + 0.30 * continuity + section_bonus),
+        )
+
+    @staticmethod
+    def _document_identity(chunk: Dict[str, Any]) -> str:
+        return str(
+            chunk.get("document_id")
+            or chunk.get("file_id")
+            or chunk.get("filename")
+            or "default-document"
+        )
 
     def _build_neighbor_index(
         self,

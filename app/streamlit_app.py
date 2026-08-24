@@ -1,5 +1,7 @@
+from importlib import metadata
 import sys
 import uuid
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,98 @@ st.set_page_config(
     page_icon="🔎",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+
+# ---------------------------------------------------------------------------
+# PROFESSIONAL DOCUMENT SOURCE UI
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    /* Sidebar spacing */
+    section[data-testid="stSidebar"] .block-container {
+        padding-top: 1.25rem;
+        padding-bottom: 1.5rem;
+    }
+
+    /* Source section */
+    .source-panel {
+        margin: 0.25rem 0 0.75rem 0;
+    }
+
+    .source-heading {
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        margin-bottom: 0.35rem;
+    }
+
+    .source-subtitle {
+        font-size: 0.72rem;
+        line-height: 1.35;
+        margin-bottom: 0.55rem;
+    }
+
+    .upload-hint {
+        border: 1px dashed rgba(128, 128, 128, 0.55);
+        border-radius: 12px;
+        padding: 0.7rem 0.75rem;
+        text-align: center;
+        margin-top: 0.45rem;
+        font-size: 0.74rem;
+        line-height: 1.35;
+    }
+
+    .document-count {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        font-size: 0.76rem;
+        font-weight: 600;
+        margin: 0.15rem 0 0.45rem 0;
+    }
+
+    .document-empty {
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        border-radius: 10px;
+        padding: 0.6rem 0.7rem;
+        font-size: 0.74rem;
+        margin-bottom: 0.5rem;
+    }
+
+    /* Keep sidebar controls visually compact */
+    section[data-testid="stSidebar"] .stSelectbox label {
+        font-size: 0.76rem;
+        font-weight: 600;
+    }
+
+    section[data-testid="stSidebar"] [data-testid="stFileUploader"] {
+        margin-top: 0.35rem;
+    }
+
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {
+        border-radius: 12px;
+        min-height: 96px;
+    }
+
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] {
+        font-size: 0.74rem;
+    }
+
+    /* Selected source indicator */
+    .active-source {
+        border-radius: 9px;
+        padding: 0.45rem 0.6rem;
+        margin-top: 0.45rem;
+        font-size: 0.72rem;
+        line-height: 1.35;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 BACKEND_URL = "http://127.0.0.1:8000/ask"
@@ -51,11 +145,17 @@ defaults = {
     "chats": {},
     "active_chat_id": None,
     "chat_counter": 0,
-    "app_mode": "Chat",
+    "app_mode": "Workspace",  # or "Chat" or "Research"
 }
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
+    
+if "workspaces" not in st.session_state:
+        st.session_state.workspaces = []
+
+if "active_workspace_id" not in st.session_state:
+        st.session_state.active_workspace_id = None
 
 
 # ============================================================================
@@ -74,6 +174,16 @@ def create_chat(title: str = "New Chat") -> str:
         "title": title,
         "messages": [],
         "github_url": None,
+
+        # Documents attached to this chat.
+        "document_ids": [],
+        "document_names": {},
+
+        # None means "All documents".
+        "selected_document_id": None,
+
+        # Prevent duplicate uploads after Streamlit reruns.
+        "uploaded_file_keys": set(),
     }
 
     st.session_state.active_chat_id = chat_id
@@ -97,53 +207,404 @@ def call_backend(
     history: list[dict[str, str]],
     chat_id: str,
     document_ids: list[str] | None = None,
+    answer_placeholder: Any | None = None,
+    extra_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Call FastAPI and stream Qwen tokens without changing the final payload."""
     payload = {
         "question": question.strip(),
         "history": history,
         "top_k": 5,
-        # Backend uses this to remember the active GitHub repository
-        # when later messages omit the URL.
         "chat_id": chat_id,
         "document_ids": document_ids,
     }
+    if extra_payload:
+        payload.update(extra_payload)
 
     response = requests.post(
         BACKEND_URL,
+        params={"stream": "true"},
         json=payload,
         timeout=300,
+        stream=True,
+        headers={"Accept": "text/event-stream"},
     )
     response.raise_for_status()
 
-    data = response.json()
+    answer_parts: list[str] = []
+    final_data: dict[str, Any] | None = None
+
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+
+        line = raw_line.strip()
+        if not line.startswith("data: "):
+            continue
+
+        try:
+            event = json.loads(line[6:])
+        except Exception as exc:
+            raise ValueError(f"Invalid streaming response from FastAPI: {line}") from exc
+
+        event_type = event.get("type")
+
+        if event_type == "token":
+            text = str(event.get("content") or "")
+            if text:
+                answer_parts.append(text)
+                if answer_placeholder is not None:
+                    answer_placeholder.markdown("".join(answer_parts))
+
+        elif event_type == "done":
+            data = event.get("data")
+            if isinstance(data, dict):
+                final_data = data
+
+        elif event_type == "error":
+            raise RuntimeError(str(event.get("error") or "Streaming generation failed."))
+
+    if final_data is None:
+        raise ValueError("FastAPI ended the stream without a final response payload.")
+
     answer = (
-        data.get("answer")
-        or data.get("response")
-        or data.get("output")
+        final_data.get("answer")
+        or "".join(answer_parts)
+        or final_data.get("response")
+        or final_data.get("output")
     )
 
     if not answer:
         raise ValueError(
             "FastAPI returned no AI answer. "
-            f"Response: {data}"
+            f"Response: {final_data}"
         )
 
-    return {
-        "answer": answer,
-        "sources": data.get("sources", []),
-        "retrieval": data.get("retrieval", {}),
-        "chunks_created": data.get("chunks_created", 0),
-        "chunks_retrieved": data.get("chunks_retrieved", 0),
-        "model": data.get("model", ""),
-        "context_origin": data.get("context_origin", ""),
-        "context_scope": data.get("context_scope", ""),
-        "context_route": data.get("context_route", {}),
-        "source_switched": data.get("source_switched", False),
-        "github_url": data.get("github_url"),
-        "active_document_ids": data.get("active_document_ids", []),
-        "uploaded_documents": data.get("uploaded_documents", []),
+    final_data["answer"] = answer
+    return final_data
+
+BACKEND_URL = "http://127.0.0.1:8000"
+
+
+def fetch_workspaces() -> list[dict[str, Any]]:
+    response = requests.get(
+        f"{BACKEND_URL}/workspaces",
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def create_workspace(
+    name: str,
+    description: str | None = None,
+) -> dict[str, Any]:
+    response = requests.post(
+        f"{BACKEND_URL}/workspaces",
+        json={
+            "name": name,
+            "description": description,
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+def make_json_safe(value: Any) -> Any:
+    """
+    Recursively convert arbitrary Python values into
+    JSON-compatible values.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        (str, int, float, bool),
+    ):
+        return value
+
+    if isinstance(
+        value,
+        (list, tuple, set),
+    ):
+        return [
+            make_json_safe(item)
+            for item in value
+        ]
+
+    if isinstance(value, dict):
+        return {
+            str(key): make_json_safe(item)
+            for key, item in value.items()
+        }
+
+    # Pydantic models
+    if hasattr(value, "model_dump"):
+        return make_json_safe(
+            value.model_dump()
+        )
+
+    # Date / datetime / URL-like values
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+
+    # Everything else gets a readable representation.
+    return str(value)
+
+
+def serialize_research_result(
+    result: Any,
+) -> dict[str, Any]:
+    """
+    Convert a ResearchItem into a JSON-safe dictionary.
+    """
+
+    if hasattr(result, "model_dump"):
+        data = result.model_dump()
+    elif hasattr(result, "dict"):
+        data = result.dict()
+    else:
+        data = vars(result)
+
+    def clean(value: Any) -> Any:
+        if value is None:
+            return None
+
+        if isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, dict):
+            return {
+                str(key): clean(item)
+                for key, item in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            return [
+                clean(item)
+                for item in value
+            ]
+
+        # datetime/date
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+
+        # Pydantic / model objects
+        if hasattr(value, "model_dump"):
+            return clean(value.model_dump())
+
+        # Everything else becomes a string.
+        return str(value)
+
+    cleaned = clean(data)
+
+    # ------------------------------------------------------------
+    # Final verification.
+    # If something is STILL not JSON serializable, this will
+    # fail here instead of much later inside requests.post().
+    # ------------------------------------------------------------
+
+    json.dumps(cleaned)
+
+    return cleaned
+
+def add_source_to_workspace(
+    workspace_id: str,
+    source_type: str,
+    title: str,
+    url: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+
+    payload = {
+    "source_type": source_type,
+    "title": title,
+    "url": url,
+    "metadata": metadata or {},
+}
+
+# Verify the entire request payload before requests
+# gets involved.
+    json.dumps(payload)
+
+    response = requests.post(
+    f"{BACKEND_URL}/workspaces/{workspace_id}/sources",
+    json=payload,
+    timeout=10,
+)
+
+    response.raise_for_status()
+
+    return response.json()
+
+def add_research_result_to_workspace(
+    source_type: str,
+    title: str,
+    url: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+
+    workspace_id = (
+        st.session_state.active_workspace_id
+    )
+
+    if not workspace_id:
+        st.warning(
+            "Please select a workspace first."
+        )
+        return False
+
+    try:
+        add_source_to_workspace(
+            workspace_id=str(workspace_id),
+            source_type=source_type,
+            title=title,
+            url=url,
+            metadata=metadata,
+        )
+
+        return True
+
+    except requests.RequestException as exc:
+        st.error(
+            f"Could not add source to workspace: {exc}"
+        )
+        return False
+
+def render_workspace_selector() -> None:
+    st.markdown("### 📁 Workspace")
+
+    try:
+        workspaces = fetch_workspaces()
+
+    except requests.RequestException as exc:
+        st.error(f"Could not load workspaces: {exc}")
+        return
+
+    # Keep the latest workspace list in Streamlit state.
+    st.session_state.workspaces = workspaces
+
+    # ------------------------------------------------------------
+    # No workspaces exist
+    # ------------------------------------------------------------
+
+    if not workspaces:
+        st.info("No workspaces yet.")
+        return
+
+    # ------------------------------------------------------------
+    # Make sure an active workspace always exists.
+    # ------------------------------------------------------------
+
+    active_id = st.session_state.active_workspace_id
+
+    workspace_ids = {
+        str(workspace["id"])
+        for workspace in workspaces
     }
 
+    if active_id is None or str(active_id) not in workspace_ids:
+        active_id = str(workspaces[0]["id"])
+        st.session_state.active_workspace_id = active_id
+
+    # ------------------------------------------------------------
+    # Workspace selector
+    # ------------------------------------------------------------
+
+    selected_index = 0
+
+    for index, workspace in enumerate(workspaces):
+        if str(workspace["id"]) == str(active_id):
+            selected_index = index
+            break
+
+    selected_workspace = st.selectbox(
+        "Current workspace",
+        options=workspaces,
+        index=selected_index,
+        format_func=lambda workspace: (
+            f"🔬 {workspace.get('name', 'Untitled Workspace')}"
+        ),
+        key="workspace_selector",
+        label_visibility="collapsed",
+    )
+
+    selected_id = str(selected_workspace["id"])
+
+    # ------------------------------------------------------------
+    # Workspace changed
+    # ------------------------------------------------------------
+
+    if selected_id != str(st.session_state.active_workspace_id):
+
+        st.session_state.active_workspace_id = selected_id
+
+        # Switching workspace should always return
+        # to that workspace's overview.
+        st.session_state.app_mode = "Workspace"
+
+        st.rerun()
+
+def render_create_workspace() -> None:
+    with st.popover("＋ New Workspace", use_container_width=True):
+        st.markdown("#### Create workspace")
+
+        name = st.text_input(
+            "Name",
+            placeholder="e.g. Vision Research",
+        )
+
+        description = st.text_area(
+            "Description",
+            placeholder="What are you researching?",
+            height=90,
+        )
+
+        if st.button(
+            "Create Workspace",
+            type="primary",
+            use_container_width=True,
+        ):
+            if not name.strip():
+                st.warning("Please enter a workspace name.")
+                return
+
+            try:
+                workspace = create_workspace(
+                    name=name.strip(),
+                    description=description.strip() or None,
+                )
+
+                st.session_state.active_workspace_id = workspace["id"]
+                st.session_state.app_mode = "Workspace"
+
+                st.success(
+                    f"Created '{workspace['name']}'."
+                )
+
+                st.rerun()
+
+            except requests.RequestException as exc:
+                st.error(
+                    f"Could not create workspace: {exc}"
+                )
+
+def render_workspace_sidebar() -> None:
+    """
+    Render workspace-level navigation.
+
+    This is intentionally separate from the chat sidebar because
+    workspace selection should remain available across the app.
+    """
+
+    with st.sidebar:
+
+        st.markdown("## 🔎 Smart Research AI")
+
+        render_workspace_selector()
+
+        render_create_workspace()
 
 def upload_document(
     uploaded_file: Any,
@@ -200,16 +661,208 @@ def show_backend_error(exc: Exception) -> None:
 # CHAT UI
 # ============================================================================
 
-def render_chat_sidebar() -> None:
+def render_document_selector(
+    chat: dict[str, Any],
+) -> list[str]:
     """
-    Render navigation/settings only.
+    Render the document source selector.
 
-    Document uploads intentionally do NOT live in the sidebar anymore.
-    They are attached directly from the chat composer using st.chat_input's
-    native file attachment button.
+    The selector is intentionally always visible:
+    - no documents -> disabled-looking empty state
+    - one/multiple documents -> All documents + individual files
+
+    Returns the document IDs to send to the backend.
     """
+
+    document_ids = chat.get("document_ids", [])
+    document_names = chat.get("document_names", {})
+
+    st.markdown(
+        '<div class="source-panel">',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="source-heading">📎 Documents</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not document_ids:
+        st.markdown(
+            '<div class="document-empty">'
+            'No documents attached yet.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Sidebar drag/drop uploader is always available.
+        st.file_uploader(
+            "Drop files here or browse",
+            type=DOCUMENT_FILE_TYPES,
+            accept_multiple_files=True,
+            key=f"sidebar_document_uploader_{chat['id']}",
+            label_visibility="collapsed",
+            help=(
+                "Upload one or more documents. "
+                "They will be indexed and become available "
+                "as sources for your questions."
+            ),
+        )
+
+        st.markdown(
+            '<div class="upload-hint">'
+            '<strong>Drop files here</strong><br>'
+            'or click to browse<br>'
+            '<span>PDF, DOCX, TXT, MD, Python, JS and more</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        return []
+
+    count = len(document_ids)
+
+    st.markdown(
+        f'<div class="document-count">'
+        f'📎 {count} document'
+        f'{"s" if count != 1 else ""} attached'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    options: list[tuple[str, str | None]] = [
+        ("All documents", None)
+    ]
+
+    for document_id in document_ids:
+        filename = document_names.get(
+            document_id,
+            f"Document {document_id[:8]}",
+        )
+        options.append((filename, document_id))
+
+    labels = [label for label, _ in options]
+
+    selected_document_id = chat.get(
+        "selected_document_id"
+    )
+
+    selected_index = 0
+
+    if selected_document_id in document_ids:
+        for index, (_, document_id) in enumerate(options):
+            if document_id == selected_document_id:
+                selected_index = index
+                break
+
+    selected_label = st.selectbox(
+        "Document to use",
+        options=labels,
+        index=selected_index,
+        key=f"document_selector_{chat['id']}",
+        help=(
+            "Choose which document(s) the RAG system "
+            "should use for your next question."
+        ),
+    )
+
+    selected_id = None
+
+    for label, document_id in options:
+        if label == selected_label:
+            selected_id = document_id
+            break
+
+    chat["selected_document_id"] = selected_id
+
+    if selected_id is None:
+        st.markdown(
+            '<div class="active-source">'
+            '📚 <strong>Searching all attached documents</strong>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        selected_ids = document_ids.copy()
+
+    else:
+        selected_name = document_names.get(
+            selected_id,
+            "Selected document",
+        )
+
+        st.markdown(
+            f'<div class="active-source">'
+            f'📄 <strong>Using:</strong> '
+            f'{selected_name}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        selected_ids = [selected_id]
+
+    # Sidebar drag/drop uploader remains available after documents exist.
+    st.file_uploader(
+        "Add more documents",
+        type=DOCUMENT_FILE_TYPES,
+        accept_multiple_files=True,
+        key=f"sidebar_document_uploader_{chat['id']}",
+        label_visibility="collapsed",
+        help="Drop files here or click to add more documents.",
+    )
+
+    st.markdown(
+        '<div class="upload-hint">'
+        '＋ <strong>Add more documents</strong><br>'
+        'Drop files here or click to browse'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    return selected_ids
+
+
+def get_sidebar_uploaded_files(
+    chat: dict[str, Any],
+) -> list[Any]:
+    """
+    Retrieve files selected in the sidebar uploader for this chat.
+
+    Streamlit stores uploader state in session_state using the same key
+    used by st.file_uploader.
+    """
+    key = f"sidebar_document_uploader_{chat['id']}"
+
+    files = st.session_state.get(key)
+
+    if not files:
+        return []
+
+    if not isinstance(files, list):
+        return [files]
+
+    return files
+
+
+def render_chat_sidebar() -> list[str]:
+    """
+    Render chat navigation/settings and the document selector.
+
+    Returns the document IDs selected for the next chat question.
+    """
+
+    selected_document_ids: list[str] = []
+
+    # Workspace navigation is shared across the application.
+    render_workspace_sidebar()
+
     with st.sidebar:
-        st.markdown("## 🔎 Smart Research AI")
+
+        st.divider()
 
         if st.button(
             "＋ New Chat",
@@ -220,16 +873,24 @@ def render_chat_sidebar() -> None:
             st.rerun()
 
         st.divider()
+
         st.caption("CHATS")
 
-        chats = list(st.session_state.chats.values())
+        chats = list(
+            st.session_state.chats.values()
+        )
 
         if not chats:
             st.caption("No conversations yet.")
 
         for chat_item in reversed(chats):
+
             chat_id = chat_item["id"]
-            label = chat_item.get("title") or "New Chat"
+
+            label = (
+                chat_item.get("title")
+                or "New Chat"
+            )
 
             if chat_id == st.session_state.active_chat_id:
                 label = "● " + label
@@ -239,8 +900,10 @@ def render_chat_sidebar() -> None:
                 key=f"select_chat_{chat_id}",
                 use_container_width=True,
             ):
+
                 st.session_state.active_chat_id = chat_id
                 st.session_state.app_mode = "Chat"
+
                 st.rerun()
 
         st.divider()
@@ -265,8 +928,14 @@ def render_chat_sidebar() -> None:
         )
 
         if active_repo:
-            st.caption("📦 Active GitHub repository")
-            st.code(active_repo, language="text")
+            st.caption(
+                "📦 Active GitHub repository"
+            )
+
+            st.code(
+                active_repo,
+                language="text",
+            )
 
         attached_documents = (
             current_chat.get("document_ids", [])
@@ -274,21 +943,231 @@ def render_chat_sidebar() -> None:
             else []
         )
 
-        if attached_documents:
-            st.caption(
-                f"📎 {len(attached_documents)} document(s) attached "
-                "to this chat"
+        # Always render the document source panel.
+        if current_chat:
+            selected_document_ids = (
+                render_document_selector(
+                    current_chat
+                )
             )
 
         st.caption(
-            "Attach documents directly from the paperclip button "
-            "inside the message box."
+            "Attach documents directly from the "
+            "paperclip button inside the message box."
         )
 
+    return selected_document_ids
 
+
+def render_workspace_overview() -> None:
+    render_workspace_sidebar()
+
+    workspace_id = st.session_state.active_workspace_id
+
+    if not workspace_id:
+        st.info("Select or create a workspace to get started.")
+        return
+
+    workspace = next(
+        (
+            item
+            for item in st.session_state.workspaces
+            if str(item["id"]) == str(workspace_id)
+        ),
+        None,
+    )
+
+    if workspace is None:
+        st.warning("The selected workspace could not be found.")
+        return
+
+    name = workspace.get("name", "Untitled Workspace")
+    description = (
+        workspace.get("description")
+        or "Your research workspace."
+    )
+
+    # Header
+    st.markdown("**RESEARCH WORKSPACE**")
+    st.markdown(f"# 🔬 {name}")
+    st.caption(description)
+
+
+    st.markdown("### Get started")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        with st.container(border=True):
+            st.markdown("#### 🔎 Discover research")
+            st.caption(
+                "Find papers, repositories, models and datasets."
+            )
+
+            if st.button(
+                "Discover research →",
+                key="workspace_discover",
+                use_container_width=True,
+            ):
+                st.session_state.app_mode = "Research"
+                st.rerun()
+
+    with col2:
+        with st.container(border=True):
+            st.markdown("#### 📚 Add sources")
+            st.caption(
+                "Upload papers, documents and research material."
+            )
+
+            if st.button(
+                "Add sources →",
+                key="workspace_add_sources",
+                use_container_width=True,
+            ):
+                st.session_state.app_mode = "Chat"
+
+                if not st.session_state.active_chat_id:
+                    create_chat()
+
+                st.rerun()
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        with st.container(border=True):
+            st.markdown("#### 🐙 Explore repositories")
+            st.caption(
+                "Find implementations and related research code."
+            )
+
+            if st.button(
+                "Explore repositories →",
+                key="workspace_repositories",
+                use_container_width=True,
+            ):
+                st.session_state.app_mode = "Research"
+                st.rerun()
+
+    with col4:
+        with st.container(border=True):
+            st.markdown("#### 💬 Ask AI")
+            st.caption(
+                "Investigate the research you've collected."
+            )
+
+            if st.button(
+                "Open research chat →",
+                key="workspace_chat",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state.app_mode = "Chat"
+
+                if not st.session_state.active_chat_id:
+                    create_chat()
+
+                st.rerun()
+
+    st.markdown("")
+    st.markdown("### Your research")
+
+    stats = st.columns(4)
+
+    with stats[0]:
+        st.metric("Papers", 0)
+
+    with stats[1]:
+        st.metric("Repositories", 0)
+
+    with stats[2]:
+        st.metric("Documents", 0)
+
+    with stats[3]:
+        st.metric("Models", 0)
+
+    st.divider()
+
+    st.caption(
+        "Start by discovering research or adding material "
+        "to this workspace."
+    )
+   
+   
 def render_chat() -> None:
-    render_chat_sidebar()
+    selected_document_ids = render_chat_sidebar()
     chat = active_chat()
+
+    # ------------------------------------------------------------
+    # Process documents uploaded through the sidebar dropzone.
+    # ------------------------------------------------------------
+    sidebar_files = get_sidebar_uploaded_files(chat)
+
+    if sidebar_files:
+        processed_keys = chat.setdefault(
+            "uploaded_file_keys",
+            set(),
+        )
+
+        for uploaded_file in sidebar_files:
+            upload_key = (
+                f"{chat['id']}:"
+                f"{uploaded_file.name}:"
+                f"{len(uploaded_file.getvalue())}"
+            )
+
+            if upload_key in processed_keys:
+                continue
+
+            try:
+                with st.spinner(
+                    f"Indexing {uploaded_file.name}..."
+                ):
+                    upload_result = upload_document(
+                        uploaded_file,
+                        chat["id"],
+                    )
+
+                document_id = upload_result["document_id"]
+                filename = upload_result.get(
+                    "filename",
+                    uploaded_file.name,
+                )
+
+                chat.setdefault("document_ids", [])
+
+                if document_id not in chat["document_ids"]:
+                    chat["document_ids"].append(document_id)
+
+                chat.setdefault("document_names", {})
+                chat["document_names"][document_id] = filename
+
+                # New sidebar upload becomes the selected source.
+                chat["selected_document_id"] = document_id
+
+                processed_keys.add(upload_key)
+
+                # Clear the uploader state after processing so the same
+                # file isn't uploaded again on every Streamlit rerun.
+                uploader_key = (
+                    f"sidebar_document_uploader_{chat['id']}"
+                )
+
+                if uploader_key in st.session_state:
+                    del st.session_state[uploader_key]
+
+                st.toast(
+                    f"Added {filename}",
+                    icon="📎",
+                )
+
+                st.rerun()
+
+            except Exception as upload_error:
+                st.error(
+                    f"Could not attach "
+                    f"{uploaded_file.name}: "
+                    f"{upload_error}"
+                )
 
     st.markdown(
         f"### {chat.get('title', 'New Chat')}"
@@ -392,19 +1271,25 @@ def render_chat() -> None:
                 )
 
             document_id = upload_result["document_id"]
+            filename = upload_result.get(
+                "filename",
+                uploaded_file.name,
+            )
 
             chat.setdefault("document_ids", [])
 
             if document_id not in chat["document_ids"]:
                 chat["document_ids"].append(document_id)
 
+            chat.setdefault("document_names", {})
+            chat["document_names"][document_id] = filename
+
+            # A newly attached file is immediately the active document
+            # for the question submitted with that attachment.
+            chat["selected_document_id"] = document_id
+
             processed_keys.add(upload_key)
-            uploaded_this_turn.append(
-                upload_result.get(
-                    "filename",
-                    uploaded_file.name,
-                )
-            )
+            uploaded_this_turn.append(filename)
 
         except Exception as upload_error:
             upload_errors.append(
@@ -418,6 +1303,16 @@ def render_chat() -> None:
     # ------------------------------------------------------------------
     # 2. A file can be submitted without text.
     # ------------------------------------------------------------------
+    # If documents were attached with this exact question, use those
+    # documents for this turn rather than an older sidebar selection.
+    if uploaded_this_turn:
+        selected_document_ids = [
+            document_id
+            for document_id in chat.get("document_ids", [])
+            if chat.get("document_names", {}).get(document_id)
+            in set(uploaded_this_turn)
+        ]
+
     if not prompt and attached_files and not uploaded_this_turn:
         return
 
@@ -473,43 +1368,45 @@ def render_chat() -> None:
         st.markdown(visible_prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner(
-            "Thinking and retrieving relevant information..."
-        ):
-            try:
-                data = call_backend(
-                    prompt,
-                    history,
-                    chat["id"],
-                    chat.get("document_ids", []),
-                )
+        answer_placeholder = st.empty()
+        status_placeholder = st.empty()
+        status_placeholder.caption("Thinking and retrieving relevant information...")
+        try:
+            data = call_backend(
+                prompt,
+                history,
+                chat["id"],
+                selected_document_ids,
+                answer_placeholder=answer_placeholder,
+            )
 
-                answer = data["answer"]
+            answer = data["answer"]
+            status_placeholder.empty()
 
-                # Keep frontend state synchronized with backend's active
-                # GitHub repository.
-                active_repo = data.get(
-                    "active_github_repository"
-                )
+            # Keep frontend state synchronized with backend's active
+            # GitHub repository.
+            active_repo = data.get(
+                "active_github_repository"
+            )
 
-                if active_repo:
-                    chat["github_url"] = active_repo
+            if active_repo:
+                chat["github_url"] = active_repo
 
-                st.markdown(answer)
+            st.markdown(answer)
 
-                chat["messages"].append({
-                    "role": "assistant",
-                    "content": answer,
-                    "metadata": data,
-                })
+            chat["messages"].append({
+                "role": "assistant",
+                "content": answer,
+                "metadata": data,
+            })
 
-                render_chat_diagnostics(data)
+            render_chat_diagnostics(data)
 
-            except Exception as exc:
-                show_backend_error(exc)
+        except Exception as exc:
+            show_backend_error(exc)
 
-                if (
-                    chat["messages"]
+            if (
+                chat["messages"]
                     and chat["messages"][-1]["role"] == "user"
                 ):
                     chat["messages"].pop()
@@ -679,6 +1576,8 @@ def research_ask_ai(result: Any) -> None:
             "for your specific question before running Hybrid RAG."
         )
 
+        streamed_this_run = False
+
         question = st.text_input(
             "Your question",
             placeholder="e.g. How does this approach work?",
@@ -771,28 +1670,24 @@ def research_ask_ai(result: Any) -> None:
                 else:
                     payload["context"] = "\n".join(context)
 
-                with st.spinner(
-                    "AI is retrieving relevant evidence..."
-                ):
-                    response = requests.post(
-                        BACKEND_URL,
-                        json=payload,
-                        timeout=300,
-                    )
-                    response.raise_for_status()
+                answer_placeholder = st.empty()
+                status_placeholder = st.empty()
+                status_placeholder.caption("Retrieving evidence and generating answer...")
 
-                data = response.json()
-                answer = (
-                    data.get("answer")
-                    or data.get("response")
-                    or data.get("output")
+                data = call_backend(
+                    question.strip(),
+                    history,
+                    research_chat_id,
+                    answer_placeholder=answer_placeholder,
+                    extra_payload={
+                        key: value
+                        for key, value in payload.items()
+                        if key not in {"question", "history", "top_k", "chat_id", "document_ids"}
+                    },
                 )
-
-                if not answer:
-                    raise ValueError(
-                        "FastAPI returned no AI answer. "
-                        f"Response: {data}"
-                    )
+                answer = data["answer"]
+                status_placeholder.empty()
+                streamed_this_run = True
 
                 st.session_state.ai_answers[result_id] = {
                     "question": question.strip(),
@@ -811,6 +1706,7 @@ def research_ask_ai(result: Any) -> None:
                     ),
                     "github_url": data.get("github_url"),
                 }
+                render_chat_diagnostics(data)
 
             except Exception as exc:
                 show_backend_error(exc)
@@ -819,58 +1715,117 @@ def research_ask_ai(result: Any) -> None:
         if not previous:
             return
 
-        st.markdown("### 🤖 AI Answer")
-        st.markdown(previous["answer"])
-
-        render_chat_diagnostics(previous)
-
+        if not streamed_this_run:
+            st.markdown("### 🤖 AI Answer")
+            st.markdown(previous["answer"])
+            render_chat_diagnostics(previous)
 
 def display_result_card(result: Any) -> None:
     source = str(
         getattr(result, "source", "") or ""
     ).lower()
 
+    title = str(
+        getattr(result, "title", "Untitled")
+        or "Untitled"
+    )
+
+    url = getattr(result, "url", None)
+
     with st.container(border=True):
         st.markdown(
-            f"### {getattr(result, 'title', 'Untitled')}"
+            f"### {title}"
         )
-        st.caption(f"Source: {source_name(source)}")
+
+        st.caption(
+            f"Source: {source_name(source)}"
+        )
+
+        # --------------------------------------------------------
+        # Source-specific metadata
+        # --------------------------------------------------------
 
         if source == "github":
             display_github_metadata(result)
+
         elif source == "huggingface":
             display_huggingface_metadata(result)
+
         elif source == "arxiv":
             display_arxiv_metadata(result)
+
         elif source == "paperswithcode":
             display_paperswithcode_metadata(result)
 
-        description = getattr(result, "description", None)
+        # --------------------------------------------------------
+        # Description
+        # --------------------------------------------------------
+
+        description = getattr(
+            result,
+            "description",
+            None,
+        )
+
         if description:
             st.write(description)
 
-        tags = getattr(result, "tags", None)
+        # --------------------------------------------------------
+        # Tags
+        # --------------------------------------------------------
+
+        tags = getattr(
+            result,
+            "tags",
+            None,
+        )
+
         if tags:
             st.write(
                 "**🏷 Tags:** "
-                + " • ".join(str(x) for x in tags)
+                + " • ".join(
+                    str(x)
+                    for x in tags
+                )
             )
+
+        # --------------------------------------------------------
+        # Published / Updated
+        # --------------------------------------------------------
 
         cols = st.columns(2)
 
-        published = getattr(result, "published", None)
+        published = getattr(
+            result,
+            "published",
+            None,
+        )
+
         if published:
             with cols[0]:
                 st.caption("📅 Published")
-                try:
-                    st.write(published.strftime("%Y-%m-%d"))
-                except Exception:
-                    st.write(str(published))
 
-        updated = getattr(result, "updated", None)
+                try:
+                    st.write(
+                        published.strftime(
+                            "%Y-%m-%d"
+                        )
+                    )
+                except Exception:
+                    st.write(
+                        str(published)
+                    )
+
+        updated = getattr(
+            result,
+            "updated",
+            None,
+        )
+
         if updated:
             with cols[1]:
                 st.caption("🔄 Updated")
+
                 try:
                     st.write(
                         updated.strftime(
@@ -878,22 +1833,97 @@ def display_result_card(result: Any) -> None:
                         )
                     )
                 except Exception:
-                    st.write(str(updated))
+                    st.write(
+                        str(updated)
+                    )
 
-        url = getattr(result, "url", None)
-        if url:
-            st.link_button(
-                "🔗 Open source",
-                str(url),
-                use_container_width=True,
+        # --------------------------------------------------------
+        # Actions
+        # --------------------------------------------------------
+
+        action_cols = st.columns(2)
+
+        with action_cols[0]:
+            if url:
+                st.link_button(
+                    "🔗 Open source",
+                    str(url),
+                    use_container_width=True,
+                )
+
+        with action_cols[1]:
+
+            workspace_id = (
+                st.session_state.active_workspace_id
             )
 
-        research_ask_ai(result)
+            if workspace_id:
 
+                if st.button(
+                    "＋ Add to workspace",
+                    key=(
+                        f"add_source_"
+                        f"{source}_"
+                        f"{title}_"
+                        f"{url}"
+                    ),
+                    use_container_width=True,
+                ):
+
+                    success = (
+                        add_research_result_to_workspace(
+                            source_type=source,
+                            title=title,
+                            url=(
+                                str(url)
+                                if url
+                                else None
+                            ),
+                            metadata=serialize_research_result(result)
+                        )
+                    )
+                    
+                    success = add_research_result_to_workspace(
+                        source_type=source,
+                        title=title,
+                    url=(
+                        str(url)
+                        if url
+                        else None
+                    ),
+                    metadata=metadata,
+                   )
+                    
+
+                    if success:
+                        st.success(
+                            "Added to current workspace."
+                        )
+
+            else:
+                st.button(
+                    "＋ Add to workspace",
+                    disabled=True,
+                    use_container_width=True,
+                    key=(
+                        f"add_disabled_"
+                        f"{source}_"
+                        f"{title}_"
+                        f"{url}"
+                    ),
+                )
+
+        # --------------------------------------------------------
+        # Existing AI action
+        # --------------------------------------------------------
+
+        research_ask_ai(result)
+        
 
 def render_research() -> None:
+    render_workspace_sidebar()
     with st.sidebar:
-        st.markdown("## 🔎 Smart Research AI")
+        st.divider()
         if st.button(
             "← Back to Chat",
             use_container_width=True,
@@ -1009,7 +2039,7 @@ def render_research() -> None:
             "or select more sources."
         )
         return
-
+    
     total = len(results)
     total_pages = max(
         1,
@@ -1044,17 +2074,9 @@ def render_research() -> None:
 
         with cols[1]:
             st.markdown(
-                f"""
-                <div style="
-                    text-align:center;
-                    padding-top:7px;
-                    font-weight:600;
-                ">
-                    Page {current} of {total_pages}
-                </div>
-                """,
-                unsafe_allow_html=True,
+                f"**Page {current} of {total_pages}**"
             )
+
 
         with cols[2]:
             if st.button(
@@ -1070,10 +2092,11 @@ def render_research() -> None:
 # ENTRY POINT
 # ============================================================================
 
-if not st.session_state.chats:
-    create_chat()
-
 if st.session_state.app_mode == "Research":
     render_research()
+
+elif st.session_state.app_mode == "Workspace":
+    render_workspace_overview()
+
 else:
     render_chat()
