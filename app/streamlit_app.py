@@ -357,17 +357,11 @@ def serialize_research_result(
     result: Any,
 ) -> dict[str, Any]:
     """
-    Convert a ResearchItem into a JSON-safe dictionary.
+    Extract the useful ResearchItem fields into a
+    JSON-safe metadata dictionary.
     """
 
-    if hasattr(result, "model_dump"):
-        data = result.model_dump()
-    elif hasattr(result, "dict"):
-        data = result.dict()
-    else:
-        data = vars(result)
-
-    def clean(value: Any) -> Any:
+    def safe(value: Any) -> Any:
         if value is None:
             return None
 
@@ -376,38 +370,142 @@ def serialize_research_result(
 
         if isinstance(value, dict):
             return {
-                str(key): clean(item)
+                str(key): safe(item)
                 for key, item in value.items()
             }
 
         if isinstance(value, (list, tuple, set)):
             return [
-                clean(item)
+                safe(item)
                 for item in value
             ]
 
-        # datetime/date
         if hasattr(value, "isoformat"):
             return value.isoformat()
 
-        # Pydantic / model objects
-        if hasattr(value, "model_dump"):
-            return clean(value.model_dump())
-
-        # Everything else becomes a string.
         return str(value)
 
-    cleaned = clean(data)
+    metadata = {
+        "research_id": getattr(
+            result,
+            "id",
+            None,
+        ),
 
-    # ------------------------------------------------------------
-    # Final verification.
-    # If something is STILL not JSON serializable, this will
-    # fail here instead of much later inside requests.post().
-    # ------------------------------------------------------------
+        "title": getattr(
+            result,
+            "title",
+            None,
+        ),
 
-    json.dumps(cleaned)
+        "description": getattr(
+            result,
+            "description",
+            None,
+        ),
 
-    return cleaned
+        "authors": getattr(
+            result,
+            "authors",
+            [],
+        ),
+
+        "source": getattr(
+            result,
+            "source",
+            None,
+        ),
+
+        "url": (
+            str(getattr(result, "url", ""))
+            if getattr(result, "url", None)
+            else None
+        ),
+
+        "published": getattr(
+            result,
+            "published",
+            None,
+        ),
+
+        "updated": getattr(
+            result,
+            "updated",
+            None,
+        ),
+
+        "tags": getattr(
+            result,
+            "tags",
+            [],
+        ),
+
+        # GitHub
+        "stars": getattr(
+            result,
+            "stars",
+            None,
+        ),
+
+        "forks": getattr(
+            result,
+            "forks",
+            None,
+        ),
+
+        "language": getattr(
+            result,
+            "language",
+            None,
+        ),
+
+        # Hugging Face
+        "downloads": getattr(
+            result,
+            "downloads",
+            None,
+        ),
+
+        "likes": getattr(
+            result,
+            "likes",
+            None,
+        ),
+
+        "library": getattr(
+            result,
+            "library",
+            None,
+        ),
+
+        "pipeline_tag": getattr(
+            result,
+            "pipeline_tag",
+            None,
+        ),
+
+        # PapersWithCode
+        "tasks": getattr(
+            result,
+            "tasks",
+            [],
+        ),
+
+        "conference": getattr(
+            result,
+            "conference",
+            None,
+        ),
+
+        # Flexible provider-specific metadata
+        "provider_metadata": getattr(
+            result,
+            "metadata",
+            {},
+        ),
+    }
+
+    return safe(metadata)
 
 def add_source_to_workspace(
     workspace_id: str,
@@ -418,21 +516,33 @@ def add_source_to_workspace(
 ) -> dict[str, Any]:
 
     payload = {
-    "source_type": source_type,
-    "title": title,
-    "url": url,
-    "metadata": metadata or {},
-}
+        "source_type": source_type,
+        "title": title,
+        "url": url,
+        "metadata": metadata or {},
+    }
 
-# Verify the entire request payload before requests
-# gets involved.
-    json.dumps(payload)
+    # ------------------------------------------------------------
+    # Convert EVERYTHING in the payload into JSON-safe values.
+    #
+    # default=str means that if a provider has accidentally put
+    # something unusual (module, datetime, URL object, etc.) into
+    # metadata, it becomes a string instead of crashing.
+    # ------------------------------------------------------------
+
+    payload = json.loads(
+        json.dumps(
+            payload,
+            default=str,
+            allow_nan=False,
+        )
+    )
 
     response = requests.post(
-    f"{BACKEND_URL}/workspaces/{workspace_id}/sources",
-    json=payload,
-    timeout=10,
-)
+        f"{BACKEND_URL}/workspaces/{workspace_id}/sources",
+        json=payload,
+        timeout=10,
+    )
 
     response.raise_for_status()
 
