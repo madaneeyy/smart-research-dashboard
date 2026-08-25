@@ -270,6 +270,14 @@ if "workspace_toast" not in st.session_state:
     st.session_state.workspace_toast = None
 if "sources_add_mode" not in st.session_state:
     st.session_state.sources_add_mode = None
+if "selected_workspace_document_id" not in st.session_state:
+    st.session_state.selected_workspace_document_id = None
+
+if "selected_workspace_source_id" not in st.session_state:
+    st.session_state.selected_workspace_source_id = None
+    
+if "selected_workspace_document_name" not in st.session_state:
+    st.session_state.selected_workspace_document_name = None
 
 
 
@@ -1339,7 +1347,7 @@ def render_workspace_overview() -> None:
     )
    
 def render_sources() -> None:
-    """Display all sources saved in the active workspace."""
+    """Display research sources and uploaded documents for the active workspace."""
 
     render_workspace_sidebar()
 
@@ -1364,20 +1372,88 @@ def render_sources() -> None:
 
     workspace_name = workspace.get("name", "Untitled Workspace")
 
+    # ------------------------------------------------------------
+    # Load both source collections
+    # ------------------------------------------------------------
     try:
-        response = requests.get(
+        sources_response = requests.get(
             f"{BACKEND_URL}/workspaces/{workspace_id}/sources",
             timeout=10,
         )
-        response.raise_for_status()
-        sources = response.json()
+        sources_response.raise_for_status()
+        research_sources = sources_response.json()
 
-        if not isinstance(sources, list):
-            sources = []
+        documents_response = requests.get(
+            f"{BACKEND_URL}/workspaces/{workspace_id}/documents",
+            timeout=10,
+        )
+        documents_response.raise_for_status()
+        workspace_documents = documents_response.json()
 
     except requests.RequestException as exc:
         st.error(f"Could not load workspace sources: {exc}")
         return
+
+    if not isinstance(research_sources, list):
+        research_sources = []
+
+    if not isinstance(workspace_documents, list):
+        workspace_documents = []
+
+    # ------------------------------------------------------------
+    # Normalize both backend collections into one UI model
+    # ------------------------------------------------------------
+    combined_sources: list[dict[str, Any]] = []
+
+    for source in research_sources:
+        metadata = source.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        combined_sources.append(
+            {
+                "kind": "research",
+                "id": source.get("id"),
+                "title": source.get("title") or "Untitled source",
+                "source_type": str(
+                    source.get("source_type") or ""
+                ).lower(),
+                "url": source.get("url"),
+                "description": str(
+                    metadata.get("description") or ""
+                ).strip(),
+                "metadata": metadata,
+            }
+        )
+
+    for document in workspace_documents:
+        pages = document.get("pages")
+        status = document.get("status") or "ready"
+
+        description = (
+            f"{pages} pages · {status.title()}"
+            if pages is not None
+            else f"Uploaded document · {status.title()}"
+        )
+
+        combined_sources.append(
+            {
+                "kind": "document",
+                "id": document.get("id"),
+                "document_id": document.get("document_id"),
+                "title": document.get("filename") or "Untitled document",
+                "source_type": "document",
+                "url": None,
+                "description": description,
+                "metadata": {
+                    "content_type": document.get("content_type"),
+                    "pages": pages,
+                    "characters": document.get("characters"),
+                    "size_bytes": document.get("size_bytes"),
+                    "status": status,
+                },
+            }
+        )
 
     source_type_labels = {
         "arxiv": "Papers",
@@ -1414,9 +1490,9 @@ def render_sources() -> None:
     )
 
     # ------------------------------------------------------------
-    # Top action
+    # Add sources popover
     # ------------------------------------------------------------
-    top_spacer, top_action = st.columns([5, 1])
+    _, top_action = st.columns([5, 1])
 
     with top_action:
         with st.popover(
@@ -1424,19 +1500,13 @@ def render_sources() -> None:
             use_container_width=True,
         ):
             st.markdown("### Add sources")
-
-            st.caption(
-                f"Add material to **{workspace_name}**"
-            )  
-
+            st.caption(f"Add material to **{workspace_name}**")
             st.divider()
 
             st.markdown("#### 📄 Add documents")
-
             st.caption(
-                "Upload papers, notes, code, datasets, "
-                "or other research material."
-           )
+                "Upload papers, notes, code, datasets, or other research material."
+            )
 
             if st.button(
                 "Upload files →",
@@ -1447,21 +1517,112 @@ def render_sources() -> None:
                 st.rerun()
 
             st.markdown("")
-
             st.markdown("#### 🔎 Discover research")
-
             st.caption(
-                "Find papers, repositories, models, "
-                "and datasets to add to this workspace."
+                "Find papers, repositories, models, and datasets to add to this workspace."
             )
 
             if st.button(
                 "Discover research →",
                 key="sources_discover_research",
                 use_container_width=True,
-           ):
+            ):
                 st.session_state.sources_add_mode = "research"
                 st.session_state.app_mode = "Research"
+                st.rerun()
+
+    # ------------------------------------------------------------
+    # Workspace document upload
+    # ------------------------------------------------------------
+    if st.session_state.sources_add_mode == "documents":
+        st.markdown("---")
+        st.markdown("### 📄 Add documents")
+        st.caption(
+            f"Upload documents to **{workspace_name}**. "
+            "They will become available as sources in this workspace."
+        )
+
+        uploaded_files = st.file_uploader(
+            "Choose files",
+            type=DOCUMENT_FILE_TYPES,
+            accept_multiple_files=True,
+            key="workspace_document_uploader",
+            label_visibility="collapsed",
+            help=(
+                "Upload PDFs, DOCX, Markdown, text files, "
+                "or supported source/code files."
+            ),
+        )
+
+        upload_col1, upload_col2 = st.columns(2)
+
+        with upload_col1:
+            if st.button(
+                "Add to workspace",
+                type="primary",
+                use_container_width=True,
+                key="confirm_workspace_document_upload",
+                disabled=not uploaded_files,
+            ):
+                successful_uploads: list[str] = []
+                failed_uploads: list[str] = []
+
+                for uploaded_file in uploaded_files:
+                    try:
+                        with st.spinner(f"Adding {uploaded_file.name}..."):
+                            response = requests.post(
+                                f"{BACKEND_URL}/workspaces/{workspace_id}/documents",
+                                files={
+                                    "file": (
+                                        uploaded_file.name,
+                                        uploaded_file.getvalue(),
+                                        uploaded_file.type
+                                        or "application/octet-stream",
+                                    )
+                                },
+                                timeout=120,
+                            )
+                            response.raise_for_status()
+                            result = response.json()
+
+                        successful_uploads.append(
+                            result.get("filename", uploaded_file.name)
+                        )
+
+                    except requests.RequestException as exc:
+                        failed_uploads.append(
+                            f"{uploaded_file.name}: {exc}"
+                        )
+                    except Exception as exc:
+                        failed_uploads.append(
+                            f"{uploaded_file.name}: {exc}"
+                        )
+
+                if successful_uploads:
+                    count = len(successful_uploads)
+                    st.success(
+                        f"Added {count} document{'s' if count != 1 else ''} "
+                        "to the workspace."
+                    )
+
+                for error in failed_uploads:
+                    st.error(f"Could not add document — {error}")
+
+                if not failed_uploads:
+                    st.session_state.sources_add_mode = None
+                    if "workspace_document_uploader" in st.session_state:
+                        del st.session_state["workspace_document_uploader"]
+                    st.rerun()
+
+        with upload_col2:
+            if st.button(
+                "Cancel",
+                use_container_width=True,
+                key="cancel_workspace_document_upload",
+            ):
+                st.session_state.sources_add_mode = None
+                if "workspace_document_uploader" in st.session_state:
+                    del st.session_state["workspace_document_uploader"]
                 st.rerun()
 
     # ------------------------------------------------------------
@@ -1480,7 +1641,7 @@ def render_sources() -> None:
     source_types = sorted(
         {
             str(source.get("source_type", "")).lower()
-            for source in sources
+            for source in combined_sources
             if source.get("source_type")
         }
     )
@@ -1509,18 +1670,31 @@ def render_sources() -> None:
     filtered_sources: list[dict[str, Any]] = []
     query = search_query.strip().lower()
 
-    for source in sources:
-        source_type = str(source.get("source_type", "")).lower()
-        title = str(source.get("title", ""))
-        url = str(source.get("url", ""))
-        metadata = source.get("metadata") or {}
+    for source in combined_sources:
+        source_type = str(
+            source.get("source_type", "")
+        ).lower()
 
+        title = str(
+            source.get("title", "")
+        )
+
+        url = str(
+            source.get("url", "")
+        )
+
+        description = str(
+            source.get("description", "")
+        )
+
+        metadata = source.get("metadata") or {}
         if not isinstance(metadata, dict):
             metadata = {}
 
-        description = str(metadata.get("description", ""))
-
-        if selected_filter != "All" and source_type != selected_filter:
+        if (
+            selected_filter != "All"
+            and source_type != selected_filter
+        ):
             continue
 
         if query:
@@ -1532,6 +1706,8 @@ def render_sources() -> None:
                     source_type,
                     str(metadata.get("authors", "")),
                     str(metadata.get("tags", "")),
+                    str(metadata.get("language", "")),
+                    str(metadata.get("content_type", "")),
                 ]
             ).lower()
 
@@ -1557,7 +1733,7 @@ def render_sources() -> None:
     # Empty state
     # ------------------------------------------------------------
     if not filtered_sources:
-        if sources:
+        if combined_sources:
             st.info("No sources match your search or filter.")
         else:
             st.info(
@@ -1570,7 +1746,10 @@ def render_sources() -> None:
     # Source cards
     # ------------------------------------------------------------
     for index, source in enumerate(filtered_sources):
-        source_type = str(source.get("source_type", "")).lower()
+        source_type = str(
+            source.get("source_type", "")
+        ).lower()
+        source_kind = source.get("kind", "research")
         title = str(source.get("title") or "Untitled source")
         url = source.get("url")
 
@@ -1578,7 +1757,10 @@ def render_sources() -> None:
         if not isinstance(metadata, dict):
             metadata = {}
 
-        description = str(metadata.get("description") or "").strip()
+        description = str(
+            source.get("description") or ""
+        ).strip()
+
         display_source_name = source_type_labels.get(
             source_type,
             source_type.replace("_", " ").title() or "Source",
@@ -1616,17 +1798,37 @@ def render_sources() -> None:
 
             meta_items: list[str] = []
 
-            if isinstance(authors, list) and authors:
-                author_count = len(authors)
-                meta_items.append(
-                    f"{author_count} author{'s' if author_count != 1 else ''}"
-                )
+            if source_kind == "document":
+                pages = metadata.get("pages")
+                status = metadata.get("status")
+                content_type = metadata.get("content_type")
 
-            if isinstance(tags, list) and tags:
-                meta_items.append(f"{len(tags)} tags")
+                if pages is not None:
+                    meta_items.append(
+                        f"{pages} page{'s' if pages != 1 else ''}"
+                    )
 
-            if language:
-                meta_items.append(str(language))
+                if status:
+                    meta_items.append(str(status).title())
+
+                if content_type:
+                    meta_items.append(
+                        str(content_type).replace(
+                            "application/", ""
+                        ).upper()
+                    )
+            else:
+                if isinstance(authors, list) and authors:
+                    author_count = len(authors)
+                    meta_items.append(
+                        f"{author_count} author{'s' if author_count != 1 else ''}"
+                    )
+
+                if isinstance(tags, list) and tags:
+                    meta_items.append(f"{len(tags)} tags")
+
+                if language:
+                    meta_items.append(str(language))
 
             if meta_items:
                 pills = "".join(
@@ -1654,6 +1856,13 @@ def render_sources() -> None:
                         use_container_width=True,
                         key=f"sources_open_{source.get('id', index)}",
                     )
+                elif source_kind == "document":
+                    st.button(
+                        "Document",
+                        disabled=True,
+                        use_container_width=True,
+                        key=f"sources_document_label_{source.get('id', index)}",
+                    )
                 else:
                     st.button(
                         "Open source",
@@ -1666,19 +1875,81 @@ def render_sources() -> None:
                 if st.button(
                     "Ask AI",
                     use_container_width=True,
-                    key=f"sources_ask_{source.get('id', index)}",
+                    key=f"sources_ask_{source.get('kind')}_{source.get('id', index)}",
                 ):
-                    st.session_state.selected_workspace_source_id = source.get("id")
+                    if source.get("kind") == "document":
+                        document_id = source.get("document_id")
+
+                        if not document_id:
+                            st.error(
+                                "This document does not have a valid document ID."
+                            )
+                            return
+
+                        st.session_state.selected_workspace_document_id = (
+                            document_id
+                        )
+                        st.session_state.selected_workspace_document_name = (
+                            source.get("title")
+                            or "Workspace document"
+                        )
+                        st.session_state.selected_workspace_source_id = None
+                    else:
+                        st.session_state.selected_workspace_source_id = (
+                            source.get("id")
+                        )
+                        st.session_state.selected_workspace_document_id = None
+
                     st.session_state.app_mode = "Chat"
 
                     if not st.session_state.active_chat_id:
                         create_chat("Research Chat")
 
-                    st.rerun()
+                        st.rerun()
+
+
+
 
 def render_chat() -> None:
-    selected_document_ids = render_chat_sidebar()
     chat = active_chat()
+
+    # ------------------------------------------------------------
+    # Activate a document selected from the workspace Sources page.
+    # ------------------------------------------------------------
+
+    workspace_document_id = (
+        st.session_state.selected_workspace_document_id
+    )
+
+    if workspace_document_id:
+
+        if workspace_document_id not in chat["document_ids"]:
+            chat["document_ids"].append(
+                workspace_document_id
+            )
+
+        # We need a readable name for the existing
+        # Chat document selector.
+        workspace_document_name = (
+            st.session_state.get(
+                "selected_workspace_document_name"
+            )
+            or "Workspace document"
+        )
+
+        chat["document_names"][
+            workspace_document_id
+        ] = workspace_document_name
+
+        chat["selected_document_id"] = (
+            workspace_document_id
+        )
+
+        # Consume the navigation state.
+        st.session_state.selected_workspace_document_id = None
+        st.session_state.selected_workspace_document_name = None
+
+    selected_document_ids = render_chat_sidebar()
 
     # ------------------------------------------------------------
     # Process documents uploaded through the sidebar dropzone.

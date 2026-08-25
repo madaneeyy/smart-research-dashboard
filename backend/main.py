@@ -18,6 +18,7 @@ from backend.routes.source import (
 )
 from backend.services.workspace_document_service import (
     create_workspace_document,
+    list_workspace_documents
 )
 try:
     from dotenv import load_dotenv
@@ -1225,6 +1226,27 @@ async def upload_workspace_document(
         "status": workspace_document.get("status", "ready"),
         "context_origin": "workspace_upload",
     }
+
+@app.get("/workspaces/{workspace_id}/documents")
+def get_workspace_documents(
+    workspace_id: str,
+) -> List[Dict[str, Any]]:
+    """
+    Return all documents associated with a workspace.
+    """
+
+    try:
+        return list_workspace_documents(workspace_id)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Could not load workspace documents.",
+                "error": str(exc),
+            },
+        )
+
 
 @app.post("/ask")
 def ask_ai(
