@@ -16,6 +16,9 @@ from backend.routes.source import (
     source_router,
     workspace_source_router,
 )
+from backend.services.workspace_document_service import (
+    create_workspace_document,
+)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -1144,6 +1147,84 @@ async def upload_document(
         ),
     }
 
+@app.post("/workspaces/{workspace_id}/documents")
+async def upload_workspace_document(
+    workspace_id: str,
+    file: UploadFile = File(...),
+) -> Dict[str, Any]:
+    """
+    Upload a document and associate it with a workspace.
+
+    This reuses the existing document extraction/cache pipeline
+    without changing the existing chat-scoped upload endpoint.
+    """
+
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file must have a filename.",
+        )
+
+    try:
+        raw_bytes = await file.read()
+
+        # Reuse the existing document extraction/cache pipeline.
+        document = DocumentCache.get_or_extract(
+            filename=file.filename,
+            raw_bytes=raw_bytes,
+            content_type=file.content_type,
+            extractor=DocumentService.extract,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    document_id = str(document["document_id"])
+
+    # Keep the extracted document available to the existing
+    # DocumentRetriever / RAG pipeline.
+    UPLOADED_DOCUMENTS[document_id] = document
+
+    try:
+        workspace_document = create_workspace_document(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            filename=document["filename"],
+            content_type=file.content_type,
+            pages=document.get("pages"),
+            characters=document.get("characters"),
+            size_bytes=document.get("size_bytes"),
+            status="ready",
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Document was processed but could not be associated with the workspace.",
+                "error": str(exc),
+                "document_id": document_id,
+            },
+        )
+
+    return {
+        "workspace_document_id": workspace_document["id"],
+        "workspace_id": workspace_id,
+        "document_id": document_id,
+        "filename": document["filename"],
+        "content_type": file.content_type,
+        "pages": document.get("pages"),
+        "characters": document.get("characters"),
+        "size_bytes": document.get("size_bytes"),
+        "status": workspace_document.get("status", "ready"),
+        "context_origin": "workspace_upload",
+    }
 
 @app.post("/ask")
 def ask_ai(

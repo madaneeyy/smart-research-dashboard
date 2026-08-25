@@ -108,6 +108,116 @@ st.markdown(
         font-size: 0.72rem;
         line-height: 1.35;
     }
+
+    /* =========================================================
+       SOURCES PAGE
+       ========================================================= */
+
+    .sources-page-header {
+        margin-bottom: 1.1rem;
+    }
+
+    .sources-workspace-name {
+        font-size: 0.76rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        opacity: 0.65;
+        margin-bottom: 0.35rem;
+    }
+
+    .sources-page-title {
+        font-size: 2rem;
+        font-weight: 700;
+        line-height: 1.15;
+        margin-bottom: 0.3rem;
+    }
+
+    .sources-page-description {
+        font-size: 0.92rem;
+        line-height: 1.5;
+        opacity: 0.68;
+    }
+
+    .sources-summary {
+        display: flex;
+        align-items: baseline;
+        gap: 0.4rem;
+        margin: 0.9rem 0 0.8rem 0;
+        font-size: 0.86rem;
+    }
+
+    .sources-summary span {
+        opacity: 0.55;
+    }
+
+    .source-card-header {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        min-height: 3.2rem;
+        margin-bottom: 0.55rem;
+    }
+
+    .source-icon {
+        width: 2.15rem;
+        height: 2.15rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+        border-radius: 10px;
+        background: rgba(128, 128, 128, 0.08);
+        font-size: 1.1rem;
+    }
+
+    .source-card-title-area {
+        min-width: 0;
+    }
+
+    .source-card-title {
+        font-size: 1.02rem;
+        font-weight: 650;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+    }
+
+    .source-card-provider {
+        font-size: 0.77rem;
+        opacity: 0.58;
+        margin-top: 0.18rem;
+    }
+
+    .source-card-description {
+        font-size: 0.86rem;
+        line-height: 1.5;
+        opacity: 0.72;
+        margin: 0.65rem 0 0.85rem 0;
+    }
+
+    .source-card-url {
+        font-size: 0.74rem;
+        opacity: 0.52;
+        margin-top: 0.1rem;
+        overflow-wrap: anywhere;
+    }
+
+    .source-card-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        margin-top: 0.55rem;
+    }
+
+    .source-meta-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.2rem 0.5rem;
+        border-radius: 999px;
+        background: rgba(128, 128, 128, 0.08);
+        font-size: 0.7rem;
+        line-height: 1.2;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -145,7 +255,7 @@ defaults = {
     "chats": {},
     "active_chat_id": None,
     "chat_counter": 0,
-    "app_mode": "Workspace",  # or "Chat" or "Research"
+    "app_mode": "Workspace",  # or "Chat", "Research", or "Sources"
 }
 for key, value in defaults.items():
     if key not in st.session_state:
@@ -156,6 +266,12 @@ if "workspaces" not in st.session_state:
 
 if "active_workspace_id" not in st.session_state:
         st.session_state.active_workspace_id = None
+if "workspace_toast" not in st.session_state:
+    st.session_state.workspace_toast = None
+if "sources_add_mode" not in st.session_state:
+    st.session_state.sources_add_mode = None
+
+
 
 
 # ============================================================================
@@ -294,6 +410,39 @@ def fetch_workspaces() -> list[dict[str, Any]]:
     response.raise_for_status()
     return response.json()
 
+def get_current_workspace_source_urls() -> set[str]:
+    workspace_id = (
+        st.session_state.active_workspace_id
+    )
+
+    if not workspace_id:
+        return set()
+
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/workspaces/{workspace_id}/sources",
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        sources = response.json()
+
+        return {
+            (
+                str(source.get("source_type", "")).lower()
+                + "|"
+                + str(source.get("url", "")).strip()
+            )
+            for source in sources
+            if source.get("url")
+        }
+
+    except Exception as exc:
+        st.warning(
+            f"Could not load workspace sources: {exc}"
+        )
+        return set()
 
 def create_workspace(
     name: str,
@@ -309,6 +458,7 @@ def create_workspace(
     )
     response.raise_for_status()
     return response.json()
+
 def make_json_safe(value: Any) -> Any:
     """
     Recursively convert arbitrary Python values into
@@ -514,6 +664,13 @@ def add_source_to_workspace(
     url: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    
+    print(
+       "ADDING SOURCE:",
+        source_type,
+        title,
+        url,
+    )
 
     payload = {
         "source_type": source_type,
@@ -1105,10 +1262,10 @@ def render_workspace_overview() -> None:
 
     st.markdown("### Get started")
 
-    col1, col2 = st.columns(2)
+    col1, col2,col3= st.columns(3)
 
     with col1:
-        with st.container(border=True):
+        with st.container(border=True,height=220):
             st.markdown("#### 🔎 Discover research")
             st.caption(
                 "Find papers, repositories, models and datasets."
@@ -1123,43 +1280,23 @@ def render_workspace_overview() -> None:
                 st.rerun()
 
     with col2:
-        with st.container(border=True):
-            st.markdown("#### 📚 Add sources")
+        with st.container(border=True,height=220):
+            st.markdown("#### 📚  Sources")
             st.caption(
-                "Upload papers, documents and research material."
+                "Browse, organize, and investigate your collected sources."
             )
 
             if st.button(
-                "Add sources →",
-                key="workspace_add_sources",
+                "View sources →",
+                key="workspace_sources",
                 use_container_width=True,
             ):
-                st.session_state.app_mode = "Chat"
-
-                if not st.session_state.active_chat_id:
-                    create_chat()
+                st.session_state.app_mode = "Sources"
 
                 st.rerun()
-
-    col3, col4 = st.columns(2)
 
     with col3:
-        with st.container(border=True):
-            st.markdown("#### 🐙 Explore repositories")
-            st.caption(
-                "Find implementations and related research code."
-            )
-
-            if st.button(
-                "Explore repositories →",
-                key="workspace_repositories",
-                use_container_width=True,
-            ):
-                st.session_state.app_mode = "Research"
-                st.rerun()
-
-    with col4:
-        with st.container(border=True):
+        with st.container(border=True,height=220):
             st.markdown("#### 💬 Ask AI")
             st.caption(
                 "Investigate the research you've collected."
@@ -1181,7 +1318,7 @@ def render_workspace_overview() -> None:
     st.markdown("")
     st.markdown("### Your research")
 
-    stats = st.columns(4)
+    stats = st.columns(3)
 
     with stats[0]:
         st.metric("Papers", 0)
@@ -1192,8 +1329,7 @@ def render_workspace_overview() -> None:
     with stats[2]:
         st.metric("Documents", 0)
 
-    with stats[3]:
-        st.metric("Models", 0)
+    
 
     st.divider()
 
@@ -1202,7 +1338,344 @@ def render_workspace_overview() -> None:
         "to this workspace."
     )
    
-   
+def render_sources() -> None:
+    """Display all sources saved in the active workspace."""
+
+    render_workspace_sidebar()
+
+    workspace_id = st.session_state.active_workspace_id
+
+    if not workspace_id:
+        st.info("Select or create a workspace to view its sources.")
+        return
+
+    workspace = next(
+        (
+            item
+            for item in st.session_state.workspaces
+            if str(item["id"]) == str(workspace_id)
+        ),
+        None,
+    )
+
+    if workspace is None:
+        st.warning("The selected workspace could not be found.")
+        return
+
+    workspace_name = workspace.get("name", "Untitled Workspace")
+
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/workspaces/{workspace_id}/sources",
+            timeout=10,
+        )
+        response.raise_for_status()
+        sources = response.json()
+
+        if not isinstance(sources, list):
+            sources = []
+
+    except requests.RequestException as exc:
+        st.error(f"Could not load workspace sources: {exc}")
+        return
+
+    source_type_labels = {
+        "arxiv": "Papers",
+        "github": "Repositories",
+        "paperswithcode": "PapersWithCode",
+        "huggingface": "Hugging Face",
+        "document": "Documents",
+        "documents": "Documents",
+    }
+
+    icon_map = {
+        "arxiv": "📄",
+        "github": "🐙",
+        "paperswithcode": "📊",
+        "huggingface": "🤗",
+        "document": "📎",
+        "documents": "📎",
+    }
+
+    # ------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------
+    st.markdown(
+        f"""
+        <div class="sources-page-header">
+            <div class="sources-workspace-name">🔬 {workspace_name}</div>
+            <div class="sources-page-title">Sources</div>
+            <div class="sources-page-description">
+                View and manage everything you've collected for this workspace.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ------------------------------------------------------------
+    # Top action
+    # ------------------------------------------------------------
+    top_spacer, top_action = st.columns([5, 1])
+
+    with top_action:
+        with st.popover(
+            "＋ Add sources",
+            use_container_width=True,
+        ):
+            st.markdown("### Add sources")
+
+            st.caption(
+                f"Add material to **{workspace_name}**"
+            )  
+
+            st.divider()
+
+            st.markdown("#### 📄 Add documents")
+
+            st.caption(
+                "Upload papers, notes, code, datasets, "
+                "or other research material."
+           )
+
+            if st.button(
+                "Upload files →",
+                key="sources_upload_documents",
+                use_container_width=True,
+            ):
+                st.session_state.sources_add_mode = "documents"
+                st.rerun()
+
+            st.markdown("")
+
+            st.markdown("#### 🔎 Discover research")
+
+            st.caption(
+                "Find papers, repositories, models, "
+                "and datasets to add to this workspace."
+            )
+
+            if st.button(
+                "Discover research →",
+                key="sources_discover_research",
+                use_container_width=True,
+           ):
+                st.session_state.sources_add_mode = "research"
+                st.session_state.app_mode = "Research"
+                st.rerun()
+
+    # ------------------------------------------------------------
+    # Search + filter
+    # ------------------------------------------------------------
+    search_col, filter_col = st.columns([4, 1])
+
+    with search_col:
+        search_query = st.text_input(
+            "Search sources",
+            placeholder="🔎 Search your sources...",
+            label_visibility="collapsed",
+            key="sources_search",
+        )
+
+    source_types = sorted(
+        {
+            str(source.get("source_type", "")).lower()
+            for source in sources
+            if source.get("source_type")
+        }
+    )
+
+    filter_options = ["All"] + source_types
+
+    with filter_col:
+        selected_filter = st.selectbox(
+            "Filter",
+            filter_options,
+            format_func=lambda value: (
+                "All"
+                if value == "All"
+                else source_type_labels.get(
+                    value,
+                    value.replace("_", " ").title(),
+                )
+            ),
+            label_visibility="collapsed",
+            key="sources_filter",
+        )
+
+    # ------------------------------------------------------------
+    # Filter sources in memory
+    # ------------------------------------------------------------
+    filtered_sources: list[dict[str, Any]] = []
+    query = search_query.strip().lower()
+
+    for source in sources:
+        source_type = str(source.get("source_type", "")).lower()
+        title = str(source.get("title", ""))
+        url = str(source.get("url", ""))
+        metadata = source.get("metadata") or {}
+
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        description = str(metadata.get("description", ""))
+
+        if selected_filter != "All" and source_type != selected_filter:
+            continue
+
+        if query:
+            searchable_text = " ".join(
+                [
+                    title,
+                    description,
+                    url,
+                    source_type,
+                    str(metadata.get("authors", "")),
+                    str(metadata.get("tags", "")),
+                ]
+            ).lower()
+
+            if query not in searchable_text:
+                continue
+
+        filtered_sources.append(source)
+
+    # ------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------
+    st.markdown(
+        f"""
+        <div class="sources-summary">
+            <strong>{len(filtered_sources)} source{'' if len(filtered_sources) == 1 else 's'}</strong>
+            <span>in this workspace</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ------------------------------------------------------------
+    # Empty state
+    # ------------------------------------------------------------
+    if not filtered_sources:
+        if sources:
+            st.info("No sources match your search or filter.")
+        else:
+            st.info(
+                "This workspace has no sources yet. "
+                "Start by discovering research or adding documents."
+            )
+        return
+
+    # ------------------------------------------------------------
+    # Source cards
+    # ------------------------------------------------------------
+    for index, source in enumerate(filtered_sources):
+        source_type = str(source.get("source_type", "")).lower()
+        title = str(source.get("title") or "Untitled source")
+        url = source.get("url")
+
+        metadata = source.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        description = str(metadata.get("description") or "").strip()
+        display_source_name = source_type_labels.get(
+            source_type,
+            source_type.replace("_", " ").title() or "Source",
+        )
+        icon = icon_map.get(source_type, "📚")
+
+        authors = metadata.get("authors")
+        tags = metadata.get("tags")
+        language = metadata.get("language")
+
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="source-card-header">
+                    <div class="source-icon">{icon}</div>
+                    <div class="source-card-title-area">
+                        <div class="source-card-title">{title}</div>
+                        <div class="source-card-provider">{display_source_name}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if description:
+                shortened_description = description
+                if len(shortened_description) > 280:
+                    shortened_description = (
+                        shortened_description[:277].rstrip() + "..."
+                    )
+                st.markdown(
+                    f'<div class="source-card-description">{shortened_description}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            meta_items: list[str] = []
+
+            if isinstance(authors, list) and authors:
+                author_count = len(authors)
+                meta_items.append(
+                    f"{author_count} author{'s' if author_count != 1 else ''}"
+                )
+
+            if isinstance(tags, list) and tags:
+                meta_items.append(f"{len(tags)} tags")
+
+            if language:
+                meta_items.append(str(language))
+
+            if meta_items:
+                pills = "".join(
+                    f'<span class="source-meta-pill">{item}</span>'
+                    for item in meta_items[:3]
+                )
+                st.markdown(
+                    f'<div class="source-card-meta">{pills}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if url:
+                st.markdown(
+                    f'<div class="source-card-url">{str(url)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            action_left, action_right = st.columns(2)
+
+            with action_left:
+                if url:
+                    st.link_button(
+                        "Open source",
+                        str(url),
+                        use_container_width=True,
+                        key=f"sources_open_{source.get('id', index)}",
+                    )
+                else:
+                    st.button(
+                        "Open source",
+                        disabled=True,
+                        use_container_width=True,
+                        key=f"sources_open_disabled_{source.get('id', index)}",
+                    )
+
+            with action_right:
+                if st.button(
+                    "Ask AI",
+                    use_container_width=True,
+                    key=f"sources_ask_{source.get('id', index)}",
+                ):
+                    st.session_state.selected_workspace_source_id = source.get("id")
+                    st.session_state.app_mode = "Chat"
+
+                    if not st.session_state.active_chat_id:
+                        create_chat("Research Chat")
+
+                    st.rerun()
+
 def render_chat() -> None:
     selected_document_ids = render_chat_sidebar()
     chat = active_chat()
@@ -1829,8 +2302,7 @@ def research_ask_ai(result: Any) -> None:
             st.markdown("### 🤖 AI Answer")
             st.markdown(previous["answer"])
             render_chat_diagnostics(previous)
-
-def display_result_card(result: Any) -> None:
+def display_result_card(result: Any,workspace_sources_urls:set[str]) -> None:
     source = str(
         getattr(result, "source", "") or ""
     ).lower()
@@ -1841,8 +2313,21 @@ def display_result_card(result: Any) -> None:
     )
 
     url = getattr(result, "url", None)
+    source_key = (
+        f"{source}|"
+        f"{str(url).strip() if url else ''}"
+    )
+
+    already_in_workspace = (
+       source_key in workspace_sources_urls
+    )
 
     with st.container(border=True):
+
+        # --------------------------------------------------------
+        # Title
+        # --------------------------------------------------------
+
         st.markdown(
             f"### {title}"
         )
@@ -1953,13 +2438,22 @@ def display_result_card(result: Any) -> None:
 
         action_cols = st.columns(2)
 
+        # --------------------------------------------------------
+        # Open source
+        # --------------------------------------------------------
+
         with action_cols[0]:
+
             if url:
                 st.link_button(
                     "🔗 Open source",
                     str(url),
                     use_container_width=True,
                 )
+
+        # --------------------------------------------------------
+        # Add to workspace
+        # --------------------------------------------------------
 
         with action_cols[1]:
 
@@ -1969,48 +2463,74 @@ def display_result_card(result: Any) -> None:
 
             if workspace_id:
 
-                if st.button(
-                    "＋ Add to workspace",
-                    key=(
-                        f"add_source_"
-                        f"{source}_"
-                        f"{title}_"
-                        f"{url}"
-                    ),
-                    use_container_width=True,
-                ):
+                source_key = (
+                    f"{source}_"
+                    f"{title}_"
+                    f"{url}"
+                )
 
-                    success = (
-                        add_research_result_to_workspace(
-                            source_type=source,
-                            title=title,
-                            url=(
-                                str(url)
-                                if url
-                                else None
-                            ),
-                            metadata=serialize_research_result(result)
-                        )
-                    )
-                    
-                    success = add_research_result_to_workspace(
-                        source_type=source,
-                        title=title,
-                    url=(
-                        str(url)
-                        if url
-                        else None
-                    ),
-                    metadata=metadata,
+                added_key = (
+                    f"workspace_source_added_"
+                    f"{source_key}"
+                )
+
+                # Initialize state for this source.
+                if added_key not in st.session_state:
+                    st.session_state[added_key] = False
+
+                # ------------------------------------------------
+                # Already added
+                # ------------------------------------------------
+
+                if already_in_workspace or st.session_state[added_key]:
+
+                    st.button(
+                        "✓ In current workspace",
+                        disabled=True,
+                        use_container_width=True,
+                        key=f"in_workspace_{source_key}",
                    )
-                    
 
-                    if success:
-                        st.success(
-                            "Added to current workspace."
+                else:
+
+                    if st.button(
+                        "＋ Add to workspace",
+                        use_container_width=True,
+                        key=f"add_{source_key}",
+             ):
+
+                        metadata = serialize_research_result(
+                            result
+                   )
+
+                        success = (
+                            add_research_result_to_workspace(
+                                source_type=source,
+                                title=title,
+                                url=(
+                                    str(url)
+                                    if url
+                                    else None
+                                ),
+                                metadata=metadata,
+                            )
                         )
+
+                        if success:
+
+                            st.session_state[added_key] = True
+
+                            st.session_state[
+                                "workspace_toast"
+                            ] = (
+                                 "Successfully added "
+                                "to workspace."
+                        )
+
+                        st.rerun()
 
             else:
+
                 st.button(
                     "＋ Add to workspace",
                     disabled=True,
@@ -2028,8 +2548,6 @@ def display_result_card(result: Any) -> None:
         # --------------------------------------------------------
 
         research_ask_ai(result)
-        
-
 def render_research() -> None:
     render_workspace_sidebar()
     with st.sidebar:
@@ -2042,6 +2560,7 @@ def render_research() -> None:
             st.rerun()
 
     st.title("🔍 Research Search")
+    
     st.write(
         "Search research papers, repositories, and models "
         "across multiple sources."
@@ -2104,6 +2623,10 @@ def render_research() -> None:
     if not selected_sources:
         st.warning("Please select at least one source.")
         return
+    
+    workspace_source_urls = (
+    get_current_workspace_source_urls()
+)
 
     try:
         service = ResearchService()
@@ -2168,7 +2691,7 @@ def render_research() -> None:
     st.caption(f"Showing {start + 1}–{end} of {total}")
 
     for result in results[start:end]:
-        display_result_card(result)
+        display_result_card(result,workspace_source_urls)
 
     if total_pages > 1:
         cols = st.columns([1, 2, 1])
@@ -2201,12 +2724,21 @@ def render_research() -> None:
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
+if st.session_state.workspace_toast:
+    st.toast(
+        st.session_state.workspace_toast,
+        icon="✅",
+    )
 
+    st.session_state.workspace_toast = None
 if st.session_state.app_mode == "Research":
     render_research()
 
 elif st.session_state.app_mode == "Workspace":
     render_workspace_overview()
+    
+elif st.session_state.app_mode == "Sources":
+    render_sources()
 
 else:
     render_chat()
