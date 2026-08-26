@@ -4,7 +4,8 @@ import uuid
 import json
 from pathlib import Path
 from typing import Any
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 
@@ -223,7 +224,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-BACKEND_URL = "http://127.0.0.1:8000/ask"
+
 RESULTS_PER_PAGE = 10
 AVAILABLE_SOURCES = ["arxiv", "github", "paperswithcode", "huggingface"]
 DOCUMENT_FILE_TYPES = [
@@ -313,18 +314,145 @@ def create_chat(title: str = "New Chat") -> str:
     st.session_state.active_chat_id = chat_id
     return chat_id
 
+def load_persistent_chat(chat_id: str) -> dict[str, Any]:
+    """
+    Load a persistent chat from FastAPI and convert it into
+    the local chat structure expected by the existing Chat UI.
+    """
 
+    chat_response = requests.get(
+        f"{BACKEND_URL}/chats/{chat_id}",
+        timeout=30,
+    )
+    chat_response.raise_for_status()
+    chat_data = chat_response.json()
+
+    messages_response = requests.get(
+        f"{BACKEND_URL}/chats/{chat_id}/messages",
+        timeout=30,
+    )
+    messages_response.raise_for_status()
+    messages_data = messages_response.json()
+
+    sources_response = requests.get(
+        f"{BACKEND_URL}/chats/{chat_id}/sources",
+        timeout=30,
+    )
+    sources_response.raise_for_status()
+    sources_data = sources_response.json()
+
+    document_ids: list[str] = []
+    document_names: dict[str, str] = {}
+
+    for source in sources_data:
+        if source.get("source_type") == "document":
+            source_id = source.get("source_id")
+
+            if not source_id:
+                continue
+
+            source_id = str(source_id)
+
+            if source_id not in document_ids:
+                document_ids.append(source_id)
+
+            document_names.setdefault(
+                source_id,
+                "Workspace document",
+            )
+
+    messages: list[dict[str, Any]] = []
+
+    for message in messages_data:
+        messages.append(
+            {
+                "role": message.get("role", "assistant"),
+                "content": message.get("content", ""),
+            }
+        )
+
+    return {
+        "id": str(chat_data["id"]),
+        "title": chat_data.get("title") or "New Chat",
+        "messages": messages,
+        "github_url": None,
+        "document_ids": document_ids,
+        "document_names": document_names,
+        "selected_document_id": (
+            document_ids[0]
+            if document_ids
+            else None
+        ),
+        "uploaded_file_keys": set(),
+    }
 def active_chat() -> dict[str, Any]:
     chat_id = st.session_state.active_chat_id
-    if chat_id not in st.session_state.chats:
-        create_chat()
-    return st.session_state.chats[st.session_state.active_chat_id]
 
+    if not chat_id:
+        create_chat()
+        return st.session_state.chats[
+            st.session_state.active_chat_id
+        ]
+
+    if chat_id not in st.session_state.chats:
+        try:
+            chat = load_persistent_chat(
+                str(chat_id)
+            )
+
+            st.session_state.chats[str(chat_id)] = chat
+
+        except requests.RequestException as exc:
+            st.error(
+                f"Could not load chat: {exc}"
+            )
+
+            create_chat()
+
+    return st.session_state.chats[
+        st.session_state.active_chat_id
+    ]
 
 def chat_title(question: str) -> str:
     text = " ".join(question.strip().split())
     return text if len(text) <= 42 else text[:39].rstrip() + "..."
 
+def create_persistent_chat(
+    workspace_id: str,
+    title: str,
+    source_type: str,
+    source_id: str,
+) -> dict[str, Any]:
+    response = requests.post(
+        f"{BACKEND_URL}/chats",
+        json={
+            "workspace_id": workspace_id,
+            "title": title,
+            "source_type": source_type,
+            "source_id": source_id,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+    return response.json()
+
+def save_chat_message(
+    chat_id: str,
+    role: str,
+    content: str,
+) -> dict[str, Any]:
+    response = requests.post(
+        f"{BACKEND_URL}/chats/{chat_id}/messages",
+        json={
+            "role": role,
+            "content": content,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+    return response.json()
 
 def call_backend(
     question: str,
@@ -346,7 +474,7 @@ def call_backend(
         payload.update(extra_payload)
 
     response = requests.post(
-        BACKEND_URL,
+        f"{BACKEND_URL}/ask",
         params={"stream": "true"},
         json=payload,
         timeout=300,
@@ -417,6 +545,76 @@ def fetch_workspaces() -> list[dict[str, Any]]:
     )
     response.raise_for_status()
     return response.json()
+
+def fetch_recent_chats(
+    workspace_id: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    response = requests.get(
+        f"{BACKEND_URL}/chats/workspace/{workspace_id}",
+        timeout=10,
+    )
+
+    response.raise_for_status()
+
+    chats = response.json()
+
+    if not isinstance(chats, list):
+        return []
+
+    return chats[:limit]
+
+def fetch_workspace_counts(
+    workspace_id: str,
+) -> dict[str, int]:
+    """
+    Return source/document counts for the active workspace.
+    """
+
+    sources_response = requests.get(
+        f"{BACKEND_URL}/workspaces/{workspace_id}/sources",
+        timeout=10,
+    )
+    sources_response.raise_for_status()
+
+    documents_response = requests.get(
+        f"{BACKEND_URL}/workspaces/{workspace_id}/documents",
+        timeout=10,
+    )
+    documents_response.raise_for_status()
+
+    sources = sources_response.json()
+    documents = documents_response.json()
+
+    if not isinstance(sources, list):
+        sources = []
+
+    if not isinstance(documents, list):
+        documents = []
+
+    papers = 0
+    repositories = 0
+
+    for source in sources:
+        source_type = str(
+            source.get("source_type") or ""
+        ).lower()
+
+        if source_type in {
+            "arxiv",
+            "paperswithcode",
+        }:
+            papers += 1
+
+        elif source_type == "github":
+            repositories += 1
+
+    return {
+        "papers": papers,
+        "repositories": repositories,
+        "documents": len(documents),
+    }
+
 
 def get_current_workspace_source_urls() -> set[str]:
     workspace_id = (
@@ -1324,20 +1522,134 @@ def render_workspace_overview() -> None:
                 st.rerun()
 
     st.markdown("")
+        # ------------------------------------------------------------------
+    # Recent chats
+    # ------------------------------------------------------------------
+
+    st.markdown("")
+    st.markdown("### Recent chats")
+
+    try:
+        recent_chats = fetch_recent_chats(
+            workspace_id=str(workspace_id),
+            limit=5,
+        )
+    except requests.RequestException as exc:
+        st.error(
+            f"Could not load recent chats: {exc}"
+        )
+        recent_chats = []
+
+    if not recent_chats:
+        st.caption(
+            "No conversations yet. Open a source and click Ask AI to start one."
+        )
+    else:
+        for chat_item in recent_chats:
+            chat_id = str(chat_item.get("id"))
+            title = (
+                chat_item.get("title")
+                or "New Chat"
+            )
+
+            updated_at = chat_item.get(
+                "updated_at"
+            )
+
+            updated_text = ""
+
+            if updated_at:
+                try:
+                    timestamp=datetime.fromisoformat(
+                        str(updated_at).replace("Z","+00:00")
+                    )
+                    local_timestamp = timestamp.astimezone(
+                        ZoneInfo("Asia/Kathmandu")
+                    )
+                    updated_text = local_timestamp.strftime(
+                        "%d %b %Y, %I:%M %p"
+                    )
+                except Exception:
+                    updated_text = str(updated_at)
+
+            chat_col, button_col = st.columns(
+                [5, 1],
+                gap="small",
+            )
+
+            with chat_col:
+                st.markdown(
+                    f"**💬 {title}**"
+                )
+
+                if updated_text:
+                    st.caption(
+                        f"Last updated: {updated_text}"
+                    )
+                else:
+                    st.caption(
+                        "Research conversation"
+                    )
+
+            with button_col:
+                if st.button(
+                    "Open →",
+                    key=f"recent_chat_{chat_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.active_chat_id = chat_id
+                    st.session_state.app_mode = "Chat"
+
+                    # Clear any stale Sources → Ask AI navigation state.
+                    st.session_state.selected_workspace_document_id = None
+                    st.session_state.selected_workspace_document_name = None
+                    st.session_state.selected_workspace_source_id = None
+
+                    st.rerun()
+
+    st.markdown("")
+
+    # ------------------------------------------------------------------
+    # Your research
+    # Keep this section outside the recent-chats conditional so every
+    # workspace always shows its source/document counts, even when it
+    # has no chats yet.
+    # ------------------------------------------------------------------
     st.markdown("### Your research")
+
+    try:
+        workspace_counts = fetch_workspace_counts(
+            workspace_id=str(workspace_id),
+        )
+    except requests.RequestException as exc:
+        st.warning(
+            f"Could not load workspace statistics: {exc}"
+        )
+        workspace_counts = {
+            "papers": 0,
+            "repositories": 0,
+            "documents": 0,
+        }
 
     stats = st.columns(3)
 
     with stats[0]:
-        st.metric("Papers", 0)
+        st.metric(
+            "Papers",
+            workspace_counts.get("papers", 0),
+        )
 
     with stats[1]:
-        st.metric("Repositories", 0)
+        st.metric(
+            "Repositories",
+            workspace_counts.get("repositories", 0),
+        )
 
     with stats[2]:
-        st.metric("Documents", 0)
-
-    
+        st.metric(
+            "Documents",
+            workspace_counts.get("documents", 0),
+        )
 
     st.divider()
 
@@ -1371,6 +1683,18 @@ def render_sources() -> None:
         return
 
     workspace_name = workspace.get("name", "Untitled Workspace")
+
+    # ------------------------------------------------------------
+    # Back to workspace overview
+    # ------------------------------------------------------------
+    if st.button(
+        "← Workspace",
+        key="sources_back_to_workspace",
+    ):
+        st.session_state.app_mode = "Workspace"
+        st.rerun()
+
+    st.markdown("")
 
     # ------------------------------------------------------------
     # Load both source collections
@@ -1848,69 +2172,118 @@ def render_sources() -> None:
 
             action_left, action_right = st.columns(2)
 
-            with action_left:
-                if url:
-                    st.link_button(
-                        "Open source",
-                        str(url),
-                        use_container_width=True,
-                        key=f"sources_open_{source.get('id', index)}",
-                    )
-                elif source_kind == "document":
-                    st.button(
-                        "Document",
-                        disabled=True,
-                        use_container_width=True,
-                        key=f"sources_document_label_{source.get('id', index)}",
-                    )
-                else:
-                    st.button(
-                        "Open source",
-                        disabled=True,
-                        use_container_width=True,
-                        key=f"sources_open_disabled_{source.get('id', index)}",
-                    )
-
-            with action_right:
-                if st.button(
-                    "Ask AI",
+        with action_left:
+            if url:
+                st.link_button(
+                    "Open source",
+                    str(url),
                     use_container_width=True,
-                    key=f"sources_ask_{source.get('kind')}_{source.get('id', index)}",
-                ):
-                    if source.get("kind") == "document":
-                        document_id = source.get("document_id")
+                    key=f"sources_open_{source.get('id', index)}",
+                )
+            elif source_kind == "document":
+                st.button(
+                    "Document",
+                    disabled=True,
+                    use_container_width=True,
+                    key=f"sources_document_label_{source.get('id', index)}",
+                )
+            else:
+                st.button(
+                    "Open source",
+                    disabled=True,
+                    use_container_width=True,
+                    key=f"sources_open_disabled_{source.get('id', index)}",
+                )
 
-                        if not document_id:
+        with action_right:
+            if st.button(
+                "Ask AI",
+                use_container_width=True,
+                key=f"sources_ask_{source.get('kind')}_{source.get('id', index)}",
+            ):
+                workspace_id = st.session_state.get(
+                    "active_workspace_id"
+                )
+
+                if not workspace_id:
+                    st.error(
+                        "No active workspace is selected."
+                    )
+                    return
+
+                if source_kind == "document":
+                    document_id = source.get("document_id")
+
+                    if not document_id:
+                        st.error(
+                            "This document does not have a valid document ID."
+                        )
+                        return
+
+                    chat_title = (
+                        source.get("title")
+                        or "Document Chat"
+                    )
+
+                    try:
+                        with st.spinner("Opening chat..."):
+                            chat_result = create_persistent_chat(
+                                workspace_id=str(workspace_id),
+                                title=chat_title,
+                                source_type="document",
+                                source_id=str(document_id),
+                            )
+
+                        chat_data = chat_result.get("chat")
+
+                        if not chat_data or not chat_data.get("id"):
                             st.error(
-                                "This document does not have a valid document ID."
+                                "The backend created no valid chat."
                             )
                             return
 
+                        # Store the persistent chat ID.
+                        st.session_state.active_chat_id = str(
+                            chat_data["id"]
+                        )
+
+                        # Pass the selected document to Chat.
                         st.session_state.selected_workspace_document_id = (
-                            document_id
+                            str(document_id)
                         )
+
                         st.session_state.selected_workspace_document_name = (
-                            source.get("title")
-                            or "Workspace document"
+                            chat_title
                         )
+
                         st.session_state.selected_workspace_source_id = None
-                    else:
-                        st.session_state.selected_workspace_source_id = (
-                            source.get("id")
-                        )
-                        st.session_state.selected_workspace_document_id = None
 
-                    st.session_state.app_mode = "Chat"
-
-                    if not st.session_state.active_chat_id:
-                        create_chat("Research Chat")
+                        # Open Chat.
+                        st.session_state.app_mode = "Chat"
 
                         st.rerun()
 
+                    except requests.RequestException as exc:
+                        st.error(
+                            f"Could not create chat: {exc}"
+                        )
 
+                else:
+                    st.warning(
+                        "Chat support for this source type will be added next."
+                    )
 
 
 def render_chat() -> None:
+    back_col, _=st.columns([1,8])
+    with back_col:
+        if st.button(
+            "← Workspace",
+            use_container_width=True,
+            key="chat_back_to_workspace",
+        ):
+            st.session_state.app_mode="Workspace"
+            st.rerun()
     chat = active_chat()
 
     # ------------------------------------------------------------
@@ -1948,8 +2321,9 @@ def render_chat() -> None:
         # Consume the navigation state.
         st.session_state.selected_workspace_document_id = None
         st.session_state.selected_workspace_document_name = None
-
+    
     selected_document_ids = render_chat_sidebar()
+
 
     # ------------------------------------------------------------
     # Process documents uploaded through the sidebar dropzone.
@@ -2214,6 +2588,18 @@ def render_chat() -> None:
         "role": "user",
         "content": visible_prompt,
     })
+    
+    try:
+        save_chat_message(
+            chat_id=str(chat["id"]),
+            role="user",
+            content=visible_prompt,
+        )
+    except requests.RequestException as exc:
+        st.error(
+            f"Could not save your message: {exc}"
+        )
+        return
 
     if len(chat["messages"]) == 1:
         chat["title"] = chat_title(prompt)
@@ -2226,6 +2612,7 @@ def render_chat() -> None:
         status_placeholder = st.empty()
         status_placeholder.caption("Thinking and retrieving relevant information...")
         try:
+            
             data = call_backend(
                 prompt,
                 history,
@@ -2253,6 +2640,16 @@ def render_chat() -> None:
                 "content": answer,
                 "metadata": data,
             })
+            try:
+                save_chat_message(
+                    chat_id=str(chat["id"]),
+                    role="assistant",
+                    content=answer,
+                )
+            except requests.RequestException as exc:
+                st.warning(
+                    f"Answer was generated, but could not be saved: {exc}"
+                )
 
             render_chat_diagnostics(data)
 
@@ -2821,14 +3218,15 @@ def display_result_card(result: Any,workspace_sources_urls:set[str]) -> None:
         research_ask_ai(result)
 def render_research() -> None:
     render_workspace_sidebar()
-    with st.sidebar:
-        st.divider()
-        if st.button(
-            "← Back to Chat",
-            use_container_width=True,
-        ):
-            st.session_state.app_mode = "Chat"
-            st.rerun()
+    if st.button(
+        "← Workspace",
+        use_container_width=True,
+        key="research_back_to_workspace",
+    ):
+        st.session_state.app_mode = "Workspace"
+        st.rerun()
+
+    st.divider()
 
     st.title("🔍 Research Search")
     

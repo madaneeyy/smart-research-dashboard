@@ -20,6 +20,15 @@ from backend.services.workspace_document_service import (
     create_workspace_document,
     list_workspace_documents
 )
+from backend.services.document_storage_service import (
+    upload_document_file,
+    create_document,
+)
+from backend.services.document_chunk_service import (
+    create_document_chunks,
+    get_document_chunks,
+)
+from backend.routes.chat import router as chat_router
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -129,6 +138,7 @@ app = FastAPI(
 app.include_router(workspace_router)
 app.include_router(source_router)
 app.include_router(workspace_source_router)
+app.include_router(chat_router)
 # ============================================================
 # CORS
 # ============================================================
@@ -976,9 +986,8 @@ def set_active_documents(
         return
 
     valid_ids = [
-        document_id
+        str(document_id)
         for document_id in document_ids
-        if document_id in UPLOADED_DOCUMENTS
     ]
 
     ACTIVE_DOCUMENT_CONTEXT[chat_id] = valid_ids
@@ -999,6 +1008,7 @@ def get_documents_for_chat(
     chat_id: Optional[str],
     document_ids: Optional[List[str]],
 ) -> List[Dict[str, Any]]:
+    """Return documents from the legacy in-memory chat-upload store."""
     ids = (
         document_ids
         if document_ids is not None
@@ -1016,6 +1026,25 @@ def get_documents_for_chat(
         documents.append(document)
 
     return documents
+
+
+def get_persistent_document_chunks(
+    document_ids: List[str],
+) -> List[Dict[str, Any]]:
+    """Load workspace document chunks from persistent Supabase storage."""
+    chunks: List[Dict[str, Any]] = []
+
+    for document_id in document_ids:
+        persistent_chunks = get_document_chunks(str(document_id))
+
+        for chunk in persistent_chunks:
+            chunks.append({
+                **chunk,
+                "source": "upload",
+                "source_type": "uploaded_document",
+            })
+
+    return chunks
 
 
 # ============================================================
@@ -1187,6 +1216,39 @@ async def upload_workspace_document(
         )
 
     document_id = str(document["document_id"])
+    storage_path = (
+        f"{workspace_id}/{document_id}/{file.filename}"
+    )
+
+    upload_document_file(
+        storage_path=storage_path,
+        file_bytes=raw_bytes,
+        content_type=file.content_type,
+    )
+
+    create_document(
+        document_id=document_id,
+        filename=document["filename"],
+        storage_path=storage_path,
+        content_type=file.content_type,
+        pages=document.get("pages"),
+        characters=document.get("characters"),
+        size_bytes=len(raw_bytes),
+    )
+    chunks = uploaded_document_chunker.chunk_documents(
+        [document]
+    )
+
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="No usable chunks were created from the document.",
+        )
+
+    create_document_chunks(
+        document_id=document_id,
+        chunks=chunks,
+    )
 
     # Keep the extracted document available to the existing
     # DocumentRetriever / RAG pipeline.
@@ -1225,6 +1287,25 @@ async def upload_workspace_document(
         "size_bytes": document.get("size_bytes"),
         "status": workspace_document.get("status", "ready"),
         "context_origin": "workspace_upload",
+    }
+
+@app.get("/debug/document/{document_id}")
+def debug_document(document_id: str) -> Dict[str, Any]:
+    document = UPLOADED_DOCUMENTS.get(document_id)
+
+    return {
+        "document_id": document_id,
+        "exists_in_uploaded_documents": document is not None,
+        "filename": (
+            document.get("filename")
+            if document
+            else None
+        ),
+        "characters": (
+            document.get("characters")
+            if document
+            else None
+        ),
     }
 
 @app.get("/workspaces/{workspace_id}/documents")
@@ -1394,18 +1475,34 @@ def ask_ai(
     context_start = time.perf_counter()
 
     documents: List[Dict[str, Any]] = []
-
+    chunks: List[Dict[str, Any]] = []
+    retrieved_chunks: List[Dict[str, Any]] = []
+    retrieved_context = ""
+    active_retriever_name = ""
+    active_chunker_name = ""
     if request.document_ids is not None:
         set_active_documents(request.chat_id, request.document_ids)
 
     active_document_ids = get_active_document_ids(request.chat_id)
-    uploaded_documents = get_documents_for_chat(request.chat_id, request.document_ids)
+
+    # Workspace documents are persistent. document_chunks is the source of
+    # truth for their availability; the in-memory store remains only for the
+    # legacy chat-upload endpoint.
+    persistent_document_chunks = get_persistent_document_chunks(
+        active_document_ids
+    )
+    uploaded_documents = get_documents_for_chat(
+        request.chat_id,
+        request.document_ids,
+    )
+
+    has_documents = bool(persistent_document_chunks) or bool(uploaded_documents)
 
     route = ContextRouter.route(
         question=question,
         history=request.history,
         github_reference=github_reference,
-        has_documents=bool(uploaded_documents),
+        has_documents=has_documents,
         resolved_query=retrieval_query,
     )
     context_scope = route["scope"]
@@ -1439,35 +1536,25 @@ def ask_ai(
         context_origin = "github"
 
     elif context_scope == "document":
-        if not uploaded_documents:
-            raise HTTPException(status_code=400, detail="No active uploaded document is available for this question.")
-        documents = [
-            {
-                **document,
-                "source": "upload",
-                "source_type": "uploaded_document",
-            }
-            for document in uploaded_documents
-        ]
+        chunks = list(persistent_document_chunks)
         context_origin = "upload"
+        active_chunker_name = "PersistentDocumentChunks"
 
     elif context_scope == "hybrid":
-        if not github_url or not uploaded_documents:
-            raise HTTPException(status_code=400, detail="A hybrid question requires both an active GitHub repository and an uploaded document.")
+        if not github_url or not persistent_document_chunks:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A hybrid question requires both an active GitHub "
+                    "repository and an uploaded document."
+                ),
+            )
+
         github_documents = build_github_documents(
             github_url=github_url,
             question=retrieval_query,
             branch=request.branch,
         )
-
-        upload_documents = [
-            {
-                **document,
-                "source": "upload",
-                "source_type": "uploaded_document",
-            }
-            for document in uploaded_documents
-        ]
 
         github_documents = [
             {
@@ -1478,8 +1565,12 @@ def ask_ai(
             for document in github_documents
         ]
 
-        documents = upload_documents + github_documents
+        chunks = list(persistent_document_chunks)
+        chunks.extend(document_chunker.chunk_documents(github_documents))
+
+        documents = github_documents
         context_origin = "github+upload"
+        active_chunker_name = "PersistentDocumentChunks + DocumentChunker"
 
     elif request.context and request.context.strip():
         context = request.context.strip()
@@ -1502,7 +1593,7 @@ def ask_ai(
 
     timings["github_or_context_ms"] = _elapsed_ms(context_start)
 
-    if context_origin != "general_chat" and not documents:
+    if context_origin != "general_chat" and not documents and not chunks:
         raise HTTPException(
             status_code=502 if github_url else 400,
             detail=(
@@ -1527,12 +1618,7 @@ def ask_ai(
     # 1-4. CONTEXT PREPARATION / RETRIEVAL / PROMPT
     # ========================================================
 
-    chunks: List[Dict[str, Any]] = []
-    retrieved_chunks: List[Dict[str, Any]] = []
-    retrieved_context = ""
-    active_retriever_name = ""
-    active_chunker_name = ""
-
+    
     if context_origin == "general_chat":
         prompt_start = _profile_start()
         system_prompt = """
@@ -1560,15 +1646,19 @@ technical terminology. Answer directly and appropriately concisely.
                 chunks = document_chunker.chunk_documents(documents)
                 active_chunker_name = "DocumentChunker"
             elif context_scope == "document":
-                chunks = uploaded_document_chunker.chunk_documents(documents)
-                active_chunker_name = "UploadedDocumentChunker"
+                # Chunks were already loaded from persistent document_chunks.
+                active_chunker_name = "PersistentDocumentChunks"
             elif context_scope == "hybrid":
-                github_documents = [d for d in documents if d.get("source") == "github"]
-                upload_documents = [d for d in documents if d.get("source") == "upload"]
-                github_chunks = document_chunker.chunk_documents(github_documents)
-                upload_chunks = uploaded_document_chunker.chunk_documents(upload_documents)
+                # Persistent upload chunks are already in `chunks`; GitHub
+                # content was chunked during context preparation.
+                github_chunks = [
+                    c for c in chunks if c.get("source") == "github"
+                ]
+                upload_chunks = [
+                    c for c in chunks if c.get("source") == "upload"
+                ]
                 chunks = github_chunks + upload_chunks
-                active_chunker_name = "DocumentChunker + UploadedDocumentChunker"
+                active_chunker_name = "PersistentDocumentChunks + DocumentChunker"
             else:
                 chunks = document_chunker.chunk_documents(documents)
                 active_chunker_name = "DocumentChunker"

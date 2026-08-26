@@ -6,7 +6,6 @@ Controlled ranking ablation for the Smart Research Dashboard RAG.
 A: Hybrid RRF -> relevance filter -> metadata-aware MMR (lambda=0.7)
 B: Hybrid RRF -> relevance filter -> query-aware combined-score ranking (NO MMR)
 C: Hybrid RRF -> relevance filter -> complementarity-aware greedy selection
-D: Hybrid RRF -> relevance filter -> relevance-constrained coverage selection
 
 The three experiments share the exact same raw Hybrid/RRF candidate pool and
 threshold. This isolates the ranking/selection stage.
@@ -39,15 +38,6 @@ from src.services.rag.retriever import SimpleRetriever
 TOP_K = 5
 THRESHOLD = 0.20
 MMR_LAMBDA = 0.70
-
-# Relevance-constrained coverage settings for Experiment D.
-# A candidate must remain sufficiently close to the best relevance score before
-# coverage/complementarity is allowed to influence its selection.
-RELEVANCE_FRACTION = 0.85
-COVERAGE_WEIGHT_D = 0.15
-SECTION_NOVELTY_WEIGHT_D = 0.05
-SOURCE_NOVELTY_WEIGHT_D = 0.02
-REDUNDANCY_PENALTY_WEIGHT_D = 0.05
 
 # Keep the same hybrid weights/RRF/candidate multiplier as the existing setup.
 SEMANTIC_WEIGHT = base.SEMANTIC_WEIGHT
@@ -331,208 +321,6 @@ def rerank_complementarity(
 
 
 # ---------------------------------------------------------------------------
-# Relevance-constrained coverage selection (Experiment D)
-# ---------------------------------------------------------------------------
-def _semantic_redundancy_against_selected(
-    candidate: Dict[str, Any],
-    selected: List[Dict[str, Any]],
-) -> float:
-    """Return max cosine similarity between candidate and selected chunks."""
-    if not selected:
-        return 0.0
-
-    model = SimpleRetriever._get_model()
-    candidate_embedding = np.asarray(
-        model.encode(
-            [str(candidate.get("content", ""))],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )[0],
-        dtype=np.float32,
-    )
-
-    selected_embeddings = np.asarray(
-        model.encode(
-            [str(item.get("content", "")) for item in selected],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        ),
-        dtype=np.float32,
-    )
-
-    if selected_embeddings.size == 0:
-        return 0.0
-
-    similarities = selected_embeddings @ candidate_embedding
-    return float(np.max(similarities))
-
-
-def _coverage_diagnostics(
-    query: str,
-    candidate: Dict[str, Any],
-    selected: List[Dict[str, Any]],
-) -> Dict[str, float]:
-    """Measure useful new evidence without allowing coverage to dominate relevance."""
-    query_terms = _query_terms(query)
-
-    candidate_terms = (
-        _tokens(candidate.get("content", ""))
-        | _tokens(candidate.get("section", ""))
-    )
-
-    selected_terms: set[str] = set()
-    selected_sections: set[str] = set()
-    selected_sources: set[str] = set()
-
-    for item in selected:
-        selected_terms |= _tokens(item.get("content", ""))
-        selected_terms |= _tokens(item.get("section", ""))
-        selected_sections.add(_section(item))
-        selected_sources.add(_source(item))
-
-    new_terms = (candidate_terms & query_terms) - selected_terms
-    coverage_gain = (
-        len(new_terms) / len(query_terms)
-        if query_terms
-        else 0.0
-    )
-
-    section = _section(candidate)
-    source = _source(candidate)
-
-    section_novelty = (
-        1.0 if section and section not in selected_sections else 0.0
-    )
-    source_novelty = (
-        1.0 if source and source not in selected_sources else 0.0
-    )
-
-    redundancy = _semantic_redundancy_against_selected(candidate, selected)
-
-    return {
-        "coverage_gain": float(coverage_gain),
-        "section_novelty": float(section_novelty),
-        "source_novelty": float(source_novelty),
-        "redundancy": float(redundancy),
-    }
-
-
-def rerank_relevance_constrained_coverage(
-    query: str,
-    candidates: List[Dict[str, Any]],
-    top_k: int,
-) -> List[Dict[str, Any]]:
-    """
-    Experiment D.
-
-    First establish a relevance floor from the best query-aware candidate.
-    Coverage is then used only to choose among candidates that are still close
-    enough to the best relevance score.
-
-    This is intentionally different from MMR:
-      - relevance is a hard eligibility constraint;
-      - coverage is a small secondary objective;
-      - redundancy is only a light tie-break penalty;
-      - a weak candidate cannot win merely because it adds a new term/section.
-
-    This directly tests the hypothesis:
-        "Can we obtain complementary evidence without sacrificing relevance?"
-    """
-    if not candidates:
-        return []
-
-    scored = []
-    for candidate in candidates:
-        result = dict(candidate)
-        result["query_aware_score"] = query_aware_score(query, result)
-        scored.append(result)
-
-    scored.sort(
-        key=lambda x: x["query_aware_score"],
-        reverse=True,
-    )
-
-    best_relevance = float(scored[0]["query_aware_score"])
-    relevance_floor = best_relevance * RELEVANCE_FRACTION
-
-    selected: List[Dict[str, Any]] = []
-
-    # Always take the strongest relevant candidate first.
-    first = scored.pop(0)
-    first["selection_rank"] = 1
-    first["coverage_selection_score"] = first["query_aware_score"]
-    first["coverage_diagnostics"] = {
-        "query_aware_relevance": float(first["query_aware_score"]),
-        "relevance_floor": float(relevance_floor),
-        "coverage_gain": 0.0,
-        "section_novelty": 1.0,
-        "source_novelty": 1.0,
-        "redundancy": 0.0,
-        "eligible": True,
-    }
-    selected.append(first)
-
-    while scored and len(selected) < top_k:
-        eligible = [
-            candidate
-            for candidate in scored
-            if float(candidate["query_aware_score"]) >= relevance_floor
-        ]
-
-        # If the relevance floor leaves no candidate, stop rather than forcing
-        # an irrelevant result into the context window.
-        if not eligible:
-            break
-
-        best_index = None
-        best_score = -float("inf")
-        best_diag: Dict[str, float] = {}
-
-        for candidate in eligible:
-            diag = _coverage_diagnostics(
-                query=query,
-                candidate=candidate,
-                selected=selected,
-            )
-
-            relevance = float(candidate["query_aware_score"])
-
-            # Relevance remains dominant. Coverage can break ties among
-            # candidates that already satisfy the relevance constraint.
-            score = (
-                relevance
-                + COVERAGE_WEIGHT_D * diag["coverage_gain"]
-                + SECTION_NOVELTY_WEIGHT_D * diag["section_novelty"]
-                + SOURCE_NOVELTY_WEIGHT_D * diag["source_novelty"]
-                - REDUNDANCY_PENALTY_WEIGHT_D * max(
-                    0.0,
-                    diag["redundancy"] - 0.80,
-                )
-            )
-
-            if score > best_score:
-                best_score = score
-                best_index = scored.index(candidate)
-                best_diag = diag
-
-        if best_index is None:
-            break
-
-        result = scored.pop(best_index)
-        result["selection_rank"] = len(selected) + 1
-        result["coverage_selection_score"] = float(best_score)
-        result["coverage_diagnostics"] = {
-            "query_aware_relevance": float(result["query_aware_score"]),
-            "relevance_floor": float(relevance_floor),
-            "eligible": True,
-            **best_diag,
-        }
-        selected.append(result)
-
-    return selected
-
-
-# ---------------------------------------------------------------------------
 # New metrics
 # ---------------------------------------------------------------------------
 def primary_recall_at_k(
@@ -631,13 +419,6 @@ def run_method(
             top_k=TOP_K,
         )
 
-    if method == "D_relevance_constrained_coverage":
-        return rerank_relevance_constrained_coverage(
-            query=query,
-            candidates=[dict(c) for c in accepted],
-            top_k=TOP_K,
-        )
-
     raise ValueError(f"Unknown method: {method}")
 
 
@@ -660,8 +441,6 @@ def summarize_results(
             "mmr_score": result.get("mmr_score"),
             "query_aware_score": result.get("query_aware_score"),
             "complementarity_score": result.get("complementarity_score"),
-            "coverage_selection_score": result.get("coverage_selection_score"),
-            "coverage_diagnostics": result.get("coverage_diagnostics"),
             "gold_relevance": relevance,
             "gold_anchor": base.anchor_for_result(result, gold_map),
             "gold_match_score": (
@@ -785,7 +564,7 @@ def pct(value: float) -> str:
 def report(evaluation: Dict[str, Any]) -> str:
     lines = [
         "=" * 110,
-        "RANKING ABLATION: MMR vs QUERY-AWARE vs COMPLEMENTARITY vs RELEVANCE-CONSTRAINED COVERAGE",
+        "RANKING ABLATION: MMR vs QUERY-AWARE vs COMPLEMENTARITY",
         "=" * 110,
         f"Generated: {evaluation['timestamp']}",
         f"Repository: {evaluation['repository']}",
@@ -795,10 +574,6 @@ def report(evaluation: Dict[str, Any]) -> str:
         f"  threshold: {THRESHOLD}",
         f"  MMR lambda: {MMR_LAMBDA}",
         f"  candidate pool: {CANDIDATE_POOL_SIZE}",
-        f"  D relevance fraction: {RELEVANCE_FRACTION}",
-        f"  D coverage weight: {COVERAGE_WEIGHT_D}",
-        f"  D section novelty weight: {SECTION_NOVELTY_WEIGHT_D}",
-        f"  D source novelty weight: {SOURCE_NOVELTY_WEIGHT_D}",
         f"  semantic weight: {SEMANTIC_WEIGHT}",
         f"  BM25 weight: {BM25_WEIGHT}",
         f"  RRF k: {RRF_K}",
@@ -864,7 +639,7 @@ def report(evaluation: Dict[str, Any]) -> str:
 
 def main() -> None:
     print("=" * 110)
-    print("RANKING ABLATION: MMR vs QUERY-AWARE vs COMPLEMENTARITY vs RELEVANCE-CONSTRAINED COVERAGE")
+    print("RANKING ABLATION: MMR vs QUERY-AWARE vs COMPLEMENTARITY")
     print("=" * 110)
     print(f"\nThreshold={THRESHOLD} | MMR λ={MMR_LAMBDA} | Candidate pool={CANDIDATE_POOL_SIZE}")
 
@@ -884,7 +659,6 @@ def main() -> None:
         "A_current_mmr",
         "B_query_aware_no_mmr",
         "C_complementarity",
-        "D_relevance_constrained_coverage",
     ]
     experiments: Dict[str, Any] = {}
 
