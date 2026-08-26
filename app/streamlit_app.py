@@ -1572,8 +1572,8 @@ def render_workspace_overview() -> None:
                 except Exception:
                     updated_text = str(updated_at)
 
-            chat_col, button_col = st.columns(
-                [5, 1],
+            chat_col, open_col,delete_col = st.columns(
+                [5, 1, 1],
                 gap="small",
             )
 
@@ -1591,7 +1591,7 @@ def render_workspace_overview() -> None:
                         "Research conversation"
                     )
 
-            with button_col:
+            with open_col:
                 if st.button(
                     "Open →",
                     key=f"recent_chat_{chat_id}",
@@ -1606,6 +1606,39 @@ def render_workspace_overview() -> None:
                     st.session_state.selected_workspace_source_id = None
 
                     st.rerun()
+            with delete_col:
+                if st.button(
+                "🗑️",
+                key=f"recent_chat_delete_{chat_id}",
+                help="Delete this chat",
+                use_container_width=True,
+                ):
+                    try:
+                        response = requests.delete(
+                            f"{BACKEND_URL}/chats/{chat_id}",
+                            timeout=10,
+                        )
+                        response.raise_for_status()
+
+            # Remove it from the current Streamlit session too.
+                        st.session_state.chats.pop(
+                            chat_id,
+                            None,
+                        )
+
+                        if (
+                            st.session_state.active_chat_id
+                            == chat_id
+                        ):
+                            st.session_state.active_chat_id = None
+
+                        st.success("Chat deleted.")
+                        st.rerun()
+
+                    except requests.RequestException as exc:
+                        st.error(
+                        f"Could not delete chat: {exc}"
+                    )
 
     st.markdown("")
 
@@ -2170,108 +2203,164 @@ def render_sources() -> None:
                     unsafe_allow_html=True,
                 )
 
-            action_left, action_right = st.columns(2)
+            action_open, action_ask, action_delete = st.columns(
+                [1, 1, 1],
+                gap="small",
+            )
 
-        with action_left:
-            if url:
-                st.link_button(
-                    "Open source",
-                    str(url),
-                    use_container_width=True,
-                    key=f"sources_open_{source.get('id', index)}",
-                )
-            elif source_kind == "document":
-                st.button(
-                    "Document",
-                    disabled=True,
-                    use_container_width=True,
-                    key=f"sources_document_label_{source.get('id', index)}",
-                )
-            else:
-                st.button(
-                    "Open source",
-                    disabled=True,
-                    use_container_width=True,
-                    key=f"sources_open_disabled_{source.get('id', index)}",
-                )
-
-        with action_right:
-            if st.button(
-                "Ask AI",
-                use_container_width=True,
-                key=f"sources_ask_{source.get('kind')}_{source.get('id', index)}",
-            ):
-                workspace_id = st.session_state.get(
-                    "active_workspace_id"
-                )
-
-                if not workspace_id:
-                    st.error(
-                        "No active workspace is selected."
+            # --------------------------------------------------------
+            # Open source
+            # --------------------------------------------------------
+            with action_open:
+                if url:
+                    st.link_button(
+                        "🔗 Open",
+                        str(url),
+                        use_container_width=True,
+                        key=f"sources_open_{source.get('id', index)}",
                     )
-                    return
+                elif source_kind == "document":
+                    st.button(
+                        "📄 Document",
+                        disabled=True,
+                        use_container_width=True,
+                        key=f"sources_document_label_{source.get('id', index)}",
+                    )
+                else:
+                    st.button(
+                        "Open",
+                        disabled=True,
+                        use_container_width=True,
+                        key=f"sources_open_disabled_{source.get('id', index)}",
+                    )
 
-                if source_kind == "document":
-                    document_id = source.get("document_id")
+            # --------------------------------------------------------
+            # Ask AI
+            # --------------------------------------------------------
+            with action_ask:
+                if st.button(
+                    "🤖 Ask AI",
+                    use_container_width=True,
+                    key=f"sources_ask_{source.get('kind')}_{source.get('id', index)}",
+                ):
+                    workspace_id = st.session_state.get(
+                        "active_workspace_id"
+                    )
 
-                    if not document_id:
+                    if not workspace_id:
                         st.error(
-                            "This document does not have a valid document ID."
+                            "No active workspace is selected."
                         )
                         return
 
-                    chat_title = (
-                        source.get("title")
-                        or "Document Chat"
-                    )
+                    if source_kind == "document":
+                        document_id = source.get("document_id")
 
-                    try:
-                        with st.spinner("Opening chat..."):
-                            chat_result = create_persistent_chat(
-                                workspace_id=str(workspace_id),
-                                title=chat_title,
-                                source_type="document",
-                                source_id=str(document_id),
-                            )
-
-                        chat_data = chat_result.get("chat")
-
-                        if not chat_data or not chat_data.get("id"):
+                        if not document_id:
                             st.error(
-                                "The backend created no valid chat."
+                                "This document does not have a valid document ID."
                             )
                             return
 
-                        # Store the persistent chat ID.
-                        st.session_state.active_chat_id = str(
-                            chat_data["id"]
+                        chat_title = (
+                            source.get("title")
+                            or "Document Chat"
                         )
 
-                        # Pass the selected document to Chat.
-                        st.session_state.selected_workspace_document_id = (
-                            str(document_id)
+                        try:
+                            with st.spinner("Opening chat..."):
+                                chat_result = create_persistent_chat(
+                                    workspace_id=str(workspace_id),
+                                    title=chat_title,
+                                    source_type="document",
+                                    source_id=str(document_id),
+                                )
+
+                            chat_data = chat_result.get("chat")
+
+                            if not chat_data or not chat_data.get("id"):
+                                st.error(
+                                    "The backend created no valid chat."
+                                )
+                                return
+
+                            st.session_state.active_chat_id = str(
+                                chat_data["id"]
+                            )
+
+                            st.session_state.selected_workspace_document_id = (
+                                str(document_id)
+                            )
+
+                            st.session_state.selected_workspace_document_name = (
+                                chat_title
+                            )
+
+                            st.session_state.selected_workspace_source_id = None
+
+                            st.session_state.app_mode = "Chat"
+
+                            st.rerun()
+
+                        except requests.RequestException as exc:
+                            st.error(
+                                f"Could not create chat: {exc}"
+                            )
+
+                    else:
+                        st.warning(
+                            "Chat support for this source type will be added next."
                         )
 
-                        st.session_state.selected_workspace_document_name = (
-                            chat_title
+            # --------------------------------------------------------
+            # Remove from workspace
+            # --------------------------------------------------------
+            with action_delete:
+                if source_kind == "research":
+                    source_id = source.get("id")
+
+                    if st.button(
+                        "🗑 Remove",
+                        use_container_width=True,
+                        key=f"sources_delete_{source_id}_{index}",
+                        help="Remove this source from the current workspace.",
+                    ):
+                        workspace_id = st.session_state.get(
+                            "active_workspace_id"
                         )
 
-                        st.session_state.selected_workspace_source_id = None
+                        if not workspace_id:
+                            st.error(
+                                "No active workspace is selected."
+                            )
+                            return
 
-                        # Open Chat.
-                        st.session_state.app_mode = "Chat"
+                        if not source_id:
+                            st.error(
+                                "This source has no valid ID."
+                            )
+                            return
 
-                        st.rerun()
+                        try:
+                            response = requests.delete(
+                                f"{BACKEND_URL}/workspaces/{workspace_id}/sources/{source_id}",
+                                timeout=10,
+                            )
+                            response.raise_for_status()
 
-                    except requests.RequestException as exc:
-                        st.error(
-                            f"Could not create chat: {exc}"
-                        )
+                            st.toast(
+                                "Source removed from this workspace."
+                            )
+                            st.rerun()
 
+                        except requests.RequestException as exc:
+                            st.error(
+                                f"Could not remove source: {exc}"
+                            )
                 else:
-                    st.warning(
-                        "Chat support for this source type will be added next."
-                    )
+                    # Document deletion has a separate cleanup flow because
+                    # documents also have storage and chunk records.
+                    st.empty()
 
 
 def render_chat() -> None:

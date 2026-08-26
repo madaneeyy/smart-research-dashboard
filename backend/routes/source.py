@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from backend.services.source_service import (
     create_source,
     delete_source,
+    delete_source_from_workspace,
     get_source,
     list_sources,
 )
@@ -103,4 +104,27 @@ def delete_source_endpoint(source_id: str):
 
     return {
         "message": "Source deleted successfully."
+    }
+
+@workspace_source_router.delete(
+    "/{source_id}",
+    response_model=DeleteSourceResponse,
+)
+def delete_workspace_source_endpoint(
+    workspace_id: str,
+    source_id: str,
+):
+    deleted = delete_source_from_workspace(
+        workspace_id=workspace_id,
+        source_id=source_id,
+    )
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Source not found in this workspace.",
+        )
+
+    return {
+        "message": "Source removed from workspace."
     }

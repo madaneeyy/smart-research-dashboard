@@ -75,3 +75,19 @@ def delete_source(source_id: str) -> bool:
 
     return True
 
+
+
+def delete_source_from_workspace(
+    workspace_id: str,
+    source_id: str,
+) -> bool:
+    response = (
+        supabase
+        .table("workspace_sources")
+        .delete()
+        .eq("workspace_id", workspace_id)
+        .eq("id", source_id)
+        .execute()
+    )
+
+    return bool(response.data)
