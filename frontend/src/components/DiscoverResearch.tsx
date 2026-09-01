@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
   Check,
+  Clipboard,
   ChevronDown,
   Clock3,
   ExternalLink,
@@ -21,6 +22,8 @@ import {
   type ResearchItem,
   type Workspace,
 } from "../lib/api";
+import { citationFromResearchItem } from "../lib/citations";
+import { CitationMenu } from "../components/CitationMenu";
 
 interface DiscoverResearchProps {
   workspace: Workspace;
@@ -1025,6 +1028,16 @@ function ResearchResultCard({
   const source =
     result.source.toLowerCase();
 
+  const [citationOpen, setCitationOpen] =
+    useState(false);
+
+  const isArxiv =
+    source === "arxiv";
+
+  const citation = isArxiv
+    ? citationFromResearchItem(result)
+    : null;
+
   return (
     <article className="group rounded-2xl border border-[var(--line)] bg-[var(--paper)] p-5 transition-all duration-200 hover:-translate-y-px hover:shadow-md sm:p-6">
       <div className="flex flex-col gap-5 lg:flex-row lg:justify-between">
@@ -1126,6 +1139,27 @@ function ResearchResultCard({
             />
             Open source
           </button>
+
+          {isArxiv && citation && (
+            <div className="relative flex-1 lg:flex-none">
+              <button
+                type="button"
+                onClick={() => setCitationOpen((open) => !open)}
+                className="flex w-full items-center justify-center gap-2 rounded-md border border-[var(--line)] px-3 py-2.5 text-xs font-medium text-[var(--ink-soft)] transition-all duration-200 hover:-translate-y-px hover:bg-[var(--paper-dim)] hover:text-[var(--ink)] hover:shadow-sm"
+                aria-expanded={citationOpen}
+              >
+                <Clipboard size={13} />
+                Cite
+              </button>
+
+              {citationOpen && (
+                <CitationMenu
+                  citation={citation}
+                  onClose={() => setCitationOpen(false)}
+                />
+              )}
+            </div>
+          )}
 
           <button
             type="button"

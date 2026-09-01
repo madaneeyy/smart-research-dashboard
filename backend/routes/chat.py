@@ -8,6 +8,7 @@ from backend.services.chat_service import (
     get_chat_messages, get_chat_sources, add_chat_message,
     get_workspace_chats, delete_chat, remove_chat_source,
 )
+from backend.services.source_service import get_arxiv_source_for_document
 
 router=APIRouter(prefix="/chats", tags=["chats"])
 
@@ -54,10 +55,27 @@ def create_chat_endpoint(request: CreateChatRequest) -> Dict[str, Any]:
                 "source_id": source_id,
             })
 
-        combined = [
-            {"source_type": "document", "source_id": x}
-            for x in ids
-        ] + generic_sources
+        combined: list[dict[str, str]] = []
+
+        for document_id in ids:
+            arxiv_source = get_arxiv_source_for_document(
+                request.workspace_id,
+                document_id,
+            )
+            if arxiv_source:
+                combined.append({
+                    "source_type": "arxiv",
+                    "source_id": document_id,
+                })
+            else:
+                combined.append({
+                    "source_type": "document",
+                    "source_id": document_id,
+                })
+
+        # Preserve generic sources exactly as supplied (GitHub and future
+        # source types use this path).
+        combined.extend(generic_sources)
 
         if combined:
             sources.extend(

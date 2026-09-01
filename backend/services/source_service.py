@@ -91,3 +91,22 @@ def delete_source_from_workspace(
     )
 
     return bool(response.data)
+
+def get_arxiv_source_for_document(
+    workspace_id: str,
+    document_id: str,
+) -> dict[str, Any] | None:
+    """Return the workspace arXiv source backed by a canonical document ID."""
+    for source in list_sources(workspace_id) or []:
+        source_type = str(source.get("source_type") or "").strip().lower()
+        if source_type not in {"arxiv", "arxiv_paper"}:
+            continue
+
+        metadata = source.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            continue
+
+        if str(metadata.get("document_id") or "").strip() == str(document_id).strip():
+            return source
+
+    return None

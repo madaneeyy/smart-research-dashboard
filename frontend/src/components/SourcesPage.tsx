@@ -169,8 +169,26 @@ export function SourcesPage({
     const query =
       searchQuery.trim().toLowerCase();
 
+    // arXiv papers are represented by a user-facing workspace source,
+    // while their downloaded PDF is stored internally as a workspace document.
+    // Never expose that internal document as a second source.
+    const arxivDocumentIds = new Set(
+      sources
+        .filter(
+          (source) =>
+            source.source_type.toLowerCase() === "arxiv",
+        )
+        .map((source) => getLinkedDocumentId(source))
+        .filter((documentId): documentId is string => Boolean(documentId)),
+    );
+
     const documentItems =
-      documents.map((document) => ({
+      documents
+        .filter(
+          (document) =>
+            !arxivDocumentIds.has(document.document_id),
+        )
+        .map((document) => ({
         kind: "document" as const,
         id: document.document_id,
         title:
@@ -458,8 +476,23 @@ export function SourcesPage({
       return;
     }
 
+    // A paper is selected through workspace_sources, but its actual content
+    // is retrieved through the linked document_id. Resolve that relationship
+    // here without exposing the internal PDF as a separate source.
+    const selectedArxivDocumentIds = sources
+      .filter(
+        (item) =>
+          selectedSourceIds.has(item.id) &&
+          item.source_type.toLowerCase() === "arxiv",
+      )
+      .map((item) => getLinkedDocumentId(item))
+      .filter((documentId): documentId is string => Boolean(documentId));
+
     const selectedDocuments = Array.from(
-      selectedDocumentIds,
+      new Set([
+        ...selectedDocumentIds,
+        ...selectedArxivDocumentIds,
+      ]),
     );
 
     const selectedGithub = sources
@@ -482,11 +515,31 @@ export function SourcesPage({
     ]);
   };
 
+  const arxivDocumentIds = useMemo(
+    () =>
+      new Set(
+        sources
+          .filter(
+            (source) =>
+              source.source_type.toLowerCase() === "arxiv",
+          )
+          .map((source) => getLinkedDocumentId(source))
+          .filter((documentId): documentId is string => Boolean(documentId)),
+      ),
+    [sources],
+  );
+
+  const visibleDocumentCount =
+    documents.filter(
+      (document) =>
+        !arxivDocumentIds.has(document.document_id),
+    ).length;
+
   const totalCount =
-    sources.length + documents.length;
+    sources.length + visibleDocumentCount;
 
   const documentCount =
-    documents.length;
+    visibleDocumentCount;
 
   const paperCount =
     sources.filter(
@@ -768,6 +821,7 @@ export function SourcesPage({
                       source={item.source}
                       selected={
                         (
+                          item.source.source_type.toLowerCase() === "arxiv" ||
                           item.source.source_type.toLowerCase() === "github" ||
                           item.source.source_type.toLowerCase() === "github_repository"
                         ) &&
@@ -775,6 +829,7 @@ export function SourcesPage({
                       }
                       onToggleSelection={
                         (
+                          item.source.source_type.toLowerCase() === "arxiv" ||
                           item.source.source_type.toLowerCase() === "github" ||
                           item.source.source_type.toLowerCase() === "github_repository"
                         )
@@ -1586,6 +1641,22 @@ function LoadingState() {
 /* ============================================================
    Helpers
    ============================================================ */
+
+function getLinkedDocumentId(
+  source: WorkspaceSource,
+): string | null {
+  const metadata = source.metadata;
+
+  if (!metadata || typeof metadata !== "object") {
+    return null;
+  }
+
+  const documentId = metadata["document_id"];
+
+  return typeof documentId === "string" && documentId.trim()
+    ? documentId.trim()
+    : null;
+}
 
 function formatContentType(
   contentType: string | null,

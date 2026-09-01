@@ -1,14 +1,22 @@
+import { useEffect, useState } from "react";
 import {
   ArrowRight,
   BookOpen,
+  Brain,
   FileText,
+  Code2,
   MessageSquare,
   Plus,
   Search,
-  Sparkles,
 } from "lucide-react";
 
-import type { Workspace } from "../lib/api";
+import {
+  getWorkspaceDocuments,
+  getWorkspaceSources,
+  type Workspace,
+  type WorkspaceDocument,
+  type WorkspaceSource,
+} from "../lib/api";
 
 interface WorkspaceOverviewProps {
   workspace: Workspace;
@@ -26,6 +34,86 @@ export function WorkspaceOverview({
   onNavigate,
   onCreateWorkspace,
 }: WorkspaceOverviewProps) {
+  const [documents, setDocuments] = useState<WorkspaceDocument[]>([]);
+  const [sources, setSources] = useState<WorkspaceSource[]>([]);
+  const [loadingStats, setLoadingStats] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadStats() {
+      setLoadingStats(true);
+
+      try {
+        const [loadedDocuments, loadedSources] = await Promise.all([
+          getWorkspaceDocuments(workspace.id),
+          getWorkspaceSources(workspace.id),
+        ]);
+
+        if (cancelled) {
+          return;
+        }
+
+        setDocuments(
+          Array.isArray(loadedDocuments) ? loadedDocuments : [],
+        );
+        setSources(
+          Array.isArray(loadedSources) ? loadedSources : [],
+        );
+      } catch {
+        if (!cancelled) {
+          setDocuments([]);
+          setSources([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoadingStats(false);
+        }
+      }
+    }
+
+    void loadStats();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.id]);
+
+  const normalizedSources = sources.map((source) => ({
+    ...source,
+    sourceType: source.source_type.trim().toLowerCase(),
+  }));
+
+  const arxivSources = normalizedSources.filter(
+    (source) => source.sourceType === "arxiv",
+  );
+
+  const githubCount = normalizedSources.filter(
+    (source) => source.sourceType === "github",
+  ).length;
+
+  const paperCount = arxivSources.length;
+
+  const huggingfaceCount = normalizedSources.filter(
+    (source) => source.sourceType === "huggingface",
+  ).length;
+
+  const arxivDocumentIds = new Set(
+    arxivSources
+      .map((source) => {
+        const value = source.metadata?.["document_id"];
+        return typeof value === "string" ? value.trim() : "";
+      })
+      .filter(Boolean),
+  );
+
+  const documentCount = documents.filter(
+    (document) => !arxivDocumentIds.has(document.document_id),
+  ).length;
+
+  const statValue = (value: number) =>
+    loadingStats ? "—" : String(value);
+
   return (
     <div className="min-h-full bg-[var(--paper)] text-[var(--ink)]">
       {/* ======================================================
@@ -86,29 +174,52 @@ export function WorkspaceOverview({
       ====================================================== */}
 
       <main className="mx-auto max-w-7xl px-6 py-8 lg:px-8 lg:py-10">
-        {/* Stats */}
+        {/* Research inventory */}
 
         <section>
-          <div className="grid gap-3 sm:grid-cols-3">
-            <StatCard
-              icon={<Sparkles size={16} />}
-              label="Sources"
-              value="0"
-              description="Nothing collected yet"
-            />
-
-            <StatCard
-              icon={<MessageSquare size={16} />}
-              label="Chats"
-              value="0"
-              description="No conversations yet"
-            />
-
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <StatCard
               icon={<FileText size={16} />}
               label="Documents"
-              value="0"
-              description="No documents added"
+              value={statValue(documentCount)}
+              description={
+                documentCount === 1
+                  ? "Uploaded document"
+                  : "Uploaded documents"
+              }
+            />
+
+            <StatCard
+              icon={<Code2 size={16} />}
+              label="GitHub Repos"
+              value={statValue(githubCount)}
+              description={
+                githubCount === 1
+                  ? "Repository connected"
+                  : "Repositories connected"
+              }
+            />
+
+            <StatCard
+              icon={<BookOpen size={16} />}
+              label="Papers"
+              value={statValue(paperCount)}
+              description={
+                paperCount === 1
+                  ? "Research paper added"
+                  : "Research papers added"
+              }
+            />
+
+            <StatCard
+              icon={<Brain size={16} />}
+              label="Hugging Face Models"
+              value={statValue(huggingfaceCount)}
+              description={
+                huggingfaceCount === 1
+                  ? "Model added"
+                  : "Models added"
+              }
             />
           </div>
         </section>

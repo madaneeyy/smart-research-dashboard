@@ -35,6 +35,7 @@ from backend.services.document_chunk_service import (
 )
 from backend.routes.chat import router as chat_router
 from backend.services.chat_service import get_chat, get_chat_sources
+from backend.services.source_service import list_sources
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -515,6 +516,8 @@ def format_retrieved_context(
         st = str(chunk.get("source_type") or chunk.get("source") or "unknown").strip().lower()
         if st in {"github", "github_repository"}:
             key = ("github_repository", str(chunk.get("repository") or chunk.get("github_url") or "GitHub repository").strip())
+        elif st in {"arxiv", "arxiv_paper"}:
+            key = ("arxiv", str(chunk.get("arxiv_id") or chunk.get("document_id") or chunk.get("filename") or "arXiv paper").strip())
         elif st in {"upload", "uploaded_document", "document"}:
             key = ("uploaded_document", str(chunk.get("document_id") or chunk.get("filename") or chunk.get("path") or "Uploaded document").strip())
         else:
@@ -527,6 +530,9 @@ def format_retrieved_context(
         if kind == "github_repository":
             source_kind = "GitHub repository"
             source_name = str(first.get("repository") or first.get("github_url") or name).strip()
+        elif kind == "arxiv":
+            source_kind = "arXiv paper"
+            source_name = str(first.get("arxiv_title") or first.get("filename") or first.get("path") or name).strip()
         elif kind == "uploaded_document":
             source_kind = "Uploaded document"
             source_name = str(first.get("filename") or first.get("path") or name).strip()
@@ -593,7 +599,7 @@ CORE INSTRUCTIONS:
 - You may summarize, synthesize, explain, compare, and connect related information when the connection is supported by the evidence.
 - When several passages contribute to the same answer, combine them into a coherent explanation.
 - Keep source-specific facts associated with the correct source.
-- Treat every SOURCE block as an independent source. "GitHub repository" means current implementation evidence; "Uploaded document" means document/paper evidence.
+- Treat every SOURCE block as an independent source. "GitHub repository" means current implementation evidence; "Uploaded document" means uploaded document evidence; "arXiv paper" means literature/paper evidence from arXiv.
 - For cross-source questions, explicitly connect evidence from both relevant sources and distinguish the paper/document description from the current implementation.
 - Do not invent source-specific facts, numbers, methods, results, quotations, citations, authors, or relationships.
 - Do not refuse simply because the evidence uses different terminology from the question.
@@ -1121,19 +1127,55 @@ def get_documents_for_chat(
 
 def get_persistent_document_chunks(
     document_ids: List[str],
+    workspace_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Load workspace document chunks from persistent Supabase storage."""
+    """Load persistent document chunks and preserve arXiv provenance."""
     chunks: List[Dict[str, Any]] = []
 
-    for document_id in document_ids:
-        persistent_chunks = get_document_chunks(str(document_id))
+    arxiv_by_document_id: Dict[str, Dict[str, Any]] = {}
 
-        for chunk in persistent_chunks:
-            chunks.append({
-                **chunk,
-                "source": "upload",
-                "source_type": "uploaded_document",
-            })
+    if workspace_id:
+        try:
+            for source in list_sources(str(workspace_id)) or []:
+                if _normalize_source_type(source.get("source_type")) not in {"arxiv", "arxiv_paper"}:
+                    continue
+                metadata = source.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    continue
+                source_document_id = str(metadata.get("document_id") or "").strip()
+                if source_document_id:
+                    arxiv_by_document_id[source_document_id] = source
+        except Exception as exc:
+            print(f"arXiv provenance lookup warning: {exc}")
+
+    for document_id in document_ids:
+        document_id = str(document_id)
+        persistent_chunks = get_document_chunks(document_id)
+        arxiv_source = arxiv_by_document_id.get(document_id)
+
+        if arxiv_source:
+            metadata = arxiv_source.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            for chunk in persistent_chunks:
+                chunks.append({
+                    **chunk,
+                    "source": "arxiv",
+                    "source_type": "arxiv",
+                    "filename": arxiv_source.get("title") or chunk.get("filename") or f"{document_id}.pdf",
+                    "path": metadata.get("canonical_url") or arxiv_source.get("url") or f"arxiv:{metadata.get('arxiv_id') or document_id}",
+                    "arxiv_id": metadata.get("arxiv_id"),
+                    "arxiv_title": arxiv_source.get("title"),
+                    "arxiv_url": metadata.get("canonical_url") or arxiv_source.get("url"),
+                })
+        else:
+            for chunk in persistent_chunks:
+                chunks.append({
+                    **chunk,
+                    "source": "upload",
+                    "source_type": "uploaded_document",
+                })
 
     return chunks
 
@@ -1343,7 +1385,7 @@ def get_unavailable_chat_document_ids(
         chat_sources = []
 
     for source in chat_sources:
-        if str(source.get("source_type") or "").lower() != "document":
+        if str(source.get("source_type") or "").lower() not in {"document", "arxiv", "arxiv_paper"}:
             continue
 
         source_id = source.get("source_id")
@@ -1900,7 +1942,7 @@ def _resolve_chat_selected_sources(
         if not source_id:
             continue
 
-        if source_type == "document":
+        if source_type in {"document", "arxiv", "arxiv_paper"}:
             if source_id not in document_ids:
                 document_ids.append(source_id)
             continue
@@ -2146,8 +2188,17 @@ def ask_ai(
     # Workspace documents are persistent. document_chunks is the source of
     # truth for their availability; the in-memory store remains only for the
     # legacy chat-upload endpoint.
+    chat_workspace_id = None
+    if request.chat_id:
+        try:
+            chat_record = get_chat(request.chat_id)
+            chat_workspace_id = str(chat_record.get("workspace_id")) if chat_record and chat_record.get("workspace_id") else None
+        except Exception:
+            chat_workspace_id = None
+
     persistent_document_chunks = get_persistent_document_chunks(
-        active_document_ids
+        active_document_ids,
+        workspace_id=chat_workspace_id,
     )
     uploaded_documents = get_documents_for_chat(
         request.chat_id,

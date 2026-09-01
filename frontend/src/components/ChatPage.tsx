@@ -1,4 +1,4 @@
-
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   BookOpen,
@@ -36,7 +36,6 @@ import {
   type WorkspaceDocument,
   type WorkspaceSource,
 } from "../lib/api";
-import { useEffect, useMemo, useRef, useState } from "react";
 
 interface ChatPageProps {
   workspace: Workspace;
@@ -107,6 +106,10 @@ export function ChatPage({
   const [githubSources, setGithubSources] = useState<
     WorkspaceSource[]
   >([]);
+  const [arxivSources, setArxivSources] = useState<WorkspaceSource[]>([]);
+  const [selectedArxivSourceIds, setSelectedArxivSourceIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [selectedGithubSourceIds, setSelectedGithubSourceIds] =
     useState<Set<string>>(new Set());
 
@@ -162,9 +165,28 @@ export function ChatPage({
           );
         }),
       );
+      setArxivSources(
+        workspaceSources.filter((source) =>
+          source.source_type.toLowerCase() === "arxiv",
+        ),
+      );
+
+      const arxivDocumentIds = new Set(
+        workspaceSources
+          .filter((source) => source.source_type.toLowerCase() === "arxiv")
+          .map((source) => {
+            const metadata = source.metadata ?? {};
+            const documentId = metadata["document_id"];
+            return documentId ? String(documentId) : "";
+          })
+          .filter(Boolean),
+      );
+
       setDocuments(
         workspaceDocuments.filter(
-          (document) => document.status !== "error",
+          (document) =>
+            document.status !== "error" &&
+            !arxivDocumentIds.has(String(document.document_id)),
         ),
       );
 
@@ -229,6 +251,16 @@ export function ChatPage({
         ),
       );
 
+      const arxivDocumentIds = new Set(
+        arxivSources
+          .map((source) => String((source.metadata ?? {})["document_id"] ?? "").trim())
+          .filter(Boolean),
+      );
+
+      const initialArxivIds = normalizedIds.filter((id) =>
+        arxivDocumentIds.has(id),
+      );
+
       const result = await createChat({
         workspace_id: workspace.id,
         title: "New Chat",
@@ -247,10 +279,33 @@ export function ChatPage({
 
       const chatId = result.chat.id;
 
+      // SourcesPage historically opens Chat with arXiv document IDs. Convert
+      // those generic document chat_sources to the explicit arXiv provenance
+      // model so the Chat source picker can display the paper title and keep
+      // selection/removal semantics consistent.
+      for (const documentId of initialArxivIds) {
+        try {
+          await removeChatSource(chatId, "document", documentId);
+        } catch {
+          // The backend may already have stored the source as arXiv.
+        }
+
+        try {
+          await addChatSource(chatId, {
+            source_type: "arxiv",
+            source_id: documentId,
+          });
+        } catch {
+          // Keep the document source as a fallback if arXiv provenance is
+          // unavailable for an older backend. Retrieval still uses documentIds.
+        }
+      }
+
       setChats([result.chat, ...currentChats]);
       setActiveChatId(chatId);
       setMessages([]);
       setSelectedDocumentIds(new Set(normalizedIds));
+      setSelectedArxivSourceIds(new Set(initialArxivIds));
       setSelectedGithubSourceIds(new Set(normalizedGithubIds));
       setInput("");
     } catch (chatError) {
@@ -289,13 +344,40 @@ export function ChatPage({
           })),
       );
 
+      const loadedArxivSources = loadedSources.filter(
+        (source) => source.source_type.toLowerCase() === "arxiv",
+      );
+
+      const arxivDocumentIds = new Set(
+        arxivSources
+          .map((source) => String((source.metadata ?? {})["document_id"] ?? "").trim())
+          .filter(Boolean),
+      );
+
+      const loadedArxivDocumentIds = loadedSources
+        .filter((source) => {
+          const type = source.source_type.toLowerCase();
+          return (
+            (type === "arxiv" || type === "document") &&
+            arxivDocumentIds.has(String(source.source_id).trim())
+          );
+        })
+        .map((source) => String(source.source_id).trim());
+
+      setSelectedArxivSourceIds(
+        new Set([
+          ...loadedArxivSources.map((source) => String(source.source_id)),
+          ...loadedArxivDocumentIds,
+        ]),
+      );
+
       setSelectedDocumentIds(
         new Set(
           loadedSources
-            .filter(
-              (source) =>
-                source.source_type.toLowerCase() === "document",
-            )
+            .filter((source) => {
+              const type = source.source_type.toLowerCase();
+              return type === "document" || type === "arxiv";
+            })
             .map((source) => String(source.source_id)),
         ),
       );
@@ -554,6 +636,70 @@ export function ChatPage({
   }
 
 
+  async function toggleArxiv(source: WorkspaceSource) {
+    if (!activeChatId || sending) {
+      return;
+    }
+
+    const documentId = String(
+      (source.metadata ?? {})["document_id"] ?? "",
+    ).trim();
+
+    if (!documentId) {
+      setError("This arXiv paper is missing its document reference.");
+      return;
+    }
+
+    const sourceId = documentId;
+    const wasSelected = selectedArxivSourceIds.has(sourceId);
+    setError(null);
+
+    setSelectedArxivSourceIds((current) => {
+      const next = new Set(current);
+      if (wasSelected) next.delete(sourceId);
+      else next.add(sourceId);
+      return next;
+    });
+
+    setSelectedDocumentIds((current) => {
+      const next = new Set(current);
+      if (wasSelected) next.delete(documentId);
+      else next.add(documentId);
+      return next;
+    });
+
+    try {
+      if (wasSelected) {
+        await removeChatSource(activeChatId, "arxiv", sourceId);
+      } else {
+        await addChatSource(activeChatId, {
+          source_type: "arxiv",
+          source_id: sourceId,
+        });
+      }
+    } catch (chatError) {
+      setSelectedArxivSourceIds((current) => {
+        const next = new Set(current);
+        if (wasSelected) next.add(sourceId);
+        else next.delete(sourceId);
+        return next;
+      });
+      setSelectedDocumentIds((current) => {
+        const next = new Set(current);
+        if (wasSelected) next.add(documentId);
+        else next.delete(documentId);
+        return next;
+      });
+      setError(
+        chatError instanceof Error
+          ? chatError.message
+          : wasSelected
+            ? "Unable to remove paper from this chat."
+            : "Unable to attach paper to this chat.",
+      );
+    }
+  }
+
   async function toggleGithub(sourceId: string) {
     if (!activeChatId || sending) {
       return;
@@ -679,6 +825,11 @@ export function ChatPage({
     [chats, activeChatId],
   );
 
+  const visibleSelectedSourceCount =
+    Math.max(0, selectedDocumentIds.size - selectedArxivSourceIds.size) +
+    selectedArxivSourceIds.size +
+    selectedGithubSourceIds.size;
+
   if (loading) {
     return (
       <div className="flex min-h-[calc(100vh-72px)] items-center justify-center bg-[var(--paper)]">
@@ -747,12 +898,10 @@ export function ChatPage({
           >
             <BookOpen size={13} />
             <span className="hidden sm:inline">Sources</span>
-            {selectedDocumentIds.size +
-              selectedGithubSourceIds.size >
+            {visibleSelectedSourceCount >
               0 && (
               <span className="rounded-full bg-[var(--paper)] px-1.5 py-0.5 font-[var(--font-mono)] text-[8px]">
-                {selectedDocumentIds.size +
-                  selectedGithubSourceIds.size}
+                {visibleSelectedSourceCount}
               </span>
             )}
           </button>
@@ -899,7 +1048,7 @@ export function ChatPage({
                 Chat sources
               </p>
               <p className="mt-1 text-[10px] text-[var(--muted)]">
-                Choose the documents and GitHub repositories this chat should use.
+                Choose the papers, documents, and GitHub repositories this chat should use.
               </p>
             </div>
 
@@ -986,7 +1135,69 @@ export function ChatPage({
               </section>
             )}
 
-            {documents.length === 0 && githubSources.length === 0 ? (
+            {arxivSources.length > 0 && (
+              <section className="mb-5">
+                <div className="mb-2 flex items-center gap-2 px-1">
+                  <BookOpen size={12} className="text-[var(--cyan)]" />
+                  <p className="font-[var(--font-mono)] text-[9px] uppercase tracking-[0.13em] text-[var(--muted)]">
+                    Papers
+                  </p>
+                  <span className="ml-auto font-[var(--font-mono)] text-[8px] text-[var(--muted)]">
+                    {selectedArxivSourceIds.size}/{arxivSources.length}
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  {arxivSources.map((source) => {
+                    const documentId = String(
+                      (source.metadata ?? {})["document_id"] ?? "",
+                    ).trim();
+                    if (!documentId) return null;
+                    const selected = selectedArxivSourceIds.has(documentId);
+                    const arxivId = String(
+                      (source.metadata ?? {})["arxiv_id"] ?? "",
+                    ).trim();
+                    return (
+                      <button
+                        key={source.id}
+                        type="button"
+                        disabled={!activeChatId || sending}
+                        onClick={() => void toggleArxiv(source)}
+                        className={[
+                          "flex w-full items-start gap-3 rounded-xl border p-3 text-left transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-50",
+                          selected
+                            ? "border-[var(--cyan)] bg-[var(--cyan-dim)]"
+                            : "border-[var(--line)] hover:bg-[var(--paper-dim)]",
+                        ].join(" ")}
+                      >
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--paper)] text-[var(--cyan)]">
+                          <BookOpen size={14} />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="line-clamp-2 text-xs font-medium">
+                            {source.title || "Untitled paper"}
+                          </p>
+                          <p className="mt-1 truncate font-[var(--font-mono)] text-[9px] uppercase tracking-[0.08em] text-[var(--muted)]">
+                            {arxivId ? `arXiv · ${arxivId}` : "arXiv paper"}
+                          </p>
+                        </div>
+                        <span
+                          className={[
+                            "mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border",
+                            selected
+                              ? "border-[var(--cyan)] bg-[var(--cyan)] text-[var(--paper)]"
+                              : "border-[var(--line)]",
+                          ].join(" ")}
+                        >
+                          {selected && <span className="h-1.5 w-1.5 rounded-full bg-current" />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
+            {documents.length === 0 && githubSources.length === 0 && arxivSources.length === 0 ? (
               <div className="rounded-xl border border-dashed border-[var(--line)] bg-[var(--paper-dim)] px-4 py-8 text-center">
                 <FileText
                   size={17}
@@ -1159,10 +1370,31 @@ export function ChatPage({
               {(selectedDocumentIds.size > 0 ||
                 selectedGithubSourceIds.size > 0) && (
                 <div className="flex flex-wrap gap-1.5 px-2 pb-2">
+                  {arxivSources
+                    .filter((source) => {
+                      const documentId = String(
+                        (source.metadata ?? {})["document_id"] ?? "",
+                      ).trim();
+                      return documentId && selectedArxivSourceIds.has(documentId);
+                    })
+                    .slice(0, 4)
+                    .map((source) => (
+                      <span
+                        key={`arxiv-${source.id}`}
+                        className="inline-flex max-w-52 items-center gap-1.5 rounded-full border border-[var(--line-soft)] bg-[var(--paper-dim)] px-2.5 py-1 font-[var(--font-mono)] text-[9px] text-[var(--ink-soft)]"
+                      >
+                        <BookOpen size={10} />
+                        <span className="truncate">{source.title || "Untitled paper"}</span>
+                      </span>
+                    ))}
+
                   {documents
                     .filter((document) =>
-                      selectedDocumentIds.has(
-                        document.document_id,
+                      selectedDocumentIds.has(document.document_id) &&
+                      !arxivSources.some(
+                        (source) =>
+                          String((source.metadata ?? {})["document_id"] ?? "").trim() ===
+                          String(document.document_id),
                       ),
                     )
                     .slice(0, 4)
@@ -1181,7 +1413,7 @@ export function ChatPage({
                   {Array.from(selectedGithubSourceIds)
                     .slice(
                       0,
-                      Math.max(0, 4 - selectedDocumentIds.size),
+                      Math.max(0, 4 - visibleSelectedSourceCount),
                     )
                     .map((sourceId) => {
                       const source = githubSources.find(
@@ -1204,14 +1436,10 @@ export function ChatPage({
                       );
                     })}
 
-                  {selectedDocumentIds.size +
-                    selectedGithubSourceIds.size >
-                    4 && (
+                  {visibleSelectedSourceCount > 4 && (
                     <span className="rounded-full border border-[var(--line-soft)] bg-[var(--paper-dim)] px-2.5 py-1 font-[var(--font-mono)] text-[9px] text-[var(--muted)]">
                       +
-                      {selectedDocumentIds.size +
-                        selectedGithubSourceIds.size -
-                        4}{" "}
+                      {visibleSelectedSourceCount - 4}{" "}
                       more
                     </span>
                   )}
@@ -1284,15 +1512,9 @@ export function ChatPage({
                 </p>
 
                 <p className="hidden font-[var(--font-mono)] text-[8px] uppercase tracking-[0.1em] text-[var(--muted)] sm:block">
-                  {selectedDocumentIds.size +
-                    selectedGithubSourceIds.size >
-                  0
-                    ? `${
-                        selectedDocumentIds.size +
-                        selectedGithubSourceIds.size
-                      } source${
-                        selectedDocumentIds.size +
-                          selectedGithubSourceIds.size ===
+                  {visibleSelectedSourceCount > 0
+                    ? `${visibleSelectedSourceCount} source${
+                        visibleSelectedSourceCount ===
                         1
                           ? ""
                           : "s"

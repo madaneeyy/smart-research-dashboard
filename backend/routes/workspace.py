@@ -112,3 +112,4 @@ def delete_workspace_endpoint(workspace_id: str):
     return {
         "message": "Workspace deleted successfully."
     }
+    
