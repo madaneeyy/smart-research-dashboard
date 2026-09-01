@@ -1,10 +1,10 @@
-from __future__ import annotations
+import math
 import re
 import json
 
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, OrderedDict
 
 import ollama
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query
@@ -16,19 +16,25 @@ from backend.routes.source import (
     source_router,
     workspace_source_router,
 )
+from backend.routes.research import router as research_router
 from backend.services.workspace_document_service import (
     create_workspace_document,
-    list_workspace_documents
+    get_workspace_document,
+    list_workspace_documents,
+    delete_workspace_document
 )
 from backend.services.document_storage_service import (
+    build_document_storage_path,
     upload_document_file,
     create_document,
+    get_document,
 )
 from backend.services.document_chunk_service import (
     create_document_chunks,
     get_document_chunks,
 )
 from backend.routes.chat import router as chat_router
+from backend.services.chat_service import get_chat, get_chat_sources
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -48,6 +54,8 @@ from src.services.document_rag.document_cache import DocumentCache
 from src.services.context_router import ContextRouter
 from src.services.document_rag.document_chunker import UploadedDocumentChunker
 from src.services.document_rag.document_retriever import DocumentRetriever
+from src.services.document_rag.evidence_engine import EvidenceEngine
+from src.services.document_rag.evidence_validator import EvidenceValidator
 import inspect
 
 # ============================================================
@@ -120,8 +128,16 @@ document_retriever = DocumentRetriever(
     focused_top_k=6,
     candidate_multiplier=5,
     mmr_lambda=0.72,
-     profiling_enabled=True,
+    profiling_enabled=True,
 )
+
+evidence_engine = EvidenceEngine(
+    retriever=document_retriever,
+    overview_per_source=2,
+    analysis_per_source=2,
+    max_final_evidence=12,
+)
+evidence_validator = EvidenceValidator()
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 
@@ -139,6 +155,7 @@ app.include_router(workspace_router)
 app.include_router(source_router)
 app.include_router(workspace_source_router)
 app.include_router(chat_router)
+app.include_router(research_router)
 # ============================================================
 # CORS
 # ============================================================
@@ -183,6 +200,11 @@ class AskRequest(BaseModel):
     github_url: Optional[str] = Field(
         default=None,
         description="GitHub repository URL to research.",
+    )
+
+    github_urls: Optional[List[str]] = Field(
+        default=None,
+        description="GitHub repository URLs selected for this chat.",
     )
 
     branch: Optional[str] = Field(
@@ -284,88 +306,149 @@ def build_github_documents(
     branch: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Build structured GitHub documents for the RAG pipeline.
+    Build query-focused GitHub documents.
 
-    IMPORTANT:
-    GitHubContentService must expose build_documents_for_query().
-    This keeps repository discovery/file ranking in the GitHub service
-    while allowing the backend to chunk each selected file separately.
+    The selected GitHub source is a retrieval target, not just a UI hint.
+    If the query-specific selector returns nothing, retry with a broad
+    repository-overview query so valid repositories do not become
+    "no usable documents" merely because the filename/path vocabulary
+    doesn't match the question lexically.
     """
-    try:
-        builder = getattr(
-            GitHubContentService,
-            "build_documents_for_query",
-            None,
-        )
+    normalized_url = str(github_url or "").strip()
+    if not normalized_url:
+        return []
 
-        if not callable(builder):
-            raise RuntimeError(
+    builder = getattr(
+        GitHubContentService,
+        "build_documents_for_query",
+        None,
+    )
+
+    if not callable(builder):
+        raise HTTPException(
+            status_code=500,
+            detail=(
                 "GitHubContentService.build_documents_for_query() "
-                "is missing. Add the query-aware document builder to "
-                "src/services/github_content.py before starting the backend."
-            )
-
-        documents = builder(
-            github_url=github_url,
-            query=question,
-            branch=branch,
+                "is not available."
+            ),
         )
 
-        if not isinstance(documents, list):
-            raise TypeError(
-                "build_documents_for_query() must return a list of documents."
+    attempts = [
+        str(question or "").strip(),
+        "repository overview project structure main components",
+    ]
+
+    last_error: Optional[Exception] = None
+
+    for attempt_index, query in enumerate(attempts):
+        if not query:
+            continue
+
+        try:
+            documents = builder(
+                github_url=normalized_url,
+                query=query,
+                branch=branch,
             )
 
-        cleaned: List[Dict[str, Any]] = []
+            if isinstance(documents, list):
+                cleaned: List[Dict[str, Any]] = []
 
-        for document in documents:
-            if not isinstance(document, dict):
-                continue
+                for document in documents:
+                    if not isinstance(document, dict):
+                        continue
 
-            content = str(
-                document.get("content") or ""
-            ).strip()
+                    content = str(
+                        document.get("content") or ""
+                    ).strip()
+                    path = str(
+                        document.get("path") or ""
+                    ).strip()
 
-            path = str(
-                document.get("path") or ""
-            ).strip()
+                    if not content or not path:
+                        continue
 
-            if not content or not path:
-                continue
+                    cleaned.append(
+                        {
+                            **document,
+                            "content": content,
+                            "path": path,
+                            "source": "github",
+                            "github_url": normalized_url,
+                            "query": query,
+                            "category": str(
+                                document.get("category")
+                                or "source"
+                            ),
+                        }
+                    )
 
-            cleaned.append(
-                {
-                    **document,
-                    "content": content,
-                    "path": path,
-                    "category": str(
-                        document.get("category")
-                        or "source"
-                    ),
-                }
+                if cleaned:
+                    print(
+                        f"GitHub documents found using "
+                        f"{'original' if attempt_index == 0 else 'fallback'} query: "
+                        f"{len(cleaned)}"
+                    )
+                    return cleaned
+
+        except ValueError as exc:
+            last_error = exc
+            break
+        except Exception as exc:
+            last_error = exc
+            print(
+                "GitHub query-aware retrieval warning:",
+                str(exc),
             )
 
-        return cleaned
+    # Last compatibility fallback. This is intentionally only reached after
+    # both query-aware attempts failed.
+    legacy_builder = getattr(
+        GitHubContentService,
+        "build_context_for_query",
+        None,
+    )
 
-    except ValueError as exc:
+    if callable(legacy_builder):
+        try:
+            context = str(
+                legacy_builder(
+                    github_url=normalized_url,
+                    query=str(question or "").strip()
+                    or "repository overview",
+                    branch=branch,
+                )
+                or ""
+            ).strip()
+
+            if context:
+                return [
+                    {
+                        "content": context,
+                        "path": "repository-context.md",
+                        "source": "github",
+                        "github_url": normalized_url,
+                        "query": question,
+                        "category": "documentation",
+                    }
+                ]
+        except Exception as exc:
+            last_error = exc
+            print(
+                "GitHub legacy context fallback warning:",
+                str(exc),
+            )
+
+    if isinstance(last_error, ValueError):
         raise HTTPException(
             status_code=400,
             detail={
                 "message": "Invalid GitHub repository request.",
-                "error": str(exc),
+                "error": str(last_error),
             },
         )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Failed to build GitHub repository documents.",
-                "error": str(exc),
-                "github_url": github_url,
-            },
-        )
+
+    return []
 
 def clean_history(
     history: List[Dict[str, str]],
@@ -421,121 +504,115 @@ def get_chunk_section(chunk: Dict[str, Any]) -> str:
 
 def format_retrieved_context(
     chunks: List[Dict[str, Any]],
+    evidence_result: Optional[Dict[str, Any]] = None,
 ) -> str:
-    evidence: List[str] = []
+    """Format evidence while preserving explicit source provenance."""
+    if not chunks:
+        return ""
 
-    for index, chunk in enumerate(chunks, start=1):
-        content = get_chunk_content(chunk)
+    groups: "OrderedDict[tuple[str, str], List[Dict[str, Any]]]" = OrderedDict()
+    for chunk in chunks:
+        st = str(chunk.get("source_type") or chunk.get("source") or "unknown").strip().lower()
+        if st in {"github", "github_repository"}:
+            key = ("github_repository", str(chunk.get("repository") or chunk.get("github_url") or "GitHub repository").strip())
+        elif st in {"upload", "uploaded_document", "document"}:
+            key = ("uploaded_document", str(chunk.get("document_id") or chunk.get("filename") or chunk.get("path") or "Uploaded document").strip())
+        else:
+            key = (st or "unknown", str(chunk.get("path") or chunk.get("filename") or "Unknown source").strip())
+        groups.setdefault(key, []).append(chunk)
 
-        if not content:
-            continue
+    blocks: List[str] = []
+    for idx, ((kind, name), source_chunks) in enumerate(groups.items(), start=1):
+        first = source_chunks[0]
+        if kind == "github_repository":
+            source_kind = "GitHub repository"
+            source_name = str(first.get("repository") or first.get("github_url") or name).strip()
+        elif kind == "uploaded_document":
+            source_kind = "Uploaded document"
+            source_name = str(first.get("filename") or first.get("path") or name).strip()
+        else:
+            source_kind = str(first.get("source_type") or first.get("source") or kind)
+            source_name = str(first.get("filename") or first.get("path") or name).strip()
 
-        source = get_chunk_source(chunk) or "Unknown source"
-        section = get_chunk_section(chunk) or "Unknown section"
-
-        parent_section = str(
-            chunk.get("parent_section") or ""
-        ).strip()
-
-        section_path = chunk.get("section_path") or []
-
-        section_path_text = ""
-        if isinstance(section_path, list) and section_path:
-            section_path_text = " > ".join(
-                str(item) for item in section_path
-            )
-
-        metadata_lines = [
-            f"Evidence {index}",
-            f"Source: {source}",
-            f"Section: {section}",
+        lines = [
+            f"===== SOURCE {idx} =====",
+            f"Source type: {source_kind}",
+            f"Source name: {source_name}",
+            f"Retrieved evidence items: {len(source_chunks)}",
+            "",
+            "EVIDENCE:",
         ]
+        n = 0
+        for chunk in source_chunks:
+            content = get_chunk_content(chunk)
+            if not content:
+                continue
+            n += 1
+            lines += ["", f"Evidence {n}"]
+            path = str(chunk.get("path") or chunk.get("filename") or "Unknown").strip()
+            lines.append(f"File/path: {path}")
+            section = get_chunk_section(chunk)
+            if section:
+                lines.append(f"Section: {section}")
+            if chunk.get("page") is not None:
+                lines.append(f"Page: {chunk.get('page')}")
+            if chunk.get("chunk_index") is not None:
+                lines.append(f"Chunk index: {chunk.get('chunk_index')}")
+            lines += ["Content:", content]
+        blocks.append("\n".join(lines))
 
-        page = chunk.get("page")
-        if page is not None:
-            metadata_lines.append(f"Page: {page}")
-
-        filename = str(chunk.get("filename") or "").strip()
-        if filename and filename != source:
-            metadata_lines.append(f"Document: {filename}")
-
-        if parent_section:
-            metadata_lines.append(
-                f"Parent section: {parent_section}"
-            )
-
-        if section_path_text:
-            metadata_lines.append(
-                f"Section path: {section_path_text}"
-            )
-
-        metadata_lines.extend(
-            [
-                "Content:",
-                content,
-            ]
-        )
-
-        evidence.append(
-            "\n".join(metadata_lines)
-        )
-
-    return "\n\n------------------------------\n\n".join(evidence)
+    return "\n\n".join(blocks)
 
 
 def build_system_prompt(
     retrieved_context: str,
+    evidence_result: Optional[Dict[str, Any]] = None,
+    question: str = "",
 ) -> str:
-    """Build a compact, source-grounded prompt for RAG answers.
-
-    Keep instructions short because this prompt is sent to Qwen on every
-    request; retrieved evidence remains unchanged.
     """
+    Single general-purpose prompt for every grounded question.
+
+    Query classification is used by retrieval, not by answer generation.
+    """
+    source_count = retrieved_context.count("===== SOURCE ")
+    coverage_complete = bool(evidence_result and evidence_result.get("coverage_complete", False))
+
     return f"""
-You are a technical research assistant. Answer the user's question directly,
-accurately, and concisely using the retrieved evidence below.
+You are a research assistant answering the user's question.
 
-GROUNDING
-- Treat retrieved evidence as authoritative for source-specific claims.
-- Do not invent facts, files, functions, parameters, results, citations,
-  implementation details, or author intent.
-- Combine evidence from multiple chunks when they complement each other.
-- Preserve exact technical terminology, identifiers, filenames, APIs,
-  algorithms, architecture names, and configuration values.
-- Prefer claims explicitly supported by the evidence.
+USER QUESTION:
+{question.strip()}
 
-INFERENCE
-- You may use general technical knowledge to explain what the evidence means,
-  but never turn that explanation into a source claim.
-- When interpreting, use wording such as "This means", "This can be
-  interpreted as", or "In practice".
-- For "why" questions, give the stated reason when available; otherwise
-  explain only what is reasonably implied. Do not invent author intent.
-- If an important part of the question cannot be answered from the evidence,
-  say so briefly. Do not add generic limitation/disclaimer sections.
+You have been given retrieved evidence from the user's selected sources.
+Read the evidence carefully and answer the question directly.
 
-CODE / IMPLEMENTATION
-- Describe only what the retrieved code supports.
-- Preserve exact identifiers and mention relevant files/modules when present.
-- If code is incomplete, state only the limitation that affects the answer.
+CORE INSTRUCTIONS:
+- Use the retrieved evidence as the main factual basis of your answer.
+- Read all supplied evidence before deciding what to say.
+- A passage does not need to contain the exact wording of the question to be relevant.
+- You may summarize, synthesize, explain, compare, and connect related information when the connection is supported by the evidence.
+- When several passages contribute to the same answer, combine them into a coherent explanation.
+- Keep source-specific facts associated with the correct source.
+- Treat every SOURCE block as an independent source. "GitHub repository" means current implementation evidence; "Uploaded document" means document/paper evidence.
+- For cross-source questions, explicitly connect evidence from both relevant sources and distinguish the paper/document description from the current implementation.
+- Do not invent source-specific facts, numbers, methods, results, quotations, citations, authors, or relationships.
+- Do not refuse simply because the evidence uses different terminology from the question.
+- If the evidence answers only part of the question, answer that part and clearly state what is not established.
+- If the retrieved evidence genuinely does not establish the requested information, say that the information is not established by the retrieved evidence.
+- Never say that there is "no evidence" when evidence passages are supplied.
+- If sources disagree, explain the disagreement rather than silently choosing one.
+- General knowledge may be used for brief explanations of terms or concepts, but do not use it to invent missing source-specific facts.
+- Prefer a useful, natural answer over a discussion of the retrieval process.
 
-ANSWER STYLE
-- Start with the answer; do not begin with "The retrieved evidence...",
-  "The provided context...", or similar unless necessary.
-- Use bullets/numbered sections for multi-part questions.
-- Be concise for simple questions and detailed only when needed.
-- Avoid unnecessarily strong claims such as "guarantees", "proves",
-  "ensures", "always", or "optimal" unless explicitly supported.
-- Do not fabricate source sections, filenames, URLs, or citations.
+SOURCE ORGANIZATION:
+There are {source_count} selected source(s).
+Coverage complete: {coverage_complete}
 
-FINAL CHECK
-Before answering: answer the actual question; keep source-specific claims
-grounded; distinguish inference from source statements; preserve terminology;
-avoid unnecessary disclaimers; keep the response no more complicated than
-necessary.
+Each SOURCE block below is independent. Preserve those boundaries.
 
-RETRIEVED EVIDENCE
+RETRIEVED EVIDENCE:
 {retrieved_context}
+
 END RETRIEVED EVIDENCE
 """.strip()
 
@@ -853,6 +930,8 @@ def _build_rag_response_payload(
     resolution: Dict[str, Any],
     requested_top_k: int,
     messages: List[Dict[str, str]],
+    unavailable_document_ids: List[str],
+    evidence_result: Dict[str, Any],
 ) -> Dict[str, Any]:
     serialized_sources = [
         serialize_chunk(chunk, index)
@@ -895,12 +974,20 @@ def _build_rag_response_payload(
     print(f"Context origin: {context_origin}")
     print(f"Context scope: {context_scope}")
     print(f"Context route reason: {route.get('reason')}")
+    if evidence_result:
+        print(f"Evidence query reason: {evidence_result.get('query_reason')}")
     print(f"Documents acquired: {len(documents)}")
     print(f"Uploaded documents: {len(uploaded_documents)}")
     document_chars = sum(len(str(document.get("content") or "")) for document in documents)
     print(f"Document chars: {document_chars:,}")
     print(f"Chunks created: {len(chunks)}")
     print(f"Chunks retrieved: {len(retrieved_chunks)}")
+    if evidence_result:
+        print(f"Evidence query type: {evidence_result.get('query_type')}")
+        print(f"Evidence strategy: {evidence_result.get('strategy')}")
+        print(f"Selected documents: {evidence_result.get('selected_document_count', 0)}")
+        print(f"Documents with evidence: {evidence_result.get('documents_with_evidence', 0)}")
+        print(f"Coverage complete: {evidence_result.get('coverage_complete', False)}")
     print(f"Retrieved context chars: {len(retrieved_context):,}")
     print(f"System prompt chars: {len(messages[0].get('content', '')) if messages else 0}")
     print(f"Total message chars: {sum(len(str(message.get('content', ''))) for message in messages):,}")
@@ -926,6 +1013,8 @@ def _build_rag_response_payload(
         "source_switched": source_switched,
         "github_url": github_url or None,
         "active_document_ids": active_document_ids,
+        "unavailable_document_ids": unavailable_document_ids,
+        "source_unavailable": bool(unavailable_document_ids),
         "uploaded_documents": [
             {
                 "document_id": document.get("document_id"),
@@ -952,9 +1041,11 @@ def _build_rag_response_payload(
             "latency_breakdown": dict(sorted(timings.items(), key=lambda item: item[1], reverse=True)),
         },
         "sources": serialized_sources,
+        "evidence": evidence_result,
+        "evidence_validation": evidence_result.get("validation") if evidence_result else None,
         "retrieval": {
             "top_k": requested_top_k,
-            "query_type": first_chunk.get("query_type"),
+            "query_type": (evidence_result.get("query_type") if evidence_result else first_chunk.get("query_type")),
             "candidate_pool_size": first_chunk.get("candidate_pool_size"),
             "post_filter_pool_size": first_chunk.get("post_filter_pool_size"),
         },
@@ -1080,15 +1171,69 @@ def resolve_conversational_query(question: str, history: List[Dict[str, str]]) -
     original=question.strip(); recent=clean_history(history, max_messages=8)
     base={"original_query":original,"resolved_query":original,"was_resolved":False,"resolution_type":"none","referenced_terms":[]}
     if not recent: return base
-    low=original.lower(); followup=any(re.search(p,low) for p in _CONVERSATIONAL_PATTERNS)
-    short=len(re.findall(r'\w+',low))<=5
-    if not followup and not short: return base
+    low = original.lower()
+    followup = any(
+        re.search(pattern, low)
+        for pattern in _CONVERSATIONAL_PATTERNS
+    )
+
+    short = len(re.findall(r"\w+", low)) <= 5
+
+    # A short question is not automatically a follow-up.
+    # It must contain explicit reference/continuity language.
+    short_reference = bool(
+        short
+        and re.search(
+            r"\b(?:it|this|that|these|those|the above|the previous|"
+            r"same|another|also|what about|how about)\b",
+            low,
+        )
+    )
+
+    if not followup and not short_reference:
+        return base
     previous=next((str(m.get('content') or '').strip() for m in reversed(recent) if m.get('role')=='user' and str(m.get('content') or '').strip()!=original),'')
     terms=_extract_conversation_terms(recent)
     parts=[original]
     if terms: parts.append('Conversation entities: '+', '.join(terms))
     if previous: parts.append('Previous user question: '+previous)
     return {"original_query":original,"resolved_query":"\n".join(parts),"was_resolved":True,"resolution_type":"reference_followup" if followup else "short_followup","referenced_terms":terms}
+
+def question_explicitly_references_missing_document(
+    question: str,
+    history: List[Dict[str, str]],
+) -> bool:
+    """Return True only when the user explicitly refers to a missing document."""
+    text = question.strip().lower()
+    explicit_patterns = (
+        r"\bthe document\b",
+        r"\bthat document\b",
+        r"\bthis document\b",
+        r"\bthe file\b",
+        r"\bthat file\b",
+        r"\bthis file\b",
+        r"\bthe report\b",
+        r"\bthat report\b",
+        r"\bthis report\b",
+        r"\baccording to (?:the|this|that) (?:document|file|report)\b",
+        r"\bwhat did (?:the|this|that) (?:document|file|report)\b",
+        r"\bwhat (?:does|did) it say\b",
+    )
+    if any(re.search(pattern, text) for pattern in explicit_patterns):
+        return True
+
+    # Conversational follow-ups can refer to a missing source implicitly.
+    # Require a short/reference-like question rather than treating all short
+    # questions as source-specific.
+    followup_patterns = (
+        r"\bwhat about it\b",
+        r"\bhow about it\b",
+        r"\bwhat does it say\b",
+        r"\bwhat did it say\b",
+        r"\bwhat were (?:the|its) (?:findings|results|methods|methodology)\b",
+    )
+    return any(re.search(pattern, text) for pattern in followup_patterns)
+
 
 ACTIVE_GITHUB_CONTEXT: Dict[str, Dict[str, Optional[str]]] = {}
 ACTIVE_SOURCE_CONTEXT: Dict[str, str] = {}
@@ -1104,6 +1249,112 @@ def get_active_github_context(chat_id: Optional[str]):
 def set_active_github_context(chat_id: Optional[str], reference: Dict[str, Optional[str]]):
     if chat_id and reference.get('repository_url'):
         ACTIVE_GITHUB_CONTEXT[chat_id]=dict(reference)
+
+def get_chat_github_urls(chat_id: Optional[str]) -> List[str]:
+    """Resolve persisted GitHub repository URLs from this chat's sources."""
+    if not chat_id:
+        return []
+
+    try:
+        rows = get_chat_sources(chat_id)
+    except Exception:
+        return []
+
+    urls: List[str] = []
+
+    for row in rows or []:
+        source_type = str(row.get("source_type") or "").strip().lower()
+
+        if source_type not in {"github", "github_repository"}:
+            continue
+
+        source_id = str(row.get("source_id") or "").strip()
+
+        if not source_id:
+            continue
+
+        reference = extract_github_reference(source_id)
+        repository_url = reference.get("repository_url")
+
+        if repository_url and repository_url not in urls:
+            urls.append(repository_url)
+
+    return urls
+
+
+
+def get_unavailable_chat_document_ids(
+    chat_id: Optional[str],
+    active_workspace_document_ids: List[str],
+) -> List[str]:
+    """
+    Return document IDs that are unavailable in the chat's workspace.
+
+    This includes:
+      1. document IDs explicitly requested by the current request that no
+         longer belong to the workspace; and
+      2. historical document chat_sources that used to belong to the workspace
+         but were later removed.
+
+    Keeping the current request in this calculation is important because the
+    frontend may still have a stale selection after a workspace document is
+    deleted.
+    """
+    if not chat_id:
+        return []
+
+    chat = get_chat(chat_id)
+    if not chat:
+        return []
+
+    workspace_id = chat.get("workspace_id")
+    if not workspace_id:
+        return []
+
+    try:
+        current_workspace_documents = list_workspace_documents(
+            str(workspace_id)
+        )
+    except Exception:
+        # If availability cannot be verified, do not falsely claim deletion.
+        return []
+
+    current_ids = {
+        str(item.get("document_id"))
+        for item in current_workspace_documents
+        if item.get("document_id")
+    }
+
+    active_ids = {
+        str(item)
+        for item in active_workspace_document_ids
+        if item
+    }
+
+    unavailable = {
+        document_id
+        for document_id in active_ids
+        if document_id not in current_ids
+    }
+
+    try:
+        chat_sources = get_chat_sources(chat_id)
+    except Exception:
+        chat_sources = []
+
+    for source in chat_sources:
+        if str(source.get("source_type") or "").lower() != "document":
+            continue
+
+        source_id = source.get("source_id")
+        if not source_id:
+            continue
+
+        source_id = str(source_id)
+        if source_id not in current_ids:
+            unavailable.add(source_id)
+
+    return list(unavailable)
 
 
 @app.get("/document-cache-stats")
@@ -1176,19 +1427,24 @@ async def upload_document(
             else [document_id]
         ),
     }
-
 @app.post("/workspaces/{workspace_id}/documents")
 async def upload_workspace_document(
     workspace_id: str,
     file: UploadFile = File(...),
 ) -> Dict[str, Any]:
     """
-    Upload a document and associate it with a workspace.
+    Persist a document once and create only a workspace association.
 
-    This reuses the existing document extraction/cache pipeline
-    without changing the existing chat-scoped upload endpoint.
+    Canonical model:
+      documents       -> one row per content-addressed document
+      document_chunks -> one canonical chunk set per document
+      Storage         -> one canonical object per document
+      workspace_documents -> one association per workspace
+
+    A previously-created document with zero chunks is repaired before the
+    workspace association is returned/created. This fixes documents that were
+    created by an earlier interrupted upload pipeline.
     """
-
     if not file.filename:
         raise HTTPException(
             status_code=400,
@@ -1198,17 +1454,20 @@ async def upload_workspace_document(
     try:
         raw_bytes = await file.read()
 
-        # Reuse the existing document extraction/cache pipeline.
+        if not raw_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty.",
+            )
+
         document = DocumentCache.get_or_extract(
             filename=file.filename,
             raw_bytes=raw_bytes,
             content_type=file.content_type,
             extractor=DocumentService.extract,
         )
-
     except HTTPException:
         raise
-
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -1216,61 +1475,198 @@ async def upload_workspace_document(
         )
 
     document_id = str(document["document_id"])
-    storage_path = (
-        f"{workspace_id}/{document_id}/{file.filename}"
-    )
 
-    upload_document_file(
-        storage_path=storage_path,
-        file_bytes=raw_bytes,
-        content_type=file.content_type,
-    )
-
-    create_document(
+    # ----------------------------------------------------------
+    # 1. Workspace-level idempotency.
+    # ----------------------------------------------------------
+    existing_workspace_document = get_workspace_document(
         document_id=document_id,
-        filename=document["filename"],
-        storage_path=storage_path,
-        content_type=file.content_type,
-        pages=document.get("pages"),
-        characters=document.get("characters"),
-        size_bytes=len(raw_bytes),
-    )
-    chunks = uploaded_document_chunker.chunk_documents(
-        [document]
+        workspace_id=workspace_id,
     )
 
-    if not chunks:
-        raise HTTPException(
-            status_code=400,
-            detail="No usable chunks were created from the document.",
-        )
-
-    create_document_chunks(
-        document_id=document_id,
-        chunks=chunks,
+    # ----------------------------------------------------------
+    # 2. Load/reuse the canonical document.
+    # ----------------------------------------------------------
+    existing_document = get_document(document_id)
+    existing_chunks = (
+        get_document_chunks(document_id)
+        if existing_document is not None
+        else []
     )
 
-    # Keep the extracted document available to the existing
-    # DocumentRetriever / RAG pipeline.
+    # If the document exists but its chunk set is missing, repair it.
+    if not existing_chunks:
+        try:
+            chunks = uploaded_document_chunker.chunk_documents(
+                [document]
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Failed to chunk the document.",
+                    "error": str(exc),
+                    "document_id": document_id,
+                    "filename": file.filename,
+                },
+            )
+
+        if not chunks:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "No usable chunks were created from the document.",
+                    "document_id": document_id,
+                    "filename": file.filename,
+                },
+            )
+
+        if existing_document is None:
+            # Chunking is validated before we create the canonical document so
+            # a parser failure does not leave another incomplete documents row.
+            storage_path = build_document_storage_path(
+                document_id=document_id,
+                filename=document["filename"],
+            )
+
+            try:
+                upload_document_file(
+                    storage_path=storage_path,
+                    file_bytes=raw_bytes,
+                    content_type=file.content_type,
+                )
+
+                create_document(
+                    document_id=document_id,
+                    filename=document["filename"],
+                    storage_path=storage_path,
+                    content_type=file.content_type,
+                    pages=document.get("pages"),
+                    characters=document.get("characters"),
+                    size_bytes=len(raw_bytes),
+                )
+
+                create_document_chunks(
+                    document_id=document_id,
+                    chunks=chunks,
+                )
+
+                existing_document = get_document(document_id)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Failed to persist the document.",
+                        "error": str(exc),
+                        "document_id": document_id,
+                    },
+                )
+        else:
+            # Existing canonical row, but an earlier upload never created the
+            # chunk set. Repair it exactly once.
+            try:
+                create_document_chunks(
+                    document_id=document_id,
+                    chunks=chunks,
+                )
+                existing_chunks = get_document_chunks(document_id)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Failed to repair the document chunk set.",
+                        "error": str(exc),
+                        "document_id": document_id,
+                    },
+                )
+
+    if existing_document is None:
+        existing_document = get_document(document_id)
+
+    if existing_workspace_document is not None:
+        # Keep the legacy in-memory cache warm for any older code paths, but
+        # the persistent document/chunks are authoritative.
+        UPLOADED_DOCUMENTS[document_id] = document
+
+        return {
+            "workspace_document_id": existing_workspace_document["id"],
+            "workspace_id": workspace_id,
+            "document_id": document_id,
+            "filename": existing_workspace_document.get(
+                "filename",
+                document["filename"],
+            ),
+            "content_type": existing_workspace_document.get(
+                "content_type",
+                file.content_type,
+            ),
+            "pages": existing_workspace_document.get(
+                "pages",
+                document.get("pages"),
+            ),
+            "characters": existing_workspace_document.get(
+                "characters",
+                document.get("characters"),
+            ),
+            "size_bytes": existing_workspace_document.get(
+                "size_bytes",
+                document.get("size_bytes"),
+            ),
+            "status": existing_workspace_document.get(
+                "status",
+                "ready",
+            ),
+            "context_origin": "workspace_upload",
+            "already_exists": True,
+            "reused_underlying_document": True,
+        }
+
     UPLOADED_DOCUMENTS[document_id] = document
 
+    # ----------------------------------------------------------
+    # 3. Create only the workspace association.
+    # ----------------------------------------------------------
     try:
         workspace_document = create_workspace_document(
             workspace_id=workspace_id,
             document_id=document_id,
-            filename=document["filename"],
-            content_type=file.content_type,
-            pages=document.get("pages"),
-            characters=document.get("characters"),
-            size_bytes=document.get("size_bytes"),
+            filename=(
+                existing_document.get("filename", document["filename"])
+                if existing_document
+                else document["filename"]
+            ),
+            content_type=(
+                existing_document.get("content_type", file.content_type)
+                if existing_document
+                else file.content_type
+            ),
+            pages=(
+                existing_document.get("pages", document.get("pages"))
+                if existing_document
+                else document.get("pages")
+            ),
+            characters=(
+                existing_document.get("characters", document.get("characters"))
+                if existing_document
+                else document.get("characters")
+            ),
+            size_bytes=(
+                existing_document.get("size_bytes", document.get("size_bytes"))
+                if existing_document
+                else document.get("size_bytes")
+            ),
             status="ready",
         )
-
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail={
-                "message": "Document was processed but could not be associated with the workspace.",
+                "message": (
+                    "The document was available but could not be "
+                    "associated with the workspace."
+                ),
                 "error": str(exc),
                 "document_id": document_id,
             },
@@ -1280,14 +1676,35 @@ async def upload_workspace_document(
         "workspace_document_id": workspace_document["id"],
         "workspace_id": workspace_id,
         "document_id": document_id,
-        "filename": document["filename"],
-        "content_type": file.content_type,
-        "pages": document.get("pages"),
-        "characters": document.get("characters"),
-        "size_bytes": document.get("size_bytes"),
-        "status": workspace_document.get("status", "ready"),
+        "filename": workspace_document.get(
+            "filename",
+            document["filename"],
+        ),
+        "content_type": workspace_document.get(
+            "content_type",
+            file.content_type,
+        ),
+        "pages": workspace_document.get(
+            "pages",
+            document.get("pages"),
+        ),
+        "characters": workspace_document.get(
+            "characters",
+            document.get("characters"),
+        ),
+        "size_bytes": workspace_document.get(
+            "size_bytes",
+            document.get("size_bytes"),
+        ),
+        "status": workspace_document.get(
+            "status",
+            "ready",
+        ),
         "context_origin": "workspace_upload",
+        "already_exists": False,
+        "reused_underlying_document": existing_document is not None,
     }
+
 
 @app.get("/debug/document/{document_id}")
 def debug_document(document_id: str) -> Dict[str, Any]:
@@ -1329,6 +1746,175 @@ def get_workspace_documents(
         )
 
 
+
+@app.get(
+    "/workspaces/{workspace_id}/documents/{document_id}/preview"
+)
+def preview_workspace_document(
+    workspace_id: str,
+    document_id: str,
+) -> Dict[str, Any]:
+    """
+    Return readable extracted content for a document that
+    belongs to the requested workspace.
+
+    The workspace association is checked first so a document
+    cannot be previewed merely by knowing its document_id.
+    """
+
+    workspace_document = (
+        get_workspace_document(
+            document_id=document_id,
+            workspace_id=workspace_id,
+        )
+    )
+
+    if workspace_document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found in this workspace.",
+        )
+
+    chunks = get_document_chunks(
+        document_id
+    )
+
+    if not chunks:
+        raise HTTPException(
+            status_code=404,
+            detail="No readable content is available for this document.",
+        )
+
+    content_parts: list[str] = []
+
+    for chunk in chunks:
+        content = str(
+            chunk.get("content")
+            or ""
+        ).strip()
+
+        if not content:
+            continue
+
+        page = chunk.get("page")
+
+        if page is not None:
+            content_parts.append(
+                f"[Page {page}]\n{content}"
+            )
+        else:
+            content_parts.append(content)
+
+    content = "\n\n".join(
+        content_parts
+    ).strip()
+
+    if not content:
+        raise HTTPException(
+            status_code=404,
+            detail="No readable content is available for this document.",
+        )
+
+    return {
+        "document_id": document_id,
+        "filename": workspace_document.get(
+            "filename",
+            "Untitled document",
+        ),
+        "content_type": workspace_document.get(
+            "content_type"
+        ),
+        "pages": workspace_document.get(
+            "pages"
+        ),
+        "characters": workspace_document.get(
+            "characters"
+        ),
+        "content": content,
+    }
+
+
+@app.delete("/workspaces/{workspace_id}/documents/{document_id}")
+def delete_workspace_document_endpoint(
+    workspace_id: str,
+    document_id: str,
+) -> Dict[str, Any]:
+
+    deleted = delete_workspace_document(
+        workspace_id=workspace_id,
+        document_id=document_id,
+    )
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found in this workspace.",
+        )
+
+    # Also clear the legacy in-memory document store.
+    UPLOADED_DOCUMENTS.pop(
+        str(document_id),
+        None,
+    )
+
+    return {
+        "message": "Document deleted successfully.",
+        "document_id": document_id,
+        "workspace_id": workspace_id,
+    }
+
+def _normalize_source_type(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _resolve_chat_selected_sources(
+    chat_id: Optional[str],
+) -> tuple[List[str], List[str]]:
+    """
+    Resolve persistent chat_sources into canonical document IDs and GitHub URLs.
+
+    This is the single source of truth for ChatPage selections.
+    """
+    document_ids: List[str] = []
+    github_urls: List[str] = []
+
+    if not chat_id:
+        return document_ids, github_urls
+
+    try:
+        rows = get_chat_sources(chat_id) or []
+    except Exception as exc:
+        print(
+            f"Chat source lookup warning for {chat_id}: {exc}"
+        )
+        return document_ids, github_urls
+
+    for row in rows:
+        source_type = _normalize_source_type(
+            row.get("source_type")
+        )
+        source_id = str(
+            row.get("source_id") or ""
+        ).strip()
+
+        if not source_id:
+            continue
+
+        if source_type == "document":
+            if source_id not in document_ids:
+                document_ids.append(source_id)
+            continue
+
+        if source_type in {
+            "github",
+            "github_repository",
+        }:
+            if source_id not in github_urls:
+                github_urls.append(source_id)
+
+    return document_ids, github_urls
+
+
 @app.post("/ask")
 def ask_ai(
     request: AskRequest,
@@ -1339,6 +1925,41 @@ def ask_ai(
     timings: Dict[str, float] = {}
 
     question = request.question.strip()
+
+    # ------------------------------------------------------------
+    # CHAT SOURCE OF TRUTH
+    # ------------------------------------------------------------
+    # Persisted chat_sources are authoritative. Explicit frontend values are
+    # merged for compatibility with clients that send them on /ask.
+    persisted_document_ids, persisted_github_urls = (
+        _resolve_chat_selected_sources(request.chat_id)
+    )
+
+    effective_document_ids = list(
+        dict.fromkeys(
+            [
+                *(
+                    str(value).strip()
+                    for value in (request.document_ids or [])
+                    if str(value).strip()
+                ),
+                *persisted_document_ids,
+            ]
+        )
+    )
+
+    effective_github_urls = list(
+        dict.fromkeys(
+            [
+                *(
+                    str(value).strip()
+                    for value in (request.github_urls or [])
+                    if str(value).strip()
+                ),
+                *persisted_github_urls,
+            ]
+        )
+    )
 
     # ------------------------------------------------------------
     # GITHUB CONTEXT PRIORITY
@@ -1354,26 +1975,30 @@ def ask_ai(
     # ------------------------------------------------------------
 
     active_github = get_active_github_context(request.chat_id)
+    persisted_chat_github_urls = get_chat_github_urls(request.chat_id)
+
+    requested_github_urls: List[str] = []
+
+    for raw_url in effective_github_urls:
+        reference = extract_github_reference(str(raw_url or "").strip())
+        repository_url = reference.get("repository_url")
+
+        if repository_url and repository_url not in requested_github_urls:
+            requested_github_urls.append(repository_url)
+
+    if request.github_url:
+        reference = extract_github_reference(request.github_url.strip())
+        repository_url = reference.get("repository_url")
+
+        if repository_url and repository_url not in requested_github_urls:
+            requested_github_urls.append(repository_url)
+
     current_reference = extract_github_reference(question)
+    current_repo_url = current_reference.get("repository_url")
 
-    # A new repository in the current message starts a new repository
-    # context for the LLM. The persisted chat history is NOT deleted;
-    # it is simply not used as model history for this request.
-    previous_repo = str(
-        (active_github or {}).get("repository_url") or ""
-    ).rstrip("/").lower()
-    current_repo = str(
-        current_reference.get("repository_url") or ""
-    ).rstrip("/").lower()
-
-    repository_switched = bool(
-        current_repo
-        and current_repo != previous_repo
-    )
-
-    if current_reference.get("repository_url"):
-        github_reference = current_reference
-        github_url = current_reference["repository_url"]
+    if current_repo_url:
+        if current_repo_url not in requested_github_urls:
+            requested_github_urls.insert(0, current_repo_url)
 
         question = remove_github_reference(
             question,
@@ -1385,47 +2010,66 @@ def ask_ai(
             current_reference,
         )
 
-    elif request.github_url:
-        explicit_reference = extract_github_reference(
-            request.github_url.strip()
+    elif requested_github_urls:
+        first_reference = extract_github_reference(
+            requested_github_urls[0]
         )
 
-        if explicit_reference.get("repository_url"):
-            explicit_repo = str(
-                explicit_reference.get("repository_url") or ""
-            ).rstrip("/").lower()
-
-            repository_switched = bool(
-                explicit_repo
-                and explicit_repo != previous_repo
-            )
-
-            github_reference = explicit_reference
-            github_url = explicit_reference["repository_url"]
-
+        if first_reference.get("repository_url"):
             set_active_github_context(
                 request.chat_id,
-                explicit_reference,
+                first_reference,
             )
-        else:
-            github_reference = {}
-            github_url = ""
 
     elif active_github and active_github.get("repository_url"):
-        github_url = active_github["repository_url"]
+        repository_url = str(
+            active_github["repository_url"]
+        ).rstrip("/")
 
-        github_reference = {
-            "original_url": active_github.get("repository_url"),
-            "repository_url": active_github.get("repository_url"),
-            "owner": active_github.get("owner"),
-            "repo": active_github.get("repo"),
-            "resource_type": active_github.get("resource_type"),
-            "resource_path": active_github.get("resource_path"),
-        }
+        if repository_url:
+            requested_github_urls = [repository_url]
 
-    else:
-        github_reference = {}
-        github_url = ""
+    elif persisted_chat_github_urls:
+        requested_github_urls = list(
+            persisted_chat_github_urls
+        )
+
+    # Include any GitHub sources persisted in chat_sources that were not
+    # already present in the active-github compatibility state.
+    for repository_url in effective_github_urls:
+        if repository_url and repository_url not in requested_github_urls:
+            requested_github_urls.append(repository_url)
+
+        first_reference = extract_github_reference(
+            requested_github_urls[0]
+        )
+
+        if first_reference.get("repository_url"):
+            set_active_github_context(
+                request.chat_id,
+                first_reference,
+            )
+
+    previous_repo = str(
+        (active_github or {}).get("repository_url") or ""
+    ).rstrip("/").lower()
+
+    repository_switched = bool(
+        current_repo_url
+        and current_repo_url.rstrip("/").lower() != previous_repo
+    )
+
+    github_url = (
+        requested_github_urls[0]
+        if requested_github_urls
+        else ""
+    )
+
+    github_reference = (
+        extract_github_reference(github_url)
+        if github_url
+        else {}
+    )
 
     # ------------------------------------------------------------
     # CONVERSATION-AWARE QUERY RESOLUTION
@@ -1438,7 +2082,19 @@ def ask_ai(
         question=question,
         history=request.history,
     )
-    retrieval_query = resolution["resolved_query"]
+
+    # Only enrich retrieval with conversation context for a genuine follow-up.
+    # Standalone questions use ONLY the current question.
+    is_conversational_followup = bool(
+        resolution.get("was_resolved")
+        and resolution.get("resolution_type")
+        in {"reference_followup", "short_followup"}
+    )
+    retrieval_query = (
+        resolution["resolved_query"]
+        if is_conversational_followup
+        else question
+    )
 
     # Important distinction:
     # - request.history is still used by the resolver.
@@ -1480,8 +2136,10 @@ def ask_ai(
     retrieved_context = ""
     active_retriever_name = ""
     active_chunker_name = ""
+    evidence_result: Dict[str, Any] = {}
+    evidence_validation: Dict[str, Any] = {}
     if request.document_ids is not None:
-        set_active_documents(request.chat_id, request.document_ids)
+        set_active_documents(request.chat_id, effective_document_ids)
 
     active_document_ids = get_active_document_ids(request.chat_id)
 
@@ -1493,21 +2151,89 @@ def ask_ai(
     )
     uploaded_documents = get_documents_for_chat(
         request.chat_id,
-        request.document_ids,
+        effective_document_ids,
     )
 
     has_documents = bool(persistent_document_chunks) or bool(uploaded_documents)
+
+    previous_scope = get_active_source_scope(request.chat_id)
+    unavailable_document_ids = get_unavailable_chat_document_ids(
+        request.chat_id,
+        active_document_ids,
+    )
+    has_unavailable_documents = bool(unavailable_document_ids)
+
+    # If the current request explicitly references a document that no longer
+    # exists in this workspace, fail closed for source-specific questions even
+    # if other documents remain attached to the chat.
+    if (
+        unavailable_document_ids
+        and not github_url
+        and question_explicitly_references_missing_document(
+            question,
+            request.history,
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "The document is no longer available. "
+                    "It was removed from this workspace, so I cannot answer "
+                    "that source-specific question."
+                ),
+                "context_scope": "document",
+                "source_unavailable": True,
+                "unavailable_document_ids": unavailable_document_ids,
+            },
+        )
 
     route = ContextRouter.route(
         question=question,
         history=request.history,
         github_reference=github_reference,
         has_documents=has_documents,
+        has_github=bool(requested_github_urls),
         resolved_query=retrieval_query,
+        previous_scope=previous_scope,
+        has_unavailable_documents=has_unavailable_documents,
     )
     context_scope = route["scope"]
-    previous_scope = get_active_source_scope(request.chat_id)
-    source_switched = bool(previous_scope and previous_scope != context_scope and context_scope != "general")
+
+    # Selected source truth: when both a persisted/uploaded document and a
+    # GitHub repository are selected, never silently drop either source family.
+    if persistent_document_chunks and requested_github_urls:
+        context_scope = "hybrid"
+        route["scope"] = "hybrid"
+        route["reason"] = "both selected source families are active"
+
+    print("\n" + "=" * 72)
+    print("SOURCE ROUTING")
+    print("=" * 72)
+    print(f"Question:              {question!r}")
+    print(f"Selected documents:    {len(active_document_ids)}")
+    print(f"Selected GitHub repos: {len(requested_github_urls)}")
+    print(f"Context scope:         {context_scope}")
+    print(f"Route reason:          {route.get('reason')}")
+    print(f"Route signals:         {route.get('signals')}")
+    print("=" * 72 + "\n")
+
+    # Explicitly attached workspace documents are authoritative for this
+    # request when no GitHub repository is active.  The router may otherwise
+    # classify a generic-looking question (for example, “what are the main
+    # findings?”) as general chat even though the user deliberately attached
+    # documents.  We want retrieval to make that relevance decision instead:
+    #   attached docs + relevant question   -> document RAG
+    #   attached docs + unrelated question  -> general Qwen fallback
+    # Do not override a hybrid route merely because the legacy singular
+    # github_url is empty; selected repositories are tracked in
+    # requested_github_urls/chat_sources.
+
+    source_switched = bool(
+        previous_scope
+        and previous_scope != context_scope
+        and context_scope != "general"
+    )
     set_active_source_scope(request.chat_id, context_scope)
 
     # Never carry retrieval terms from the previous source into a newly
@@ -1516,57 +2242,161 @@ def ask_ai(
     if repository_switched or source_switched:
         retrieval_query = question
 
-    model_history = [] if repository_switched or source_switched else request.history
+    if repository_switched or source_switched:
+        model_history = []
+    elif context_scope in {"document", "hybrid"}:
+        # Standalone research questions must be isolated from previous turns.
+        # Only genuine conversational follow-ups receive prior conversation.
+        is_conversational_followup = bool(
+            resolution.get("was_resolved")
+            and resolution.get("resolution_type")
+            in {"reference_followup", "short_followup"}
+        )
+        model_history = (
+            [
+                message
+                for message in request.history[-6:]
+                if str(message.get("role", "")).strip().lower()
+                in {"user", "assistant"}
+            ]
+            if is_conversational_followup
+            else []
+        )
+    else:
+        model_history = request.history
 
     if context_scope == "github":
         if not github_url:
             raise HTTPException(status_code=400, detail="No active GitHub repository is available for this question.")
-        documents = [
-            {
-                **document,
-                "source": "github",
-                "source_type": "github_repository",
-            }
-            for document in build_github_documents(
-                github_url=github_url,
+        documents = []
+
+        for selected_github_url in requested_github_urls:
+            github_docs = build_github_documents(
+                github_url=selected_github_url,
                 question=retrieval_query,
                 branch=request.branch,
             )
-        ]
+
+            documents.extend(
+                {
+                    **document,
+                    "source": "github",
+                    "source_type": "github_repository",
+                    "github_url": selected_github_url,
+                }
+                for document in github_docs
+            )
         context_origin = "github"
 
     elif context_scope == "document":
-        chunks = list(persistent_document_chunks)
-        context_origin = "upload"
-        active_chunker_name = "PersistentDocumentChunks"
+        if not persistent_document_chunks and not uploaded_documents:
+            if unavailable_document_ids and question_explicitly_references_missing_document(
+                question,
+                request.history,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "The document is no longer available. "
+                            "It was removed from this workspace, so I cannot answer "
+                            "that source-specific question."
+                        ),
+                        "context_scope": "document",
+                        "source_unavailable": True,
+                        "unavailable_document_ids": unavailable_document_ids,
+                    },
+                )
+
+            # The selected document is gone, but the current question does not
+            # explicitly depend on that missing source. Continue with general chat.
+            context_origin = "general_chat"
+            context_scope = "general"
+            active_chunker_name = "none"
+            active_retriever_name = "none"
+
+        if context_scope == "document":
+            chunks = list(persistent_document_chunks)
+            context_origin = "upload"
+            active_chunker_name = "PersistentDocumentChunks"
 
     elif context_scope == "hybrid":
-        if not github_url or not persistent_document_chunks:
+        if not requested_github_urls or not persistent_document_chunks:
+            missing_parts: List[str] = []
+            if not requested_github_urls:
+                missing_parts.append("GitHub repository")
+            if not persistent_document_chunks:
+                if unavailable_document_ids:
+                    missing_parts.append("uploaded document (removed)")
+                else:
+                    missing_parts.append("uploaded document")
+
             raise HTTPException(
-                status_code=400,
-                detail=(
-                    "A hybrid question requires both an active GitHub "
-                    "repository and an uploaded document."
-                ),
+                status_code=409 if unavailable_document_ids else 400,
+                detail={
+                    "message": (
+                        "A cross-source question cannot be answered because "
+                        + ", ".join(missing_parts)
+                        + " is unavailable."
+                    ),
+                    "context_scope": "hybrid",
+                    "source_unavailable": bool(unavailable_document_ids),
+                    "unavailable_document_ids": unavailable_document_ids,
+                },
             )
 
-        github_documents = build_github_documents(
-            github_url=github_url,
-            question=retrieval_query,
-            branch=request.branch,
-        )
+        github_documents: List[Dict[str, Any]] = []
 
-        github_documents = [
-            {
-                **document,
-                "source": "github",
-                "source_type": "github_repository",
-            }
-            for document in github_documents
-        ]
+        for selected_github_url in requested_github_urls:
+            github_docs = build_github_documents(
+                github_url=selected_github_url,
+                question=retrieval_query,
+                branch=request.branch,
+            )
+
+            github_documents.extend(
+                {
+                    **document,
+                    "source": "github",
+                    "source_type": "github_repository",
+                    "github_url": selected_github_url,
+                }
+                for document in github_docs
+            )
+
+        github_chunks_created = document_chunker.chunk_documents(github_documents)
+
+        # GitHub overview documents are already normalized source records. If
+        # the generic document chunker rejects a small/structured file set,
+        # preserve the GitHub evidence as direct chunks rather than dropping
+        # the entire repository from the hybrid request.
+        if github_documents and not github_chunks_created:
+            github_chunks_created = []
+            for document in github_documents:
+                content = str(document.get("content") or "").strip()
+                if not content:
+                    continue
+                github_chunks_created.append({
+                    **document,
+                    "content": content,
+                    "raw_content": content,
+                    "path": str(document.get("path") or "github/source.md"),
+                    "source": "github",
+                    "source_type": "github_repository",
+                    "chunk_type": "text",
+                    "chunk_index": 0,
+                    "char_count": len(content),
+                })
 
         chunks = list(persistent_document_chunks)
-        chunks.extend(document_chunker.chunk_documents(github_documents))
+        chunks.extend(github_chunks_created)
+
+        print(
+            "HYBRID CONTEXT PREP: "
+            f"upload_chunks={len(persistent_document_chunks)}, "
+            f"github_documents={len(github_documents)}, "
+            f"github_chunks={len(github_chunks_created)}"
+        )
 
         documents = github_documents
         context_origin = "github+upload"
@@ -1593,12 +2423,12 @@ def ask_ai(
 
     timings["github_or_context_ms"] = _elapsed_ms(context_start)
 
-    if context_origin != "general_chat" and not documents and not chunks:
+    if context_scope != "general" and not documents and not chunks:
         raise HTTPException(
-            status_code=502 if github_url else 400,
+            status_code=502 if requested_github_urls else 400,
             detail=(
                 "GitHubContentService returned no usable documents."
-                if github_url
+                if requested_github_urls
                 else "Research context must not be empty."
             ),
         )
@@ -1649,16 +2479,137 @@ technical terminology. Answer directly and appropriately concisely.
                 # Chunks were already loaded from persistent document_chunks.
                 active_chunker_name = "PersistentDocumentChunks"
             elif context_scope == "hybrid":
-                # Persistent upload chunks are already in `chunks`; GitHub
-                # content was chunked during context preparation.
+                # IMPORTANT:
+                # Do NOT reconstruct source families from the flattened `chunks`
+                # list here. The preparation stage already created authoritative
+                # GitHub and upload lists. Re-splitting after chunking was the
+                # reason the GitHub family could disappear from retrieval.
+
                 github_chunks = [
-                    c for c in chunks if c.get("source") == "github"
+                    chunk
+                    for chunk in github_chunks_created
+                    if get_chunk_content(chunk)
                 ]
+
                 upload_chunks = [
-                    c for c in chunks if c.get("source") == "upload"
+                    chunk
+                    for chunk in persistent_document_chunks
+                    if get_chunk_content(chunk)
                 ]
-                chunks = github_chunks + upload_chunks
-                active_chunker_name = "PersistentDocumentChunks + DocumentChunker"
+
+                print(
+                    "HYBRID RETRIEVAL INPUTS: "
+                    f"upload={len(upload_chunks)}, "
+                    f"github={len(github_chunks)}"
+                )
+
+                # Rank each source family using the SAME production ranker
+                # already used when that family is retrieved on its own
+                # (HybridRetriever for GitHub, DocumentRetriever for uploads),
+                # instead of maintaining a bespoke local reranker here.
+                #
+                # This file previously had a third, independent scoring
+                # implementation (pure embedding cosine similarity with an
+                # ad-hoc lexical patch) that could silently disagree with
+                # HybridRetriever's own lexical/path/symbol/BM25 scoring.
+                # That drift was the root cause of GitHub evidence dropping
+                # out of hybrid comparison answers. HybridRetriever's
+                # relevance filter already guarantees at least one result
+                # whenever `chunks` is non-empty (see _relevance_filter's
+                # "never erase the whole pool" fallback), so the
+                # source-family coverage guarantee below still holds even
+                # though HybridRetriever's own gate is active here.
+                source_count = int(bool(upload_chunks)) + int(bool(github_chunks))
+                per_source_k = (
+                    max(
+                        1,
+                        math.ceil(requested_top_k / source_count),
+                    )
+                    if source_count
+                    else 0
+                )
+
+                github_results = (
+                    hybrid_retriever.retrieve(
+                        question=retrieval_query,
+                        chunks=github_chunks,
+                        top_k=min(per_source_k, len(github_chunks)),
+                    )
+                    if github_chunks
+                    else []
+                )
+
+                upload_results = (
+                    document_retriever.retrieve(
+                        question=retrieval_query,
+                        chunks=upload_chunks,
+                        top_k=min(per_source_k, len(upload_chunks)),
+                    )
+                    if upload_chunks
+                    else []
+                )
+
+                retrieved_chunks = []
+
+                # Guarantee source-family coverage before filling leftovers.
+                for index in range(per_source_k):
+                    if index < len(upload_results):
+                        retrieved_chunks.append(upload_results[index])
+                    if index < len(github_results):
+                        retrieved_chunks.append(github_results[index])
+
+                if len(retrieved_chunks) < requested_top_k:
+                    seen_ids = {
+                        (
+                            str(item.get("source") or ""),
+                            str(item.get("document_id") or ""),
+                            str(item.get("path") or ""),
+                            str(item.get("chunk_index") or ""),
+                            str(item.get("content") or "")[:120],
+                        )
+                        for item in retrieved_chunks
+                    }
+
+                    leftovers = (
+                        upload_results[per_source_k:]
+                        + github_results[per_source_k:]
+                    )
+
+                    for item in leftovers:
+                        key = (
+                            str(item.get("source") or ""),
+                            str(item.get("document_id") or ""),
+                            str(item.get("path") or ""),
+                            str(item.get("chunk_index") or ""),
+                            str(item.get("content") or "")[:120],
+                        )
+
+                        if key in seen_ids:
+                            continue
+
+                        retrieved_chunks.append(item)
+                        seen_ids.add(key)
+
+                        if len(retrieved_chunks) >= requested_top_k:
+                            break
+
+                print(
+                    "HYBRID SOURCE RESULTS: "
+                    f"upload={len(upload_results)}, "
+                    f"github={len(github_results)}, "
+                    f"final={len(retrieved_chunks)}"
+                )
+
+                print(
+                    "HYBRID GITHUB PATHS: "
+                    + ", ".join(
+                        str(item.get("path") or "")
+                        for item in github_results
+                    )
+                )
+
+                active_retriever_name = "SourceAwareHybridRetriever"
+
             else:
                 chunks = document_chunker.chunk_documents(documents)
                 active_chunker_name = "DocumentChunker"
@@ -1695,32 +2646,32 @@ technical terminology. Answer directly and appropriately concisely.
                 active_retriever_name = "HybridRetriever"
 
             elif context_scope == "document":
-                retrieved_chunks = document_retriever.retrieve(
+                evidence_result = evidence_engine.retrieve(
                     question=retrieval_query,
                     chunks=chunks,
-                    top_k=min(requested_top_k, len(chunks)),
+                    document_ids=active_document_ids,
+                    top_k=requested_top_k,
                 )
-                active_retriever_name = "DocumentRetriever"
+                retrieved_chunks = list(evidence_result.get("evidence") or [])
+                evidence_validation = evidence_validator.validate(
+                    question=retrieval_query,
+                    evidence_result=evidence_result,
+                )
+                evidence_result["validation"] = evidence_validation
+                active_retriever_name = "EvidenceEngine + DocumentRetriever"
 
             elif context_scope == "hybrid":
-                github_chunks = [c for c in chunks if c.get("source") == "github"]
-                upload_chunks = [c for c in chunks if c.get("source") == "upload"]
-
-                # Retrieve independently, then merge. Each source gets its own
-                # relevance/MMR decision before the final evidence is assembled.
-                github_results = hybrid_retriever.retrieve(
-                    question=retrieval_query,
-                    chunks=github_chunks,
-                    top_k=min(requested_top_k, len(github_chunks)) if github_chunks else 0,
-                ) if github_chunks else []
-                upload_results = document_retriever.retrieve(
-                    question=retrieval_query,
-                    chunks=upload_chunks,
-                    top_k=min(requested_top_k, len(upload_chunks)) if upload_chunks else 0,
-                ) if upload_chunks else []
-
-                retrieved_chunks = (github_results + upload_results)[:requested_top_k]
-                active_retriever_name = "HybridRetriever + DocumentRetriever"
+                # retrieved_chunks was already computed above (chunk_start
+                # phase) using the authoritative source-tagged
+                # github_chunks_created / persistent_document_chunks lists.
+                # Do NOT re-derive source families from the flattened
+                # `chunks` list here: document_chunker.chunk_documents()
+                # does not guarantee it preserves the "source" key on its
+                # output chunk dicts, so re-splitting after chunking can
+                # silently drop the GitHub family from retrieval. This was
+                # the root cause of cross-source questions returning only
+                # document evidence.
+                pass
 
             else:
                 retrieved_chunks = hybrid_retriever.retrieve(
@@ -1744,76 +2695,90 @@ technical terminology. Answer directly and appropriately concisely.
             )
 
         if not retrieved_chunks:
-            raise HTTPException(
-                status_code=404,
-                detail="No sufficiently relevant evidence was found in the active source.",
+            # A selected document does not mean every question is about it.
+            # If retrieval finds no relevant evidence, intentionally fall back
+            # to general Qwen rather than failing the request.
+            if context_scope == "document":
+                context_origin = "general_chat"
+                context_scope = "general"
+                active_retriever_name = "none"
+                active_chunker_name = "none"
+                retrieved_context = ""
+
+                prompt_start = _profile_start()
+                system_prompt = """
+You are a helpful AI assistant.
+
+The user has selected documents, but the retrieval step returned no usable
+passages for this particular question.
+
+Answer helpfully using general knowledge and the conversation history.
+Do not pretend the answer came from the selected documents.
+If the question clearly asks for source-specific facts, explain that the
+selected evidence did not establish those facts.
+""".strip()
+                messages = build_messages(
+                    question=question,
+                    history=model_history,
+                    system_prompt=system_prompt,
+                )
+                timings["prompt_build_ms"] = _profile_ms(prompt_start)
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No sufficiently relevant evidence was found in the active source.",
+                )
+        else:
+            github_count = sum(1 for item in retrieved_chunks if str(item.get("source_type") or item.get("source") or "").lower() in {"github","github_repository"})
+            upload_count = sum(1 for item in retrieved_chunks if str(item.get("source_type") or item.get("source") or "").lower() in {"upload","uploaded_document","document"})
+            print(f"SOURCE EVIDENCE COUNTS: github={github_count}, upload={upload_count}, total={len(retrieved_chunks)}")
+            context_format_start = _profile_start()
+            retrieved_context = format_retrieved_context(retrieved_chunks, evidence_result)
+            timings["context_formatting_ms"] = _profile_ms(context_format_start)
+            if not retrieved_context.strip():
+                raise HTTPException(status_code=500, detail="Retriever returned chunks but their content was empty.")
+
+            prompt_start = time.perf_counter()
+            system_prompt = build_system_prompt(
+                retrieved_context,
+                evidence_result,
+                question=question,
             )
 
-        context_format_start = _profile_start()
-        retrieved_context = format_retrieved_context(retrieved_chunks)
-        timings["context_formatting_ms"] = _profile_ms(context_format_start)
-        if not retrieved_context.strip():
-            raise HTTPException(status_code=500, detail="Retriever returned chunks but their content was empty.")
+            messages = build_messages(
+                question=question,
+                history=model_history,
+                system_prompt=system_prompt,
+            )
+            timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
 
-        prompt_start = time.perf_counter()
-        system_prompt = build_system_prompt(retrieved_context)
-
-        if context_scope == "document":
-            system_prompt = (
-                "IMPORTANT SOURCE RULE: This request is document-only. Use "
-                "only the retrieved uploaded-document evidence. Ignore any "
-                "active GitHub repository unless the user explicitly asks "
-                "for a comparison.\n\n" + system_prompt
-            )
-        elif context_scope == "github":
-            system_prompt = (
-                "IMPORTANT SOURCE RULE: This request is GitHub-only. Use "
-                "only the active repository and retrieved GitHub evidence. "
-                "Ignore uploaded documents.\n\n" + system_prompt
-            )
-        elif context_scope == "hybrid":
-            system_prompt = (
-                "IMPORTANT SOURCE RULE: This request is hybrid. Use both "
-                "retrieved GitHub and uploaded-document evidence, keeping "
-                "claims tied to the correct source.\n\n" + system_prompt
-            )
-
-        if repository_switched:
-            system_prompt = (
-                "IMPORTANT CURRENT REPOSITORY CONTEXT:\n"
-                "A new GitHub repository was selected in the current "
-                "message. Answer this request using ONLY the current "
-                "repository and the retrieved evidence below. Do not use "
-                "facts, files, claims, or conclusions from a previously "
-                "discussed repository. Do not say that the previous "
-                "repository lacks information about this question. "
-                "If the current repository evidence is insufficient, "
-                "state that directly.\n\n"
-                + system_prompt
-            )
-        elif source_switched:
-            system_prompt = (
-                "IMPORTANT SOURCE CONTEXT:\n"
-                "The active source changed for this request. Use ONLY the "
-                "currently retrieved source evidence. Do not carry facts, "
-                "claims, files, or conclusions from the previous source into "
-                "this answer. If the current source evidence is insufficient, "
-                "state that directly.\n\n"
-                + system_prompt
-            )
-
-        messages = build_messages(
-            question=question,
-            history=model_history,
-            system_prompt=system_prompt,
-        )
-        timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
+            nonempty_retrieved = [
+                chunk for chunk in retrieved_chunks
+                if get_chunk_content(chunk)
+            ]
+            print("\n" + "=" * 72)
+            print("LLM EVIDENCE HANDOFF")
+            print("=" * 72)
+            print(f"Retrieved evidence chunks : {len(nonempty_retrieved)}")
+            print(f"Prompt contains evidence  : {bool(retrieved_context.strip())}")
+            print(f"Retrieved context chars   : {len(retrieved_context):,}")
+            print(f"System prompt chars       : {len(system_prompt):,}")
+            print("=" * 72 + "\n")
 
     # ========================================================
     # 5. QWEN / OLLAMA
     # ========================================================
 
     llm_start = _profile_start()
+
+    print("\n" + "=" * 72)
+    print("LLM CONTEXT CONTROL")
+    print("=" * 72)
+    print(f"Follow-up detected:   {is_conversational_followup}")
+    print(f"History sent to Qwen:  {len(model_history)}")
+    print(f"Retrieval query:       {retrieval_query!r}")
+    print(f"Current question:      {question!r}")
+    print("=" * 72 + "\n")
 
     try:
         if stream:
@@ -1878,6 +2843,8 @@ technical terminology. Answer directly and appropriately concisely.
                         resolution=resolution,
                         requested_top_k=requested_top_k,
                         messages=messages,
+                        unavailable_document_ids=unavailable_document_ids,
+                        evidence_result=evidence_result,
                     )
 
                     yield (
@@ -1981,6 +2948,8 @@ technical terminology. Answer directly and appropriately concisely.
         resolution=resolution,
         requested_top_k=requested_top_k,
         messages=messages,
+        evidence_result=evidence_result,
+        unavailable_document_ids=unavailable_document_ids,
     )
 
 

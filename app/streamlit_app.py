@@ -318,6 +318,11 @@ def load_persistent_chat(chat_id: str) -> dict[str, Any]:
     """
     Load a persistent chat from FastAPI and convert it into
     the local chat structure expected by the existing Chat UI.
+
+    Document availability is resolved against the workspace's
+    persistent document list. Historical chat_sources are retained,
+    so a deleted document can be recognized as unavailable instead
+    of silently disappearing from chat history.
     """
 
     chat_response = requests.get(
@@ -343,22 +348,60 @@ def load_persistent_chat(chat_id: str) -> dict[str, Any]:
 
     document_ids: list[str] = []
     document_names: dict[str, str] = {}
+    unavailable_documents: list[dict[str, str]] = []
+
+    workspace_id = chat_data.get("workspace_id")
+
+    available_documents: dict[str, dict[str, Any]] = {}
+
+    if workspace_id:
+        try:
+            workspace_documents_response = requests.get(
+                f"{BACKEND_URL}/workspaces/{workspace_id}/documents",
+                timeout=30,
+            )
+            workspace_documents_response.raise_for_status()
+            workspace_documents = workspace_documents_response.json()
+
+            if isinstance(workspace_documents, list):
+                for document in workspace_documents:
+                    document_id = document.get("document_id")
+                    if document_id:
+                        available_documents[str(document_id)] = document
+
+        except requests.RequestException:
+            # Preserve chat loading even if the availability lookup fails.
+            available_documents = {}
 
     for source in sources_data:
-        if source.get("source_type") == "document":
-            source_id = source.get("source_id")
+        if source.get("source_type") != "document":
+            continue
 
-            if not source_id:
-                continue
+        source_id = source.get("source_id")
+        if not source_id:
+            continue
 
-            source_id = str(source_id)
+        source_id = str(source_id)
+        document = available_documents.get(source_id)
 
+        if document is not None:
             if source_id not in document_ids:
                 document_ids.append(source_id)
 
             document_names.setdefault(
                 source_id,
-                "Workspace document",
+                document.get("filename", "Workspace document"),
+            )
+        else:
+            unavailable_documents.append(
+                {
+                    "source_id": source_id,
+                    "title": (
+                        document_names.get(source_id)
+                        or chat_data.get("title")
+                        or "Previously attached document"
+                    ),
+                }
             )
 
     messages: list[dict[str, Any]] = []
@@ -373,11 +416,13 @@ def load_persistent_chat(chat_id: str) -> dict[str, Any]:
 
     return {
         "id": str(chat_data["id"]),
+        "workspace_id": str(workspace_id) if workspace_id else None,
         "title": chat_data.get("title") or "New Chat",
         "messages": messages,
         "github_url": None,
         "document_ids": document_ids,
         "document_names": document_names,
+        "unavailable_documents": unavailable_documents,
         "selected_document_id": (
             document_ids[0]
             if document_ids
@@ -385,6 +430,7 @@ def load_persistent_chat(chat_id: str) -> dict[str, Any]:
         ),
         "uploaded_file_keys": set(),
     }
+
 def active_chat() -> dict[str, Any]:
     chat_id = st.session_state.active_chat_id
 
@@ -1140,15 +1186,17 @@ def render_document_selector(
     """
     Render the document source selector.
 
-    The selector is intentionally always visible:
-    - no documents -> disabled-looking empty state
-    - one/multiple documents -> All documents + individual files
-
-    Returns the document IDs to send to the backend.
+    Available documents are selectable. Historical documents that were
+    removed from the workspace are shown as unavailable and are never
+    returned as RAG inputs.
     """
 
     document_ids = chat.get("document_ids", [])
     document_names = chat.get("document_names", {})
+    unavailable_documents = chat.get(
+        "unavailable_documents",
+        [],
+    )
 
     st.markdown(
         '<div class="source-panel">',
@@ -1160,15 +1208,33 @@ def render_document_selector(
         unsafe_allow_html=True,
     )
 
-    if not document_ids:
-        st.markdown(
-            '<div class="document-empty">'
-            'No documents attached yet.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+    if unavailable_documents:
+        for unavailable in unavailable_documents:
+            title = (
+                unavailable.get("title")
+                or "Previously attached document"
+            )
+            st.warning(
+                f"⚠️ **{title}** is no longer available. "
+                "It was removed from this workspace."
+            )
 
-        # Sidebar drag/drop uploader is always available.
+    if not document_ids:
+        if unavailable_documents:
+            st.markdown(
+                '<div class="document-empty">'
+                'No available documents remain in this chat.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="document-empty">'
+                'No documents attached yet.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
         st.file_uploader(
             "Drop files here or browse",
             type=DOCUMENT_FILE_TYPES,
@@ -1192,7 +1258,6 @@ def render_document_selector(
         )
 
         st.markdown("</div>", unsafe_allow_html=True)
-
         return []
 
     count = len(document_ids)
@@ -1253,7 +1318,7 @@ def render_document_selector(
     if selected_id is None:
         st.markdown(
             '<div class="active-source">'
-            '📚 <strong>Searching all attached documents</strong>'
+            '📚 <strong>Searching all available documents</strong>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1276,7 +1341,6 @@ def render_document_selector(
 
         selected_ids = [selected_id]
 
-    # Sidebar drag/drop uploader remains available after documents exist.
     st.file_uploader(
         "Add more documents",
         type=DOCUMENT_FILE_TYPES,
@@ -2316,6 +2380,10 @@ def render_sources() -> None:
             # Remove from workspace
             # --------------------------------------------------------
             with action_delete:
+                workspace_id = st.session_state.get(
+                    "active_workspace_id"
+                )
+
                 if source_kind == "research":
                     source_id = source.get("id")
 
@@ -2325,10 +2393,6 @@ def render_sources() -> None:
                         key=f"sources_delete_{source_id}_{index}",
                         help="Remove this source from the current workspace.",
                     ):
-                        workspace_id = st.session_state.get(
-                            "active_workspace_id"
-                        )
-
                         if not workspace_id:
                             st.error(
                                 "No active workspace is selected."
@@ -2343,12 +2407,14 @@ def render_sources() -> None:
 
                         try:
                             response = requests.delete(
-                                f"{BACKEND_URL}/workspaces/{workspace_id}/sources/{source_id}",
+                                f"{BACKEND_URL}/workspaces/"
+                                f"{workspace_id}/sources/"
+                                f"{source_id}",
                                 timeout=10,
                             )
                             response.raise_for_status()
 
-                            st.toast(
+                            st.success(
                                 "Source removed from this workspace."
                             )
                             st.rerun()
@@ -2357,10 +2423,139 @@ def render_sources() -> None:
                             st.error(
                                 f"Could not remove source: {exc}"
                             )
+
+                elif source_kind == "document":
+                    document_id = source.get("document_id")
+
+                    if st.button(
+                        "🗑 Remove",
+                        use_container_width=True,
+                        key=f"documents_delete_{document_id}_{index}",
+                        help="Delete this document from the workspace.",
+                    ):
+                        if not workspace_id:
+                            st.error(
+                                "No active workspace is selected."
+                            )
+                            return
+
+                        if not document_id:
+                            st.error(
+                                "This document has no valid ID."
+                            )
+                            return
+
+                        try:
+                            response = requests.delete(
+                                f"{BACKEND_URL}/workspaces/"
+                                f"{workspace_id}/documents/"
+                                f"{document_id}",
+                                timeout=30,
+                            )
+                            response.raise_for_status()
+
+                            # Clear any stale workspace-to-chat navigation
+                            # state pointing at the deleted document.
+                            if (
+                                st.session_state.get(
+                                    "selected_workspace_document_id"
+                                )
+                                == str(document_id)
+                            ):
+                                st.session_state.selected_workspace_document_id = None
+                                st.session_state.selected_workspace_document_name = None
+
+                            st.success(
+                                "Document deleted successfully."
+                            )
+                            st.rerun()
+
+                        except requests.RequestException as exc:
+                            st.error(
+                                f"Could not delete document: {exc}"
+                            )
+
                 else:
-                    # Document deletion has a separate cleanup flow because
-                    # documents also have storage and chunk records.
                     st.empty()
+
+
+def refresh_chat_document_availability(
+    chat: dict[str, Any],
+) -> None:
+    """
+    Re-check persistent document availability for an already-loaded chat.
+
+    This is intentionally separate from load_persistent_chat() so a chat
+    that is already in Streamlit session state can still notice when one
+    of its documents was deleted elsewhere.
+    """
+
+    workspace_id = chat.get("workspace_id")
+    if not workspace_id:
+        return
+
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/workspaces/{workspace_id}/documents",
+            timeout=15,
+        )
+        response.raise_for_status()
+        workspace_documents = response.json()
+    except requests.RequestException:
+        return
+
+    if not isinstance(workspace_documents, list):
+        return
+
+    available_documents: dict[str, dict[str, Any]] = {}
+
+    for document in workspace_documents:
+        document_id = document.get("document_id")
+        if document_id:
+            available_documents[str(document_id)] = document
+
+    original_document_ids = [
+        str(document_id)
+        for document_id in chat.get("document_ids", [])
+    ]
+
+    document_names = chat.setdefault("document_names", {})
+    unavailable_documents: list[dict[str, str]] = []
+
+    available_ids: list[str] = []
+
+    for document_id in original_document_ids:
+        document = available_documents.get(document_id)
+
+        if document is not None:
+            available_ids.append(document_id)
+            document_names[document_id] = (
+                document.get("filename")
+                or document_names.get(
+                    document_id,
+                    "Workspace document",
+                )
+            )
+        else:
+            unavailable_documents.append(
+                {
+                    "source_id": document_id,
+                    "title": document_names.get(
+                        document_id,
+                        "Previously attached document",
+                    ),
+                }
+            )
+
+    chat["document_ids"] = available_ids
+    chat["unavailable_documents"] = unavailable_documents
+
+    if chat.get("selected_document_id") not in available_ids:
+        chat["selected_document_id"] = (
+            available_ids[0]
+            if available_ids
+            else None
+        )
 
 
 def render_chat() -> None:
@@ -2374,6 +2569,10 @@ def render_chat() -> None:
             st.session_state.app_mode="Workspace"
             st.rerun()
     chat = active_chat()
+
+    # A persistent document may have been deleted after this chat
+    # was loaded. Re-check availability before rendering the selector.
+    refresh_chat_document_availability(chat)
 
     # ------------------------------------------------------------
     # Activate a document selected from the workspace Sources page.
@@ -2411,6 +2610,7 @@ def render_chat() -> None:
         st.session_state.selected_workspace_document_id = None
         st.session_state.selected_workspace_document_name = None
     
+    refresh_chat_document_availability(chat)
     selected_document_ids = render_chat_sidebar()
 
 

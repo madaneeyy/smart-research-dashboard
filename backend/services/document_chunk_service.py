@@ -62,3 +62,16 @@ def get_document_chunks(
     )
 
     return response.data or []
+
+def delete_document_chunks(
+    document_id: str,
+) -> bool:
+    response = (
+        supabase
+        .table("document_chunks")
+        .delete()
+        .eq("document_id", document_id)
+        .execute()
+    )
+
+    return True

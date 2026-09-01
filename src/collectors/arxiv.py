@@ -153,7 +153,7 @@ def parse_arxiv_response(
     # arXiv responses/tests may contain leading whitespace,
     # so strip it before parsing.
 
-    xml_text = xml_text.strip()
+    xml_text = xml_text.lstrip("\ufeff \t\r\n")
 
     root = ET.fromstring(xml_text)
 

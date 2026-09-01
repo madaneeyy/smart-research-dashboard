@@ -87,12 +87,71 @@ def delete_workspace_document(
     if existing_document is None:
         return False
 
+    # Remove the workspace association first.
     (
         supabase
         .table("workspace_documents")
         .delete()
         .eq("workspace_id", workspace_id)
         .eq("document_id", document_id)
+        .execute()
+    )
+
+    # Check whether this document is still associated
+    # with another workspace.
+    remaining = (
+        supabase
+        .table("workspace_documents")
+        .select("id")
+        .eq("document_id", document_id)
+        .limit(1)
+        .execute()
+    )
+
+    # If another workspace still uses the document,
+    # do not delete the underlying document data.
+    if remaining.data:
+        return True
+
+
+    # Get the underlying document record.
+    document_response = (
+        supabase
+        .table("documents")
+        .select("storage_path")
+        .eq("id", document_id)
+        .limit(1)
+        .execute()
+    )
+
+    storage_path = None
+
+    if document_response.data:
+        storage_path = document_response.data[0].get(
+            "storage_path"
+        )
+
+    # Delete all persistent chunks.
+    (
+        supabase
+        .table("document_chunks")
+        .delete()
+        .eq("document_id", document_id)
+        .execute()
+    )
+
+    # Delete the Storage object.
+    if storage_path:
+        supabase.storage.from_("documents").remove(
+            [storage_path]
+        )
+
+    # Delete the document record.
+    (
+        supabase
+        .table("documents")
+        .delete()
+        .eq("id", document_id)
         .execute()
     )
 

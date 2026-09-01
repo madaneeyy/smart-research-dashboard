@@ -232,6 +232,7 @@ class GitHubContentService:
         "working", "use", "uses", "using", "used", "manage",
         "manages", "handling", "handle", "sequence", "main",
         "key", "specific", "details",
+        "repo", "repository", "codebase", "project",
     }
 
     INTENT_WORDS = {
@@ -1328,7 +1329,10 @@ class GitHubContentService:
             re.search(
                 r"\bwhat\s+is\b|\bwhat\s+are\b|"
                 r"\bwhat\s+is\s+.*\bused\s+for\b|"
-                r"\bwhat\s+does\b.*\bdo\b",
+                r"\bwhat\s+does\b.*\bdo\b|"
+                r"\b(?:explain|describe|walk\s+me\s+through|"
+                r"give\s+(?:me\s+)?an?\s+overview\s+of)\b"
+                r".*\b(?:repo(?:sitory)?|codebase|project)\b",
                 query.lower(),
             )
         )
@@ -1667,6 +1671,93 @@ class GitHubContentService:
                 reasons.append("tutorial documentation for conceptual question")
 
         # ---------------------------------------------------------
+        # Distributed/parallelism concept aliases.
+        #
+        # Natural-language questions often say "parallelism" while the
+        # repository uses concrete directory/file names such as
+        # tensor_parallel, pipeline_parallel, data_parallel, distributed,
+        # model_parallel, or parallel_state. Treat these as related path
+        # evidence without hard-coding a particular repository.
+        # ---------------------------------------------------------
+        parallelism_tokens = set(
+            analysis.get("identifier_parts", [])
+        ) | set(
+            str(x).lower()
+            for x in analysis.get("all_terms", [])
+        )
+
+        parallelism_requested = bool(
+            {
+                "parallelism",
+                "parallel",
+                "distributed",
+                "tensor",
+                "pipeline",
+                "data",
+                "model",
+            } & parallelism_tokens
+        )
+
+        if parallelism_requested:
+            if any(
+                token in normalized
+                for token in (
+                    "tensor_parallel",
+                    "tensor-parallel",
+                    "tensorparallel",
+                )
+            ):
+                score += 110
+                reasons.append(
+                    "tensor parallel implementation path"
+                )
+
+            if any(
+                token in normalized
+                for token in (
+                    "pipeline_parallel",
+                    "pipeline-parallel",
+                    "pipelineparallel",
+                )
+            ):
+                score += 110
+                reasons.append(
+                    "pipeline parallel implementation path"
+                )
+
+            if any(
+                token in normalized
+                for token in (
+                    "data_parallel",
+                    "data-parallel",
+                    "dataparallel",
+                )
+            ):
+                score += 100
+                reasons.append(
+                    "data parallel implementation path"
+                )
+
+            if "distributed" in parts or "distributed" in lower_path:
+                score += 80
+                reasons.append(
+                    "distributed implementation path"
+                )
+
+            if any(
+                token in normalized
+                for token in (
+                    "parallel_state",
+                    "model_parallel",
+                    "parallelism",
+                )
+            ):
+                score += 85
+                reasons.append(
+                    "parallel-state/model-parallel implementation path"
+                )
+
+        # ---------------------------------------------------------
         # Query-specific structural priors.
         #
         # These resolve an important ambiguity: a generic identifier can
@@ -1878,6 +1969,67 @@ class GitHubContentService:
                 item["path"],
             )
         )
+
+        # ---------------------------------------------------------
+        # Robust fallback for broad / underspecified questions.
+        #
+        # A repository can be perfectly valid but have no filenames whose
+        # path contains one of the query terms. For example:
+        #
+        #   "What is this repository about?"
+        #   "Give me an overview."
+        #   "What does this project do?"
+        #
+        # In that case the previous implementation returned an empty
+        # candidate set. That made the entire GitHub source look unavailable
+        # even though the repository was accessible.
+        #
+        # Keep README handling separate; here we provide a small set of
+        # root-level / shallow fallback files for repositories without a
+        # useful README or for queries with weak lexical signals.
+        # ---------------------------------------------------------
+        if not candidates:
+            fallback_paths = []
+
+            for path in tree:
+                normalized = path.replace("\\", "/").strip("/")
+
+                supported = (
+                    cls._is_source_file(normalized)
+                    or cls._is_config_file(normalized)
+                    or cls._is_documentation_file(normalized)
+                )
+
+                if not supported:
+                    continue
+
+                if set(cls._path_parts(normalized)) & cls.EXCLUDED_PARTS:
+                    continue
+
+                depth = normalized.count("/")
+
+                # Prefer repository-root and shallow files. These usually
+                # contain the project entrypoint, configuration, or usage.
+                fallback_paths.append(
+                    (
+                        0 if depth == 0 else 1 if depth == 1 else 2,
+                        0 if cls._is_config_file(normalized) else 1,
+                        len(normalized),
+                        normalized,
+                    )
+                )
+
+            fallback_paths.sort()
+
+            for _, _, _, path in fallback_paths[:max_files]:
+                candidates.append(
+                    {
+                        "path": path,
+                        "score": 0.1,
+                        "matched_terms": [],
+                        "reasons": ["broad-query fallback"],
+                    }
+                )
 
         return candidates[:max_files]
 
@@ -2783,19 +2935,309 @@ class GitHubContentService:
         branch: str | None = None,
     ) -> list[dict]:
         """
-        Build structured, query-focused documents for the RAG pipeline.
+        Build structured GitHub evidence.
 
-        Unlike build_context_for_query(), this method does NOT combine
-        repository content into one large string. Each selected source file
-        remains a separate document so DocumentChunker can chunk files
-        independently and preserve file-level metadata.
+        Overview questions use a repository-map strategy so broad questions
+        do not retrieve an arbitrary deeply-nested implementation file.
+        Specific questions continue to use query-aware file ranking.
         """
-
         metadata = cls.fetch_repository_metadata(github_url)
         resolved_branch = branch or metadata.get("default_branch") or "main"
-
         analysis = cls.analyze_query(query)
 
+        # Always initialize repository_name before either overview or
+        # query-specific retrieval. Previously it was created only inside the
+        # overview branch, causing UnboundLocalError for technical GitHub
+        # questions.
+        repository_name = str(
+            metadata.get("repository") or ""
+        ).strip().lower()
+        analysis["repository_name"] = repository_name
+
+        print("\n" + "=" * 72)
+        print("GITHUB QUERY-AWARE RETRIEVAL")
+        print("=" * 72)
+        print(
+            f"Repository: {metadata.get('owner')}/{metadata.get('repository')}"
+        )
+        print(f"Branch: {resolved_branch}")
+        print(f"Query: {query!r}")
+        print(f"Intents: {analysis.get('intents')}")
+        print(f"Overview: {analysis.get('wants_overview')}")
+
+        if analysis.get("wants_overview"):
+            documents: list[dict] = []
+
+            repository_name = (
+                f"{metadata.get('owner', '')}/"
+                f"{metadata.get('repository', '')}"
+            )
+
+            documents.append(
+                {
+                    "content": "\n".join(
+                        [
+                            f"Repository: {repository_name}",
+                            f"Description: {metadata.get('description') or 'Not provided by GitHub.'}",
+                            f"Primary language: {metadata.get('language') or 'Not provided.'}",
+                            f"Default branch: {resolved_branch}",
+                            f"GitHub URL: {metadata.get('url') or github_url}",
+                        ]
+                    ),
+                    "path": "__repository_metadata__.md",
+                    "source": "github",
+                    "category": "repository_metadata",
+                    "language": "md",
+                    "github_url": github_url,
+                    "repository": repository_name,
+                    "branch": resolved_branch,
+                    "github_rank": 0,
+                    "github_score": 10000.0,
+                    "github_selection_reasons": [
+                        "repository metadata for overview"
+                    ],
+                    "query": query,
+                    "primary_entities": analysis.get("primary_entities", []),
+                }
+            )
+
+            # README is the canonical repository-level source.
+            try:
+                readme = cls.fetch_readme(github_url)
+            except Exception as exc:
+                print("README fetch warning:", exc)
+                readme = ""
+
+            if readme:
+                relevant_readme = cls._extract_relevant_readme(
+                    readme,
+                    query=query,
+                )
+                if not relevant_readme:
+                    relevant_readme = readme[: cls.MAX_README_CHARS]
+
+                if relevant_readme:
+                    documents.append(
+                        {
+                            "content": relevant_readme[: cls.MAX_SOURCE_FILE_CONTEXT_CHARS],
+                            "path": "README.md",
+                            "source": "github",
+                            "category": "documentation",
+                            "language": "md",
+                            "github_url": github_url,
+                            "repository": repository_name,
+                            "branch": resolved_branch,
+                            "github_rank": 1,
+                            "github_score": 9000.0,
+                            "github_matched_terms": [],
+                            "github_selection_reasons": [
+                                "mandatory repository README for overview"
+                            ],
+                            "symbols": [],
+                            "query": query,
+                            "primary_entities": analysis.get(
+                                "primary_entities", []
+                            ),
+                        }
+                    )
+
+            # Root-level configuration/docs/source provide a compact repository map.
+            try:
+                root_entries = cls.fetch_root_contents(github_url)
+            except Exception as exc:
+                print("Root listing warning:", exc)
+                root_entries = []
+
+            root_paths: list[str] = []
+            for entry in root_entries:
+                if entry.get("type") != "file":
+                    continue
+
+                candidate_path = str(entry.get("path") or "").strip("/")
+                if not candidate_path:
+                    continue
+
+                filename = Path(candidate_path).name.lower()
+
+                if filename in {
+                    "readme.md", "readme.rst", "readme.txt",
+                    "license", "license.md", "copying",
+                }:
+                    continue
+
+                if (
+                    cls._is_config_file(candidate_path)
+                    or cls._is_documentation_file(candidate_path)
+                    or cls._is_source_file(candidate_path)
+                ):
+                    root_paths.append(candidate_path)
+
+            def overview_priority(candidate_path: str) -> tuple[int, int, str]:
+                if cls._is_config_file(candidate_path):
+                    kind = 0
+                elif cls._is_documentation_file(candidate_path):
+                    kind = 1
+                else:
+                    kind = 2
+                return (
+                    kind,
+                    len(candidate_path),
+                    candidate_path.lower(),
+                )
+
+            root_paths = sorted(set(root_paths), key=overview_priority)
+
+            max_root = max(
+                0,
+                cls.MAX_QUERY_SOURCE_FILES - len(documents),
+            )
+
+            for root_path in root_paths[:max_root]:
+                try:
+                    content = cls.fetch_file(
+                        github_url=github_url,
+                        file_path=root_path,
+                        branch=resolved_branch,
+                    )
+                except Exception:
+                    continue
+
+                content = str(content or "").strip()
+                if not content:
+                    continue
+
+                documents.append(
+                    {
+                        "content": content[: cls.MAX_SOURCE_FILE_CONTEXT_CHARS],
+                        "path": root_path,
+                        "source": "github",
+                        "category": (
+                            "documentation"
+                            if cls._is_documentation_file(root_path)
+                            else "configuration"
+                            if cls._is_config_file(root_path)
+                            else "source"
+                        ),
+                        "language": Path(root_path).suffix.lower().lstrip("."),
+                        "github_url": github_url,
+                        "repository": repository_name,
+                        "branch": resolved_branch,
+                        "github_rank": len(documents) + 1,
+                        "github_score": 5000.0,
+                        "github_matched_terms": [],
+                        "github_selection_reasons": [
+                            "root-level repository-map file"
+                        ],
+                        "symbols": [],
+                        "query": query,
+                        "primary_entities": analysis.get(
+                            "primary_entities", []
+                        ),
+                    }
+                )
+
+            # If the root is sparse, add only a couple of representative
+            # high-level candidates. Do not let tests/examples dominate an overview.
+            target_count = min(5, max(3, cls.MAX_QUERY_SOURCE_FILES))
+            if len(documents) < target_count:
+                candidates = cls.select_relevant_source_files(
+                    github_url=github_url,
+                    query=query,
+                    branch=resolved_branch,
+                    max_files=cls.MAX_CANDIDATE_FILES,
+                )
+
+                existing_paths = {
+                    str(item.get("path", "")).lower()
+                    for item in documents
+                }
+
+                for candidate in candidates:
+                    if len(documents) >= target_count:
+                        break
+
+                    candidate_path = str(candidate.get("path") or "").strip()
+                    if not candidate_path:
+                        continue
+
+                    if candidate_path.lower() in existing_paths:
+                        continue
+
+                    if (
+                        cls._is_test_file(candidate_path)
+                        or cls._is_benchmark_file(candidate_path)
+                        or cls._is_example_file(candidate_path)
+                    ):
+                        continue
+
+                    try:
+                        content = cls.fetch_file(
+                            github_url=github_url,
+                            file_path=candidate_path,
+                            branch=resolved_branch,
+                        )
+                    except Exception:
+                        continue
+
+                    content = str(content or "").strip()
+                    if not content:
+                        continue
+
+                    focused, symbols = cls._focus_source_content(
+                        path=candidate_path,
+                        content=content,
+                        query=query,
+                        max_chars=cls.MAX_SOURCE_FILE_CONTEXT_CHARS,
+                    )
+
+                    if not focused:
+                        focused = content[: cls.MAX_SOURCE_FILE_CONTEXT_CHARS]
+
+                    documents.append(
+                        {
+                            "content": focused,
+                            "path": candidate_path,
+                            "source": "github",
+                            "category": (
+                                "documentation"
+                                if cls._is_documentation_file(candidate_path)
+                                else "configuration"
+                                if cls._is_config_file(candidate_path)
+                                else "source"
+                            ),
+                            "language": Path(candidate_path).suffix.lower().lstrip("."),
+                            "github_url": github_url,
+                            "repository": repository_name,
+                            "branch": resolved_branch,
+                            "github_rank": len(documents) + 1,
+                            "github_score": candidate.get("score", 0.0),
+                            "github_matched_terms": candidate.get(
+                                "matched_terms", []
+                            ),
+                            "github_selection_reasons": list(
+                                candidate.get("reasons", [])
+                            ) + ["overview representative file"],
+                            "symbols": symbols,
+                            "query": query,
+                            "primary_entities": analysis.get(
+                                "primary_entities", []
+                            ),
+                        }
+                    )
+                    existing_paths.add(candidate_path.lower())
+
+            print(
+                "Overview documents:",
+                ", ".join(
+                    str(item.get("path"))
+                    for item in documents
+                ),
+            )
+            print(f"Final GitHub documents: {len(documents)}")
+            print("=" * 72 + "\n")
+            return documents
+
+        # Specific technical question: preserve existing query-focused retrieval.
         candidates = cls.select_relevant_source_files(
             github_url=github_url,
             query=query,
@@ -2803,10 +3245,49 @@ class GitHubContentService:
             max_files=cls.MAX_CANDIDATE_FILES,
         )
 
+        # For conceptual implementation questions, a second retrieval pass
+        # may use implementation vocabulary that mirrors common repository
+        # layouts. This is still query-specific; it is NOT the generic
+        # repository-overview fallback.
         if not candidates:
-            return []
+            q_lower = query.lower()
+            expansion_terms: list[str] = []
 
-        scored_candidates = []
+            if any(
+                term in q_lower
+                for term in (
+                    "parallelism",
+                    "parallel",
+                    "distributed",
+                    "tensor",
+                    "pipeline",
+                    "data parallel",
+                )
+            ):
+                expansion_terms.extend(
+                    [
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                        "data_parallel",
+                        "distributed",
+                        "parallel_state",
+                        "model_parallel",
+                    ]
+                )
+
+            expanded_query = (
+                f"{query} " + " ".join(expansion_terms)
+            ).strip()
+
+            if expanded_query != query:
+                candidates = cls.select_relevant_source_files(
+                    github_url=github_url,
+                    query=expanded_query,
+                    branch=resolved_branch,
+                    max_files=cls.MAX_CANDIDATE_FILES,
+                )
+
+        scored_candidates: list[dict] = []
 
         for candidate in candidates:
             path = candidate["path"]
@@ -2823,9 +3304,7 @@ class GitHubContentService:
             if not content:
                 continue
 
-            content_for_scoring = content[
-                : cls.MAX_SOURCE_FILE_FETCH_CHARS
-            ]
+            content_for_scoring = content[: cls.MAX_SOURCE_FILE_FETCH_CHARS]
 
             score, content_reasons = cls._score_file_content(
                 path=path,
@@ -2834,12 +3313,9 @@ class GitHubContentService:
                 path_score=float(candidate.get("score", 0.0)),
             )
 
-            # Installation-style questions ("how do I install this",
-            # "what are the requirements") are best answered by build/
-            # dependency files, which otherwise rarely win on generic
-            # content scoring alone.
-            if analysis.get("wants_installation") and cls._is_config_file(
-                path
+            if (
+                analysis.get("wants_installation")
+                and cls._is_config_file(path)
             ):
                 score += 150.0
                 content_reasons = list(content_reasons) + [
@@ -2860,20 +3336,6 @@ class GitHubContentService:
                 }
             )
 
-        # ------------------------------------------------------------
-        # README as a real candidate.
-        #
-        # select_relevant_source_files almost always returns *some*
-        # file even for broad questions like "what is this repository
-        # about", so README needs to compete on the same scoreboard as
-        # source files rather than only appearing when nothing else was
-        # found. It gets a strong score boost for overview and
-        # installation questions (READMEs conventionally document
-        # both). Specific code questions still get outscored by the
-        # actual matching source file, since their score comes from
-        # real symbol/identifier hits.
-        # ------------------------------------------------------------
-
         try:
             readme = cls.fetch_readme(github_url)
         except Exception:
@@ -2886,22 +3348,18 @@ class GitHubContentService:
             )
 
             if relevant_readme:
-                if analysis.get("wants_overview"):
-                    readme_score = 500.0
-                    readme_reason = "repository overview question"
-                elif analysis.get("wants_installation"):
-                    readme_score = 300.0
-                    readme_reason = "installation question"
-                else:
-                    readme_score = 20.0
-                    readme_reason = "documentation context"
-
                 scored_candidates.append(
                     {
                         "path": "README.md",
                         "content": relevant_readme,
-                        "score": readme_score,
-                        "reasons": [readme_reason],
+                        "score": 300.0
+                        if analysis.get("wants_installation")
+                        else 20.0,
+                        "reasons": [
+                            "installation question"
+                            if analysis.get("wants_installation")
+                            else "documentation context"
+                        ],
                         "matched_terms": [],
                         "is_readme": True,
                     }
@@ -2918,27 +3376,18 @@ class GitHubContentService:
             )
         )
 
-        # Keep the same selection policy used by the existing
-        # query-aware context builder.
-        selected = scored_candidates[
-            : cls.MAX_QUERY_SOURCE_FILES
-        ]
-
-        documents = []
+        selected = scored_candidates[: cls.MAX_QUERY_SOURCE_FILES]
+        documents: list[dict] = []
 
         for rank, item in enumerate(selected, start=1):
             path = item["path"]
             content = item["content"]
 
             if item.get("is_readme"):
-                # Already curated by _extract_relevant_readme; don't run
-                # it through code-focused symbol/window matching, which
-                # would drop straight to a 35-line header for READMEs
-                # with no literal keyword hits.
                 focused = content[: cls.MAX_SOURCE_FILE_CONTEXT_CHARS]
-                symbol_metadata = []
+                symbols = []
             else:
-                focused, symbol_metadata = cls._focus_source_content(
+                focused, symbols = cls._focus_source_content(
                     path=path,
                     content=content,
                     query=query,
@@ -2948,8 +3397,6 @@ class GitHubContentService:
             if not focused:
                 continue
 
-            # Keep the document self-contained while preserving the
-            # original source path and retrieval metadata.
             documents.append(
                 {
                     "content": focused,
@@ -2968,20 +3415,13 @@ class GitHubContentService:
                     ),
                     "language": Path(path).suffix.lower().lstrip("."),
                     "github_url": github_url,
-                    "repository": (
-                        f"{metadata.get('owner', '')}/"
-                        f"{metadata.get('repository', '')}"
-                    ),
+                    "repository": repository_name,
                     "branch": resolved_branch,
                     "github_rank": rank,
                     "github_score": item.get("score", 0.0),
-                    "github_matched_terms": item.get(
-                        "matched_terms", []
-                    ),
-                    "github_selection_reasons": item.get(
-                        "reasons", []
-                    ),
-                    "symbols": symbol_metadata,
+                    "github_matched_terms": item.get("matched_terms", []),
+                    "github_selection_reasons": item.get("reasons", []),
+                    "symbols": symbols,
                     "query": query,
                     "primary_entities": analysis.get(
                         "primary_entities", []
@@ -2989,6 +3429,12 @@ class GitHubContentService:
                 }
             )
 
+        print(
+            "Selected query files:",
+            ", ".join(str(item.get("path")) for item in selected),
+        )
+        print(f"Final GitHub documents: {len(documents)}")
+        print("=" * 72 + "\n")
         return documents
 
     @classmethod
