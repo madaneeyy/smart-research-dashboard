@@ -30,17 +30,12 @@ import time
 from collections import Counter, OrderedDict
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-except Exception:
-    TfidfVectorizer = None
-    cosine_similarity = None
-
-try:
-    from sentence_transformers import CrossEncoder
-except Exception:
-    CrossEncoder = None
+# Heavy ML dependencies are imported lazily inside the methods that need them.
+# This keeps Render startup lightweight and prevents torch/sentence-transformers
+# from being loaded merely by importing the module.
+TfidfVectorizer = None
+cosine_similarity = None
+CrossEncoder = None
 
 
 class DocumentRetriever:
@@ -522,8 +517,15 @@ class DocumentRetriever:
         question: str,
         chunks: Sequence[Dict[str, Any]],
     ) -> List[float]:
+        global TfidfVectorizer, cosine_similarity
         if TfidfVectorizer is None or cosine_similarity is None:
-            return [0.0] * len(chunks)
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer as _TfidfVectorizer
+                from sklearn.metrics.pairwise import cosine_similarity as _cosine_similarity
+                TfidfVectorizer = _TfidfVectorizer
+                cosine_similarity = _cosine_similarity
+            except Exception:
+                return [0.0] * len(chunks)
 
         texts = [
             self._retrieval_text(chunk)
@@ -946,6 +948,16 @@ class DocumentRetriever:
 
         if self._reranker_model is not None:
             return self._reranker_model
+
+        global CrossEncoder
+        if CrossEncoder is None:
+            try:
+                from sentence_transformers import CrossEncoder as _CrossEncoder
+                CrossEncoder = _CrossEncoder
+            except Exception:
+                self._reranker_failed = True
+                self._last_reranker_status = "unavailable:crossencoder_import"
+                return None
 
         if CrossEncoder is None:
             self._reranker_failed = True

@@ -1,4 +1,3 @@
-from sentence_transformers import SentenceTransformer
 import numpy as np
 import hashlib
 import os
@@ -82,6 +81,8 @@ class SimpleRetriever:
         # --------------------------------------------------------
         # Already loaded in this Python process
         # --------------------------------------------------------
+
+        from sentence_transformers import SentenceTransformer
 
         if cls._model is not None:
             return cls._model
