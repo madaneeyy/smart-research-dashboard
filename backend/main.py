@@ -53,16 +53,12 @@ except ImportError:
 # PROJECT RAG COMPONENTS
 # ============================================================
 
-from src.services.rag.chunker import DocumentChunker
-from src.services.rag.hybrid_retriever import HybridRetriever
+# Heavy RAG modules are imported lazily inside the request paths/getters.
+# This keeps Render startup below the 512 MiB limit.
 from src.services.github.github_content import GitHubContentService
 from src.services.document_rag.document_service import DocumentService
 from src.services.document_rag.document_cache import DocumentCache
 from src.services.context_router import ContextRouter
-from src.services.document_rag.document_chunker import UploadedDocumentChunker
-from src.services.document_rag.document_retriever import DocumentRetriever
-from src.services.document_rag.evidence_engine import EvidenceEngine
-from src.services.document_rag.evidence_validator import EvidenceValidator
 from src.services.document_rag.query_classifier import QueryClassifier
 import inspect
 
@@ -110,6 +106,7 @@ _evidence_validator = None
 def get_hybrid_retriever():
     global _hybrid_retriever
     if _hybrid_retriever is None:
+        from src.services.rag.hybrid_retriever import HybridRetriever
         _hybrid_retriever = HybridRetriever(
             semantic_weight=0.5,
             bm25_weight=0.5,
@@ -134,6 +131,7 @@ def get_hybrid_retriever():
 def get_document_retriever():
     global _document_retriever
     if _document_retriever is None:
+        from src.services.document_rag.document_retriever import DocumentRetriever
         _document_retriever = DocumentRetriever(
             overview_top_k=7,
             focused_top_k=6,
@@ -147,6 +145,7 @@ def get_document_retriever():
 def get_evidence_engine():
     global _evidence_engine
     if _evidence_engine is None:
+        from src.services.document_rag.evidence_engine import EvidenceEngine
         _evidence_engine = EvidenceEngine(
             retriever=get_document_retriever(),
             overview_per_source=2,
@@ -159,39 +158,30 @@ def get_evidence_engine():
 def get_evidence_validator():
     global _evidence_validator
     if _evidence_validator is None:
+        from src.services.document_rag.evidence_validator import EvidenceValidator
         _evidence_validator = EvidenceValidator()
     return _evidence_validator
 
-# The chunker is lightweight and can safely be reused.
-document_chunker = DocumentChunker(
-    max_chars=1800,
-    min_chars=250,
-    overlap_chars=250,
-)
+_document_chunker = None
+_uploaded_document_chunker = None
 
-uploaded_document_chunker = UploadedDocumentChunker(
-    target_chars=1000,
-    max_chars=1600,
-    overlap_chars=180,
-    min_chunk_chars=20,
-)
+def get_document_chunker():
+    global _document_chunker
+    if _document_chunker is None:
+        from src.services.rag.chunker import DocumentChunker
+        _document_chunker = DocumentChunker(
+            max_chars=1800, min_chars=250, overlap_chars=250
+        )
+    return _document_chunker
 
-document_retriever = DocumentRetriever(
-    overview_top_k=7,
-    focused_top_k=6,
-    candidate_multiplier=5,
-    mmr_lambda=0.72,
-    profiling_enabled=True,
-)
-
-evidence_engine = EvidenceEngine(
-    retriever=document_retriever,
-    overview_per_source=2,
-    analysis_per_source=2,
-    max_final_evidence=12,
-)
-evidence_validator = EvidenceValidator()
-
+def get_uploaded_document_chunker():
+    global _uploaded_document_chunker
+    if _uploaded_document_chunker is None:
+        from src.services.document_rag.document_chunker import UploadedDocumentChunker
+        _uploaded_document_chunker = UploadedDocumentChunker(
+            target_chars=1000, max_chars=1600, overlap_chars=180, min_chunk_chars=20
+        )
+    return _uploaded_document_chunker
 
 
 # ============================================================
@@ -1581,7 +1571,7 @@ async def upload_workspace_document(
     # If the document exists but its chunk set is missing, repair it.
     if not existing_chunks:
         try:
-            chunks = uploaded_document_chunker.chunk_documents(
+            chunks = get_uploaded_document_chunker().chunk_documents(
                 [document]
             )
         except Exception as exc:
@@ -2462,7 +2452,7 @@ def ask_ai(
                 for document in github_docs
             )
 
-        github_chunks_created = document_chunker.chunk_documents(github_documents)
+        github_chunks_created = get_document_chunker().chunk_documents(github_documents)
 
         # GitHub overview documents are already normalized source records. If
         # the generic document chunker rejects a small/structured file set,
@@ -2571,7 +2561,7 @@ technical terminology. Answer directly and appropriately concisely.
         chunk_start = _profile_start()
         try:
             if context_scope == "github":
-                chunks = document_chunker.chunk_documents(documents)
+                chunks = get_document_chunker().chunk_documents(documents)
                 active_chunker_name = "DocumentChunker"
             elif context_scope == "document":
                 # Chunks were already loaded from persistent document_chunks.
@@ -2716,7 +2706,7 @@ technical terminology. Answer directly and appropriately concisely.
                 active_retriever_name = "SourceAwareHybridRetriever"
 
             else:
-                chunks = document_chunker.chunk_documents(documents)
+                chunks = get_document_chunker().chunk_documents(documents)
                 active_chunker_name = "DocumentChunker"
 
             timings["chunking_ms"] = _profile_ms(chunk_start)
@@ -2770,7 +2760,7 @@ technical terminology. Answer directly and appropriately concisely.
                 # phase) using the authoritative source-tagged
                 # github_chunks_created / persistent_document_chunks lists.
                 # Do NOT re-derive source families from the flattened
-                # `chunks` list here: document_chunker.chunk_documents()
+                # `chunks` list here: get_document_chunker().chunk_documents()
                 # does not guarantee it preserves the "source" key on its
                 # output chunk dicts, so re-splitting after chunking can
                 # silently drop the GitHub family from retrieval. This was
