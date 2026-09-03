@@ -5,7 +5,13 @@ import json
 import os
 import time
 from typing import Any, Dict, List, Optional, OrderedDict
-
+import ollama
+import requests
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
