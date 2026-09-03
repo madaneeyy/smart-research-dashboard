@@ -217,7 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .env
-
+.env.*
+!.env.example
 # RAG / ML model cache
 src/services/rag/cache/models/
 src/services/rag/cache/*.npy
@@ -230,3 +231,19 @@ evaluation/results/
 
 #Github Content Cache
 src/services/cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Debug / retrieval artifacts
+debug_*.py
+debug_*.json
+fyp_chunks_*.json
+retrieval_eval_results.json
+
+# Backup / temporary backend files
+backend/*_backup_*.py
+backend/main_provider_step3.py

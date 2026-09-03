@@ -1,0 +1,306 @@
+{
+  "name": "Smart Research Dashboard - FYP document retrieval benchmark",
+  "document": {
+    "title": "A CROSS-DOMAIN STUDY OF ACCURACY, CALIBRATION, AND ROBUSTNESS IN CNN, TRANSFORMER, AND SEQUENTIAL VISION MODELS",
+    "pages": 30
+  },
+  "evaluation_note": "Initial benchmark uses PDF page-level gold evidence. A retrieved chunk counts as a hit when its page is in gold_pages. Later, replace page labels with exact chunk IDs or graded relevance labels.",
+  "questions": [
+    {
+      "id": "OV01",
+      "question": "Explain this report in short",
+      "query_type": "overview",
+      "gold_pages": [
+        4,
+        7,
+        8,
+        19,
+        23
+      ]
+    },
+    {
+      "id": "OV02",
+      "question": "What is this report about?",
+      "query_type": "overview",
+      "gold_pages": [
+        4,
+        7,
+        8
+      ]
+    },
+    {
+      "id": "OV03",
+      "question": "What are the main findings of the study?",
+      "query_type": "overview",
+      "gold_pages": [
+        4,
+        19,
+        23
+      ]
+    },
+    {
+      "id": "OV04",
+      "question": "What is the main conclusion of the report?",
+      "query_type": "overview",
+      "gold_pages": [
+        23
+      ]
+    },
+    {
+      "id": "OV05",
+      "question": "What are the key points of this project?",
+      "query_type": "overview",
+      "gold_pages": [
+        4,
+        19,
+        23
+      ]
+    },
+    {
+      "id": "OV06",
+      "question": "Summarize the overall study and its outcome",
+      "query_type": "overview",
+      "gold_pages": [
+        4,
+        7,
+        19,
+        23
+      ]
+    },
+    {
+      "id": "FACT01",
+      "question": "What datasets were used in the project?",
+      "query_type": "factual",
+      "gold_pages": [
+        7,
+        14,
+        15
+      ]
+    },
+    {
+      "id": "FACT02",
+      "question": "What three model architectures were compared?",
+      "query_type": "factual",
+      "gold_pages": [
+        7,
+        16,
+        17
+      ]
+    },
+    {
+      "id": "FACT03",
+      "question": "How many random seeds were used?",
+      "query_type": "factual",
+      "gold_pages": [
+        7,
+        13,
+        18
+      ]
+    },
+    {
+      "id": "FACT04",
+      "question": "What evaluation metrics were used?",
+      "query_type": "factual",
+      "gold_pages": [
+        7,
+        12,
+        13
+      ]
+    },
+    {
+      "id": "FACT05",
+      "question": "What corruptions were used for robustness testing?",
+      "query_type": "factual",
+      "gold_pages": [
+        13
+      ]
+    },
+    {
+      "id": "FACT06",
+      "question": "How large is the CIFAR-100 dataset?",
+      "query_type": "factual",
+      "gold_pages": [
+        14
+      ]
+    },
+    {
+      "id": "FACT07",
+      "question": "What is the EuroSAT dataset used for?",
+      "query_type": "factual",
+      "gold_pages": [
+        14,
+        15
+      ]
+    },
+    {
+      "id": "FACT08",
+      "question": "What type of task is the Brain MRI dataset?",
+      "query_type": "factual",
+      "gold_pages": [
+        15
+      ]
+    },
+    {
+      "id": "FACT09",
+      "question": "Which optimizer was used for training?",
+      "query_type": "factual",
+      "gold_pages": [
+        13,
+        18
+      ]
+    },
+    {
+      "id": "FACT10",
+      "question": "What preprocessing and augmentation were applied?",
+      "query_type": "factual",
+      "gold_pages": [
+        13,
+        14,
+        15,
+        18
+      ]
+    },
+    {
+      "id": "METH01",
+      "question": "How was the experimental pipeline standardized across datasets and models?",
+      "query_type": "methodology",
+      "gold_pages": [
+        11,
+        13,
+        18
+      ]
+    },
+    {
+      "id": "METH02",
+      "question": "How was ResNet-18 implemented?",
+      "query_type": "methodology",
+      "gold_pages": [
+        16
+      ]
+    },
+    {
+      "id": "METH03",
+      "question": "How was ViT-Small implemented?",
+      "query_type": "methodology",
+      "gold_pages": [
+        16,
+        17
+      ]
+    },
+    {
+      "id": "METH04",
+      "question": "How was Vision Mamba implemented and trained?",
+      "query_type": "methodology",
+      "gold_pages": [
+        17
+      ]
+    },
+    {
+      "id": "METH05",
+      "question": "How was temperature scaling evaluated?",
+      "query_type": "methodology",
+      "gold_pages": [
+        9,
+        13
+      ]
+    },
+    {
+      "id": "METH06",
+      "question": "How was robustness evaluated?",
+      "query_type": "methodology",
+      "gold_pages": [
+        13
+      ]
+    },
+    {
+      "id": "RES01",
+      "question": "Which model achieved the best balance of accuracy and calibration on CIFAR-100?",
+      "query_type": "factual",
+      "gold_pages": [
+        4,
+        19,
+        23
+      ]
+    },
+    {
+      "id": "RES02",
+      "question": "How did ResNet-18 and ViT-Small compare on EuroSAT under corruption?",
+      "query_type": "comparison",
+      "gold_pages": [
+        19
+      ]
+    },
+    {
+      "id": "RES03",
+      "question": "What happened on the Brain MRI task?",
+      "query_type": "overview",
+      "gold_pages": [
+        19,
+        23
+      ]
+    },
+    {
+      "id": "RES04",
+      "question": "How did Vision Mamba perform across the three datasets?",
+      "query_type": "comparison",
+      "gold_pages": [
+        19
+      ]
+    },
+    {
+      "id": "RES05",
+      "question": "Did temperature scaling always improve calibration?",
+      "query_type": "comparison",
+      "gold_pages": [
+        9,
+        19,
+        23
+      ]
+    },
+    {
+      "id": "LIMIT01",
+      "question": "What does the report say about the limitations of temperature scaling?",
+      "query_type": "limitation",
+      "gold_pages": [
+        9,
+        19,
+        23
+      ]
+    },
+    {
+      "id": "FUT01",
+      "question": "What future work does the report propose?",
+      "query_type": "overview",
+      "gold_pages": [
+        23
+      ]
+    },
+    {
+      "id": "FUT02",
+      "question": "What additional robustness corruptions are proposed for future work?",
+      "query_type": "factual",
+      "gold_pages": [
+        23
+      ]
+    },
+    {
+      "id": "FUT03",
+      "question": "Does the report propose cross-domain transfer as future work?",
+      "query_type": "factual",
+      "gold_pages": [
+        23
+      ]
+    },
+    {
+      "id": "WHY01",
+      "question": "Why is accuracy alone not sufficient for model selection in this study?",
+      "query_type": "overview",
+      "gold_pages": [
+        4,
+        7,
+        19,
+        23
+      ]
+    }
+  ]
+}

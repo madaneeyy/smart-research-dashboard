@@ -6,7 +6,6 @@ import os
 import time
 from typing import Any, Dict, List, Optional, OrderedDict
 
-import ollama
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +35,7 @@ from backend.services.document_chunk_service import (
 from backend.routes.chat import router as chat_router
 from backend.services.chat_service import get_chat, get_chat_sources
 from backend.services.source_service import list_sources
+from backend.services import llm_service
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -57,22 +57,18 @@ from src.services.document_rag.document_chunker import UploadedDocumentChunker
 from src.services.document_rag.document_retriever import DocumentRetriever
 from src.services.document_rag.evidence_engine import EvidenceEngine
 from src.services.document_rag.evidence_validator import EvidenceValidator
+from src.services.document_rag.query_classifier import QueryClassifier
 import inspect
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b-instruct")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+LLM_PROVIDER = llm_service.get_provider()
+LLM_MODEL = llm_service.get_model()
 
 DEFAULT_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 MAX_TOP_K = int(os.getenv("RAG_MAX_TOP_K", "10"))
-
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
-OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1000"))
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
 
 MAX_CONTEXT_CHARACTERS = int(
     os.getenv("MAX_CONTEXT_CHARACTERS", "2000000")
@@ -140,7 +136,6 @@ evidence_engine = EvidenceEngine(
 )
 evidence_validator = EvidenceValidator()
 
-ollama_client = ollama.Client(host=OLLAMA_HOST)
 
 
 # ============================================================
@@ -738,8 +733,8 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "Smart Research AI API",
-        "model": OLLAMA_MODEL,
-        "ollama_host": OLLAMA_HOST,
+        "provider": LLM_PROVIDER,
+        "model": LLM_MODEL,
         "retriever": "HybridRetriever",
         "chunker": "DocumentChunker",
         "document_chunker": "UploadedDocumentChunker",
@@ -754,41 +749,31 @@ def root() -> Dict[str, Any]:
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    try:
-        response = ollama_client.list()
+    provider_health = llm_service.check_connection()
 
-        models = []
-
-        for model in getattr(response, "models", []):
-            name = getattr(model, "model", None)
-
-            if name:
-                models.append(str(name))
-
-        return {
-            "status": "ok",
-            "ollama": "connected",
-            "model": OLLAMA_MODEL,
-            "model_available": OLLAMA_MODEL in models,
-            "models": models,
-            "github_retriever": "HybridRetriever",
-            "github_chunker": "DocumentChunker",
-            "document_retriever": "DocumentRetriever",
-            "document_chunker": "UploadedDocumentChunker",
-            "github_content": "GitHubContentService",
-        }
-
-    except Exception as exc:
+    if not provider_health.get("connected"):
         raise HTTPException(
             status_code=503,
             detail={
                 "status": "error",
-                "ollama": "unavailable",
-                "model": OLLAMA_MODEL,
-                "ollama_host": OLLAMA_HOST,
-                "error": str(exc),
+                **provider_health,
+                "github_retriever": "HybridRetriever",
+                "github_chunker": "DocumentChunker",
+                "document_retriever": "DocumentRetriever",
+                "document_chunker": "UploadedDocumentChunker",
+                "github_content": "GitHubContentService",
             },
         )
+
+    return {
+        "status": "ok",
+        **provider_health,
+        "github_retriever": "HybridRetriever",
+        "github_chunker": "DocumentChunker",
+        "document_retriever": "DocumentRetriever",
+        "document_chunker": "UploadedDocumentChunker",
+        "github_content": "GitHubContentService",
+    }
 
 
 # ============================================================
@@ -974,7 +959,8 @@ def _build_rag_response_payload(
     print("RAG REQUEST PERFORMANCE")
     print("=" * 72)
     print(f"Question: {question}")
-    print(f"Model: {OLLAMA_MODEL}")
+    print(f"Provider: {LLM_PROVIDER}")
+    print(f"Model: {LLM_MODEL}")
     print(f"Repository switched: {repository_switched}")
     print(f"LLM history turns: {len(model_history)}")
     print(f"Context origin: {context_origin}")
@@ -1007,7 +993,7 @@ def _build_rag_response_payload(
     return {
         "question": question,
         "answer": answer,
-        "model": OLLAMA_MODEL,
+        "model": LLM_MODEL,
         "retriever": active_retriever_name or ("HybridRetriever" if context_origin != "general_chat" else "none"),
         "chunker": active_chunker_name or ("DocumentChunker" if context_origin != "general_chat" else "none"),
         "context_origin": context_origin,
@@ -2183,7 +2169,12 @@ def ask_ai(
     if request.document_ids is not None:
         set_active_documents(request.chat_id, effective_document_ids)
 
-    active_document_ids = get_active_document_ids(request.chat_id)
+    # When /ask has no chat_id, preserve explicitly supplied document IDs.
+    active_document_ids = (
+        get_active_document_ids(request.chat_id)
+        if request.chat_id
+        else list(effective_document_ids)
+    )
 
     # Workspace documents are persistent. document_chunks is the source of
     # truth for their availability; the in-memory store remains only for the
@@ -2590,10 +2581,17 @@ technical terminology. Answer directly and appropriately concisely.
                     else []
                 )
 
+                classification = QueryClassifier.classify(
+                    retrieval_query,
+                    document_count=len({str(c.get("document_id")) for c in upload_chunks if c.get("document_id")}),
+                )
+                query_type = str(classification.get("query_type") or "focused").strip().lower()
+
                 upload_results = (
                     document_retriever.retrieve(
                         question=retrieval_query,
                         chunks=upload_chunks,
+                        query_type=query_type,
                         top_k=min(per_source_k, len(upload_chunks)),
                     )
                     if upload_chunks
@@ -2833,15 +2831,8 @@ selected evidence did not establish those facts.
 
     try:
         if stream:
-            ollama_stream = ollama_client.chat(
-                model=OLLAMA_MODEL,
+            llm_stream = llm_service.chat(
                 messages=messages,
-                options={
-                    "num_ctx": OLLAMA_NUM_CTX,
-                    "temperature": OLLAMA_TEMPERATURE,
-                    "num_predict": OLLAMA_NUM_PREDICT,
-                },
-                keep_alive=OLLAMA_KEEP_ALIVE,
                 stream=True,
             )
 
@@ -2851,9 +2842,9 @@ selected evidence did not establish those facts.
                 last_response: Any = None
 
                 try:
-                    for chunk in ollama_stream:
+                    for chunk in llm_stream:
                         last_response = chunk
-                        content = getattr(getattr(chunk, "message", None), "content", None)
+                        content = llm_service.extract_stream_content(chunk)
                         if content:
                             text = str(content)
                             answer_parts.append(text)
@@ -2864,10 +2855,11 @@ selected evidence did not establish those facts.
                             )
 
                     answer = "".join(answer_parts).strip()
-                    timings["qwen_wall_ms"] = _profile_ms(llm_start)
+                    timings["llm_wall_ms"] = _profile_ms(llm_start)
+                    timings["qwen_wall_ms"] = timings["llm_wall_ms"]
 
                     if not answer:
-                        raise RuntimeError("Qwen returned an empty answer.")
+                        raise RuntimeError("LLM returned an empty answer.")
 
                     payload = _build_rag_response_payload(
                         question=question,
@@ -2921,27 +2913,21 @@ selected evidence did not establish those facts.
                 },
             )
 
-        response = ollama_client.chat(
-            model=OLLAMA_MODEL,
+        response = llm_service.chat(
             messages=messages,
-            options={
-                "num_ctx": OLLAMA_NUM_CTX,
-                "temperature": OLLAMA_TEMPERATURE,
-                "num_predict": OLLAMA_NUM_PREDICT,
-            },
-            keep_alive=OLLAMA_KEEP_ALIVE,
             stream=False,
         )
 
-        timings["qwen_wall_ms"] = _profile_ms(llm_start)
+        timings["llm_wall_ms"] = _profile_ms(llm_start)
+        timings["qwen_wall_ms"] = timings["llm_wall_ms"]
 
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail={
-                "message": "Qwen/Ollama request failed.",
-                "model": OLLAMA_MODEL,
-                "ollama_host": OLLAMA_HOST,
+                "message": "LLM request failed.",
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
                 "error": str(exc),
             },
         )
@@ -2951,15 +2937,15 @@ selected evidence did not establish those facts.
     # ========================================================
 
     try:
-        answer = str(
-            response.message.content
-        ).strip()
+        answer = llm_service.extract_content(response)
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail={
-                "message": "Unexpected Ollama response format.",
+                "message": "Unexpected LLM response format.",
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
                 "error": str(exc),
             },
         )
@@ -2967,7 +2953,7 @@ selected evidence did not establish those facts.
     if not answer:
         raise HTTPException(
             status_code=500,
-            detail="Qwen returned an empty answer.",
+            detail="LLM returned an empty answer.",
         )
 
     # ========================================================

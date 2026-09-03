@@ -37,14 +37,39 @@ class EvidenceValidator:
         evidence = list(evidence_result.get("evidence") or [])
         query_type = str(evidence_result.get("query_type") or "focused")
 
+        # EvidenceEngine stores evidence once at the top level. Build a small
+        # per-document index here instead of expecting each coverage package
+        # to contain its own evidence list.
+        evidence_by_document: Dict[str, List[Dict[str, Any]]] = {}
+        for item in evidence:
+            document_id = str(
+                item.get("document_id")
+                or item.get("file_id")
+                or item.get("filename")
+                or ""
+            ).strip()
+            if document_id:
+                evidence_by_document.setdefault(document_id, []).append(item)
+
         source_statuses: List[Dict[str, Any]] = []
         for package in packages:
-            source_evidence = list(package.get("evidence") or [])
+            document_id = str(package.get("document_id") or "").strip()
+            source_evidence = evidence_by_document.get(document_id, [])
+
+            # Accept the current EvidenceEngine field name and the older name
+            # so this validator remains compatible during the transition.
+            normalized_package = dict(package)
+            normalized_package["available_chunk_count"] = int(
+                package.get("available_chunk_count")
+                or package.get("chunk_count_available")
+                or 0
+            )
+
             source_statuses.append(
                 self._validate_source(
                     question=question,
                     query_type=query_type,
-                    package=package,
+                    package=normalized_package,
                     source_evidence=source_evidence,
                 )
             )

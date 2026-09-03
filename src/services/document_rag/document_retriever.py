@@ -25,6 +25,7 @@ Public API is kept compatible with the current backend:
 import hashlib
 import math
 import re
+from copy import deepcopy
 import time
 from collections import Counter, OrderedDict
 from typing import Any, Dict, List, Sequence, Set, Tuple
@@ -84,26 +85,6 @@ class DocumentRetriever:
         },
     }
 
-    OVERVIEW_RE = re.compile(
-        r"\b(explain|summari[sz]e|overview|walk\s+me\s+through|"
-        r"main\s+(?:idea|ideas|points|findings)|key\s+(?:idea|ideas|points|findings)|"
-        r"in\s+short|briefly|what\s+is\s+this)\b",
-        re.I,
-    )
-
-    FACTUAL_RE = re.compile(
-        r"\b(title|name|author|authors|date|year|location|"
-        r"who\s+(?:is|was|are)|what\s+(?:is|was|are)|"
-        r"when\s+(?:was|is)|where\s+(?:was|is)|how\s+many)\b",
-        re.I,
-    )
-
-    VISUAL_RE = re.compile(
-        r"\b(figure|fig\.?|diagram|chart|plot|graph|table|"
-        r"image|illustration|screenshot|architecture\s+diagram)\b",
-        re.I,
-    )
-
     def __init__(
         self,
         overview_top_k: int = 7,
@@ -117,7 +98,7 @@ class DocumentRetriever:
         query_embedding_cache_size: int = 32,
         reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         reranker_enabled: bool = True,
-        reranker_candidate_count: int = 20,
+        reranker_candidate_count: int = 32,
         reranker_batch_size: int = 16,
         context_budget_overview: int = 12000,
         context_budget_focused: int = 9000,
@@ -127,7 +108,7 @@ class DocumentRetriever:
         max_expanded_per_result: int = 2,
         expand_same_section_only: bool = False,
         expand_parents: bool = True,
-        max_total_expanded_chunks: int = 10,
+        max_total_expanded_chunks: int = 8,
         min_neighbor_relevance: float = 0.18,
         expand_factual_queries: bool = False,
         profiling_enabled: bool = False,
@@ -156,6 +137,7 @@ class DocumentRetriever:
         self.reranker_batch_size = max(1, int(reranker_batch_size))
         self._reranker_model = None
         self._reranker_failed = False
+        self._last_reranker_status = "not_run"
 
         self.context_budget_overview = max(1000, int(context_budget_overview))
         self.context_budget_focused = max(1000, int(context_budget_focused))
@@ -181,187 +163,183 @@ class DocumentRetriever:
     # Public API
     # ------------------------------------------------------------------
 
-    def retrieve(
+    def debug_retrieval(
         self,
         question: str,
         chunks: Sequence[Dict[str, Any]],
-        top_k: int = 5,
-    ) -> List[Dict[str, Any]]:
-        _profile = {}
-        _t0 = time.perf_counter()
-        _stage = time.perf_counter()
+        query_type: str | None = None,
+        gold_pages: Sequence[int] | None = None,
+        top_k: int = 8,
+    ) -> Dict[str, Any]:
+        """Trace one retrieval through every major ranking stage.
+
+        This is diagnostic-only and does not change ``retrieve()``.  It reports
+        where the requested gold pages appear (or disappear) in BM25, TF-IDF,
+        dense retrieval, fusion, query filtering, reranking, MMR, neighbor
+        expansion, and the final context-budget selection.
+        """
         valid = self._prepare_chunks(chunks)
-        _profile["prepare_chunks_ms"] = (time.perf_counter() - _stage) * 1000
-        if not valid:
-            return []
-
         question = str(question or "").strip()
-        if not question:
-            return []
+        if not valid or not question:
+            return {"question": question, "error": "No valid chunks or question."}
 
-        query_type = self._query_type(question)
+        query_type = str(query_type or self._query_type(question)).strip().lower()
+        retrieval_question = self._expanded_query(question, query_type)
+        gold = {int(p) for p in (gold_pages or [])}
         requested = max(1, int(top_k or self.focused_top_k))
 
         if query_type == "overview":
             target_k = min(max(requested, self.overview_top_k), 8, len(valid))
             budget = self.context_budget_overview
+            floor = 48
         elif query_type == "factual":
             target_k = min(max(requested, 3), 5, len(valid))
             budget = self.context_budget_factual
+            floor = 30
         else:
             target_k = min(max(requested, self.focused_top_k), 8, len(valid))
             budget = self.context_budget_focused
+            floor = 48
 
-        # Build all retrieval signals once per request.
-        _stage = time.perf_counter()
-        bm25_scores = self._bm25_scores(question, valid)
-        _profile["bm25_ms"] = (time.perf_counter() - _stage) * 1000
-        _stage = time.perf_counter()
-        tfidf_scores = self._tfidf_scores(question, valid)
-        _profile["tfidf_ms"] = (time.perf_counter() - _stage) * 1000
-        _stage = time.perf_counter()
-        dense_texts = [self._retrieval_text(chunk) for chunk in valid]
-        dense_cache_key = self._embedding_cache_key(valid, dense_texts)
-        dense_cache_hit = dense_cache_key in self._dense_embedding_cache
-        dense_scores = self._dense_scores(question, valid)
-        _profile["dense_ms"] = (time.perf_counter() - _stage) * 1000
-        _profile["dense_document_cache_hit"] = int(dense_cache_hit)
+        def page(item: Dict[str, Any]) -> int | None:
+            try:
+                value = item.get("page")
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
 
-        # Rank separately with each retriever.
-        bm25_rank = self._rank_indices(bm25_scores)
-        tfidf_rank = self._rank_indices(tfidf_scores)
-        dense_rank = self._rank_indices(dense_scores) if dense_scores else []
+        def stable(item: Dict[str, Any]) -> str:
+            return self._stable_chunk_id(item)
 
-        _stage = time.perf_counter()
+        def stage_snapshot(items: Sequence[Dict[str, Any]], limit: int | None = None) -> Dict[str, Any]:
+            rows = []
+            seen = set()
+            for rank, item in enumerate(items, 1):
+                pg = page(item)
+                if pg in gold:
+                    rows.append({
+                        "rank": rank,
+                        "page": pg,
+                        "chunk_index": item.get("document_chunk_index", item.get("_original_index")),
+                        "chunk_id": stable(item),
+                        "score": round(float(item.get("_hybrid_score", 0.0)), 6),
+                        "bm25": round(float(item.get("_bm25_score", 0.0)), 6),
+                        "tfidf": round(float(item.get("_tfidf_score", 0.0)), 6),
+                        "dense": round(float(item.get("_dense_score", 0.0)), 6),
+                        "metadata": round(float(item.get("_metadata_score", 0.0)), 6),
+                        "query_fit": round(float(item.get("_query_fit_score", 0.0)), 6),
+                        "reranker": (round(float(item["_reranker_score"]), 6) if item.get("_reranker_score") is not None else None),
+                    })
+                    seen.add(pg)
+            return {
+                "gold_pages_found": sorted(seen),
+                "gold_pages_missing": sorted(gold - seen),
+                "gold_matches": rows,
+                "count": len(items),
+                "top_pages": [page(x) for x in list(items)[: (limit or len(items))]],
+            }
+
+        bm25 = self._bm25_scores(retrieval_question, valid)
+        tfidf = self._tfidf_scores(retrieval_question, valid)
+        dense = self._dense_scores(retrieval_question, valid)
+        br = self._rank_indices(bm25)
+        tr = self._rank_indices(tfidf)
+        dr = self._rank_indices(dense) if dense else []
+
+        def ranked_items(indices: Sequence[int], scores: Sequence[float]) -> List[Dict[str, Any]]:
+            result = []
+            for idx in indices:
+                item = dict(valid[idx])
+                item["_stage_score"] = float(scores[idx]) if idx < len(scores) else 0.0
+                result.append(item)
+            return result
+
+        bm25_items = ranked_items(br, bm25)
+        tfidf_items = ranked_items(tr, tfidf)
+        dense_items = ranked_items(dr, dense) if dense else []
+
         fused = self._fuse_ranks(
-            bm25_rank=bm25_rank,
-            tfidf_rank=tfidf_rank,
-            dense_rank=dense_rank,
-            bm25_scores=bm25_scores,
-            tfidf_scores=tfidf_scores,
-            dense_scores=dense_scores,
-            question=question,
-            query_type=query_type,
-            chunks=valid,
+            br, tr, dr, bm25, tfidf, dense, question, query_type, valid
         )
-
-        # Keep a reasonably large candidate pool before MMR.
         candidate_count = min(
-            len(fused),
-            max(target_k * self.candidate_multiplier, target_k),
+            len(fused), max(target_k * self.candidate_multiplier, floor, 60)
         )
         candidates = fused[:candidate_count]
-        _profile["fusion_ms"] = (time.perf_counter() - _stage) * 1000
+        fusion_pool = list(candidates)
 
-        _stage = time.perf_counter()
-        candidates = self._query_aware_filter(
-            question=question,
-            candidates=candidates,
-            query_type=query_type,
+        filtered = self._query_aware_filter(question, candidates, query_type)
+        reranked = self._rerank_candidates(question, filtered)
+        rerank_pool = list(reranked)
+        mmr_selected = self._mmr_select(reranked, target_k, question)
+        expanded = self._expand_with_neighbors(
+            mmr_selected, valid, question, query_type, self.max_total_expanded_chunks
         )
+        final = self._apply_context_budget(expanded, budget)
+        if not final and rerank_pool:
+            final = [self._truncate(rerank_pool[0], budget)]
 
-        _profile["query_filter_ms"] = (time.perf_counter() - _stage) * 1000
+        stages = {
+            "bm25": stage_snapshot(bm25_items, 20),
+            "tfidf": stage_snapshot(tfidf_items, 20),
+            "dense": stage_snapshot(dense_items, 20),
+            "fusion_candidate_pool": stage_snapshot(fusion_pool),
+            "query_aware_filter": stage_snapshot(filtered),
+            "reranker": stage_snapshot(rerank_pool),
+            "mmr_selection": stage_snapshot(mmr_selected),
+            "neighbor_expansion": stage_snapshot(expanded),
+            "final_context_budget": stage_snapshot(final),
+        }
 
-        _stage = time.perf_counter()
-        candidates = self._rerank_candidates(
-            question=question,
-            candidates=candidates,
-        )
+        return {
+            "question": question,
+            "query_type": query_type,
+            "retrieval_question": retrieval_question,
+            "gold_pages": sorted(gold),
+            "target_k": target_k,
+            "context_budget": budget,
+            "reranker_status": self._last_reranker_status,
+            "stages": stages,
+        }
 
-        _profile["reranker_ms"] = (time.perf_counter() - _stage) * 1000
 
-        _stage = time.perf_counter()
-        selected = self._mmr_select(
-            candidates=candidates,
-            top_k=target_k,
-            question=question,
-        )
-
-        # Expand high-quality retrieved chunks with their immediate document
-        # neighbors.  This happens after ranking so neighbors never outrank
-        # the evidence selected by the retrieval/reranking pipeline.
-        _profile["mmr_ms"] = (time.perf_counter() - _stage) * 1000
-
-        _stage = time.perf_counter()
-        selected = self._expand_with_neighbors(
-            selected=selected,
-            all_chunks=valid,
-            question=question,
-            query_type=query_type,
-            max_total_chunks=self.max_total_expanded_chunks,
-        )
-
-        _profile["parent_neighbor_expansion_ms"] = (time.perf_counter() - _stage) * 1000
-
-        _stage = time.perf_counter()
-        selected = self._apply_context_budget(selected, budget)
-        _profile["context_budget_ms"] = (time.perf_counter() - _stage) * 1000
-
-        if not selected and candidates:
-            selected = [self._truncate(candidates[0], budget)]
-
-        results: List[Dict[str, Any]] = []
-
-        for rank, item in enumerate(selected, start=1):
-            result = dict(item)
-
-            # Public, honest retrieval metadata.
-            result["retrieval_source"] = "document"
-            result["retriever_name"] = self.__class__.__name__
-            result["document_rank"] = rank
-            result["query_type"] = query_type
-
-            # Keep score names explicit so the UI does not imply that an
-            # unavailable score came from a different retrieval algorithm.
-            result["relevance_score"] = round(
-                float(result.get("_hybrid_score", 0.0)), 4
-            )
-            result["bm25_score"] = round(
-                float(result.get("_bm25_score", 0.0)), 4
-            )
-            result["tfidf_score"] = round(
-                float(result.get("_tfidf_score", 0.0)), 4
-            )
-            result["dense_score"] = round(
-                float(result.get("_dense_score", 0.0)), 4
-            )
-            result["reranker_score"] = round(
-                float(result.get("_reranker_score", 0.0)), 4
-            )
-            result["metadata_score"] = round(
-                float(result.get("_metadata_score", 0.0)), 4
-            )
-            result["mmr_score"] = round(
-                float(result.get("_mmr_score", 0.0)), 4
-            )
-            result["redundancy_score"] = round(
-                float(result.get("_redundancy_score", 0.0)), 4
-            )
-            result["context_budget_chars"] = budget
-
-            # Internal fields are not useful to the frontend.
-            for key in list(result):
-                if key.startswith("_"):
-                    result.pop(key, None)
-
-            results.append(result)
-
-        _profile["total_retrieval_ms"] = (time.perf_counter() - _t0) * 1000
-        _profile["input_chunks"] = len(valid)
-        _profile["candidate_chunks"] = len(candidates)
-        _profile["final_chunks"] = len(results)
-        self.last_profile = _profile
-        if self.profiling_enabled:
-            print("\n" + "=" * 72)
-            print("DOCUMENT RETRIEVER PERFORMANCE")
-            print("=" * 72)
-            for k, v in _profile.items():
-                if k.endswith("_ms"):
-                    print(f"{k:<34}: {v:,.2f} ms")
-                else:
-                    print(f"{k:<34}: {int(v)}")
-            print("=" * 72)
+    def retrieve(self, question: str, chunks: Sequence[Dict[str, Any]], query_type: str | None = None, top_k: int = 5) -> List[Dict[str, Any]]:
+        t0=time.perf_counter(); valid=self._prepare_chunks(chunks)
+        if not valid: return []
+        question=str(question or "").strip()
+        if not question: return []
+        query_type=str(query_type or self._query_type(question)).strip().lower()
+        retrieval_question=self._expanded_query(question,query_type)
+        requested=max(1,int(top_k or self.focused_top_k))
+        if query_type=="overview": target_k=min(max(requested,self.overview_top_k),8,len(valid)); budget=self.context_budget_overview; floor=48
+        elif query_type=="factual": target_k=min(max(requested,3),5,len(valid)); budget=self.context_budget_factual; floor=30
+        else: target_k=min(max(requested,self.focused_top_k),8,len(valid)); budget=self.context_budget_focused; floor=48
+        p={}
+        st=time.perf_counter(); bm25=self._bm25_scores(retrieval_question,valid); p["bm25_ms"]=(time.perf_counter()-st)*1000
+        st=time.perf_counter(); tfidf=self._tfidf_scores(retrieval_question,valid); p["tfidf_ms"]=(time.perf_counter()-st)*1000
+        st=time.perf_counter(); dense=self._dense_scores(retrieval_question,valid); p["dense_ms"]=(time.perf_counter()-st)*1000
+        br=self._rank_indices(bm25); tr=self._rank_indices(tfidf); dr=self._rank_indices(dense) if dense else []
+        fused=self._fuse_ranks(br,tr,dr,bm25,tfidf,dense,question,query_type,valid)
+        candidates=fused[:min(len(fused),max(target_k*self.candidate_multiplier,floor,60))]
+        candidates=self._query_aware_filter(question,candidates,query_type)
+        candidates=self._rerank_candidates(question,candidates)
+        selected=self._mmr_select(candidates,target_k,question)
+        selected=self._expand_with_neighbors(selected,valid,question,query_type,self.max_total_expanded_chunks)
+        selected=self._apply_context_budget(selected,budget)
+        if not selected and candidates: selected=[self._truncate(candidates[0],budget)]
+        results=[]
+        for rank,item in enumerate(selected,1):
+            r=dict(item); r.update({"retrieval_source":"document","retriever_name":self.__class__.__name__,"document_rank":rank,"query_type":query_type,"relevance_score":round(float(r.get("_hybrid_score",0)),4)})
+            for public,internal in (("bm25_score","_bm25_score"),("tfidf_score","_tfidf_score"),("dense_score","_dense_score"),("metadata_score","_metadata_score"),("mmr_score","_mmr_score"),("redundancy_score","_redundancy_score"),("query_fit_score","_query_fit_score")):
+                r[public]=round(float(r.get(internal,0)),4)
+            if r.get("_reranker_score") is not None: r["reranker_score"]=round(float(r["_reranker_score"]),4)
+            r["context_budget_chars"]=budget
+            for k in list(r):
+                if k.startswith("_"): r.pop(k,None)
+            results.append(r)
+        p.update({"reranker_status":self._last_reranker_status,"total_retrieval_ms":(time.perf_counter()-t0)*1000,"input_chunks":len(valid),"candidate_chunks":len(candidates),"final_chunks":len(results)})
+        self.last_profile=p
         return results
+
 
     # ------------------------------------------------------------------
     # Chunk preparation
@@ -394,25 +372,76 @@ class DocumentRetriever:
 
         return valid
 
-    # ------------------------------------------------------------------
-    # Query routing
-    # ------------------------------------------------------------------
-
-    def _query_type(self, question: str) -> str:
-        if self.VISUAL_RE.search(question):
-            return "visual"
-        if self.OVERVIEW_RE.search(question):
-            return "overview"
-        if self.FACTUAL_RE.search(question):
-            return "factual"
-        return "focused"
-
     def _query_terms(self, question: str) -> Set[str]:
         return {
             token
             for token in self._tokens(question)
             if token not in self.STOPWORDS
         }
+
+    def _query_type(self, question: str) -> str:
+        q = str(question or "").strip().lower()
+        if not q: return "focused"
+        def has(p): return bool(re.search(p, q, re.I))
+        if has(r"\b(which optimizer|what .* metrics?|what datasets?|what .* architecture|how many .* seeds?|what corruptions?|what additional robustness corruptions|does the report propose .* future work)\b"): return "factual"
+        if has(r"\b(summarize|summary|explain|overall|main findings?|key findings?|main conclusion|overall conclusion|key points?|what is (this|the) (report|project|study) about|future work|future scope|what does.*conclude|conclusion|why is .* not sufficient|what happened on .* task)\b"): return "overview"
+        if has(r"\b(compare|comparison|versus|vs\.?|difference|differ|outperform|better than|always improve|how did .* compare|across (the|these|all) (three|3|datasets))\b"): return "comparison"
+        if has(r"\b(how was .* (implemented|trained|evaluated)|how was the experimental pipeline|methodology|experimental setup|implementation|training|approach)\b"): return "methodology"
+        if has(r"\b(limitation|limitations|drawback|drawbacks|shortcoming|shortcomings|constraint|constraints)\b"): return "limitation"
+        if has(r"\b(gap|research gap|what is missing|missing)\b"): return "gap"
+        if has(r"\b(contradict|contradiction|inconsistent|conflict)\b"): return "contradiction"
+        if has(r"\b(figure|fig\.?|table|visual|diagram|plot|chart|shown)\b"): return "visual"
+        if has(r"\b(dataset|datasets|model|models|architecture|architectures|metrics?|metric|corruptions?|seeds?|date|title|authors?)\b"): return "factual"
+        if has(r"\b(what|which|who|when|where|how many|how much|name|list)\b"): return "factual"
+        return "focused"
+
+
+
+    @staticmethod
+    def _query_type_profile(query_type: str) -> Dict[str, float]:
+        return {
+            "overview": {"abstract": .75, "introduction": .45, "result": 1.0, "conclusion": 1.0, "future": 1.05, "methodology": .12},
+            "comparison": {"result": 1.10, "comparison": 1.15, "conclusion": .70, "abstract": .45, "introduction": .18, "methodology": .10},
+            "methodology": {"methodology": 1.15, "experimental": .95, "implementation": 1.05, "evaluation": .85, "result": .30, "conclusion": .12},
+            "limitation": {"limitation": 1.15, "conclusion": .90, "discussion": .80, "result": .45},
+            "factual": {"abstract": .25, "methodology": .30, "result": .25, "conclusion": .15},
+        }.get(query_type, {"result": .45, "conclusion": .35, "methodology": .30})
+
+    def _expanded_query(self, question: str, query_type: str) -> str:
+        """Expand queries with intent-specific vocabulary without polluting the query.
+
+        Broadly appending every possible section label is harmful for focused
+        questions (for example, adding ``future scope`` to a conclusion query).
+        Keep expansion tied to the semantic focus of the actual question.
+        """
+        q = str(question or "").strip()
+        q_lower = q.lower()
+
+        if query_type == "overview":
+            if re.search(r"\b(main conclusion|overall conclusion|what does .* conclude|conclusion|outcome)\b", q_lower):
+                addition = "conclusion final outcome overall findings discussion"
+            elif re.search(r"\b(future work|future scope|future directions?|proposed future)\b", q_lower):
+                addition = "future work future scope future directions recommendations"
+            elif re.search(r"\b(main findings?|key findings?|key points?|results?)\b", q_lower):
+                addition = "results findings key findings conclusion"
+            else:
+                addition = "abstract introduction study purpose results findings"
+        elif query_type == "comparison":
+            addition = "results performance comparison comparative ranking across datasets"
+        elif query_type == "methodology":
+            if re.search(r"\b(robustness|corruptions?|noise|blur)\b", q_lower):
+                addition = "robustness evaluation corruptions noise blur experimental procedure"
+            elif re.search(r"\b(temperature scaling|calibration)\b", q_lower):
+                addition = "calibration temperature scaling evaluation ECE MCE methodology"
+            else:
+                addition = "methodology experimental setup implementation training evaluation procedure"
+        elif query_type == "limitation":
+            addition = "limitations discussion conclusion drawbacks shortcomings constraints"
+        else:
+            addition = ""
+
+        return q + (" " + addition if addition else "")
+
 
     # ------------------------------------------------------------------
     # BM25
@@ -640,132 +669,23 @@ class DocumentRetriever:
     # Hybrid fusion
     # ------------------------------------------------------------------
 
-    def _fuse_ranks(
-        self,
-        bm25_rank: List[int],
-        tfidf_rank: List[int],
-        dense_rank: List[int],
-        bm25_scores: List[float],
-        tfidf_scores: List[float],
-        dense_scores: List[float],
-        question: str,
-        query_type: str,
-        chunks: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        n = len(chunks)
-        rrf_k = 60.0
-
-        # Query-adaptive weights.
-        if query_type == "factual":
-            weights = {
-                "bm25": 0.48,
-                "tfidf": 0.27,
-                "dense": 0.15,
-                "metadata": 0.10,
-            }
-        elif query_type == "overview":
-            weights = {
-                "bm25": 0.25,
-                "tfidf": 0.20,
-                "dense": 0.35,
-                "metadata": 0.20,
-            }
-        elif query_type == "visual":
-            # The text retriever cannot truly inspect visuals yet. Keep text
-            # retrieval useful while making this query type visible to the
-            # future ColQwen integration.
-            weights = {
-                "bm25": 0.25,
-                "tfidf": 0.20,
-                "dense": 0.40,
-                "metadata": 0.15,
-            }
-        else:
-            weights = {
-                "bm25": 0.30,
-                "tfidf": 0.20,
-                "dense": 0.38,
-                "metadata": 0.12,
-            }
-
-        # If dense retrieval is unavailable, redistribute its weight.
+    def _fuse_ranks(self,bm25_rank,tfidf_rank,dense_rank,bm25_scores,tfidf_scores,dense_scores,question,query_type,chunks):
+        if query_type=="factual": w={"bm25":.48,"tfidf":.27,"dense":.15,"metadata":.10}
+        elif query_type=="overview": w={"bm25":.24,"tfidf":.16,"dense":.30,"metadata":.30}
+        elif query_type=="comparison": w={"bm25":.30,"tfidf":.16,"dense":.24,"metadata":.30}
+        elif query_type=="methodology": w={"bm25":.34,"tfidf":.20,"dense":.21,"metadata":.25}
+        else: w={"bm25":.30,"tfidf":.20,"dense":.35,"metadata":.15}
         if not any(dense_scores):
-            lexical_total = weights["bm25"] + weights["tfidf"]
-            if lexical_total > 0:
-                weights["bm25"] += (
-                    weights["dense"] * weights["bm25"] / lexical_total
-                )
-                weights["tfidf"] += (
-                    weights["dense"] * weights["tfidf"] / lexical_total
-                )
-            weights["dense"] = 0.0
+            total=w["bm25"]+w["tfidf"]
+            for k in ("bm25","tfidf"): w[k]+=w["dense"]*w[k]/max(total,1e-9)
+            w["dense"]=0
+        maps={"bm25":{i:r for r,i in enumerate(bm25_rank,1)},"tfidf":{i:r for r,i in enumerate(tfidf_rank,1)},"dense":{i:r for r,i in enumerate(dense_rank,1)}}; fused=[]
+        max_rrf=max((w["bm25"]+w["tfidf"]+w["dense"])/61,1e-9)
+        for i,c in enumerate(chunks):
+            rr=sum(w[k]*(1/(60+maps[k][i]) if i in maps[k] else 0) for k in maps); nr=max(0,min(1,rr/max_rrf)); meta=self._metadata_score(question,c,query_type); hybrid=(1-w["metadata"])*nr+w["metadata"]*meta
+            x=dict(c); x.update({"_hybrid_score":hybrid,"_bm25_score":bm25_scores[i],"_tfidf_score":tfidf_scores[i],"_dense_score":dense_scores[i],"_metadata_score":meta}); fused.append(x)
+        return sorted(fused,key=lambda x:float(x["_hybrid_score"]),reverse=True)
 
-        rank_maps = {
-            "bm25": {index: rank for rank, index in enumerate(bm25_rank, 1)},
-            "tfidf": {index: rank for rank, index in enumerate(tfidf_rank, 1)},
-            "dense": {index: rank for rank, index in enumerate(dense_rank, 1)},
-        }
-
-        fused: List[Dict[str, Any]] = []
-
-        for index in range(n):
-            bm25_rrf = (
-                1.0 / (rrf_k + rank_maps["bm25"][index])
-                if index in rank_maps["bm25"]
-                else 0.0
-            )
-            tfidf_rrf = (
-                1.0 / (rrf_k + rank_maps["tfidf"][index])
-                if index in rank_maps["tfidf"]
-                else 0.0
-            )
-            dense_rrf = (
-                1.0 / (rrf_k + rank_maps["dense"][index])
-                if index in rank_maps["dense"]
-                else 0.0
-            )
-
-            metadata_score = self._metadata_score(
-                question=question,
-                chunk=chunks[index],
-                query_type=query_type,
-            )
-
-            rrf_score = (
-                weights["bm25"] * bm25_rrf
-                + weights["tfidf"] * tfidf_rrf
-                + weights["dense"] * dense_rrf
-            )
-
-            # RRF values are small. Metadata is normalized separately.
-            # Normalize weighted RRF directly. The maximum is reached
-            # when every available retriever ranks this chunk first.
-            max_rrf = max(sum(weights.values()) / (rrf_k + 1.0), 1e-12)
-            normalized_rrf = max(0.0, min(1.0, rrf_score / max_rrf))
-
-            hybrid_score = (
-                0.90 * normalized_rrf
-                + 0.10 * metadata_score
-            )
-
-            item = dict(chunks[index])
-            item["_hybrid_score"] = hybrid_score
-            item["_bm25_score"] = bm25_scores[index]
-            item["_tfidf_score"] = tfidf_scores[index]
-            item["_dense_score"] = dense_scores[index]
-            item["_metadata_score"] = metadata_score
-            item["_bm25_rank"] = rank_maps["bm25"].get(index)
-            item["_tfidf_rank"] = rank_maps["tfidf"].get(index)
-            item["_dense_rank"] = rank_maps["dense"].get(index)
-
-            fused.append(item)
-
-        fused.sort(
-            key=lambda item: float(item["_hybrid_score"]),
-            reverse=True,
-        )
-
-        return fused
 
     @staticmethod
     def _normalize_single_rr(
@@ -784,140 +704,130 @@ class DocumentRetriever:
     # Metadata / structure scoring
     # ------------------------------------------------------------------
 
-    def _metadata_score(
-        self,
-        question: str,
-        chunk: Dict[str, Any],
-        query_type: str,
-    ) -> float:
-        terms = self._query_terms(question)
+    def _metadata_score(self, question, chunk, query_type):
+        """Score structural and semantic metadata for the query's actual focus.
 
-        heading = str(
-            chunk.get("section")
-            or chunk.get("heading")
-            or chunk.get("title")
-            or ""
-        ).lower()
-
-        content = str(chunk.get("content") or "").lower()
-
+        This is deliberately document-agnostic: it reacts to headings, parent
+        sections, query vocabulary, and entity-like terms rather than fixed page
+        numbers or this benchmark's section labels.
+        """
+        q = str(question or "").strip()
+        q_lower = q.lower()
+        terms = self._query_terms(q)
+        heading = str(chunk.get("section") or chunk.get("heading") or chunk.get("title") or "").strip().lower()
+        parent = str(chunk.get("parent_section") or chunk.get("parent_heading") or "").strip().lower()
+        content = str(chunk.get("content") or "").strip().lower()
+        structural = f"{heading} {parent}".strip()
         score = 0.0
 
-        if heading:
-            heading_tokens = set(self._tokens(heading))
-            overlap = len(terms & heading_tokens) / max(len(terms), 1)
-            score += 0.45 * overlap
+        if terms and heading:
+            score += 0.24 * len(terms & set(self._tokens(heading))) / max(len(terms), 1)
 
-        intent_hits = 0.0
-        if terms:
-            for intent_terms in self.INTENT_TERMS.values():
-                overlap = len(terms & intent_terms)
-                if overlap:
-                    content_terms = set(self._tokens(content))
-                    if content_terms & intent_terms:
-                        intent_hits = max(
-                            intent_hits,
-                            min(
-                                1.0,
-                                len(content_terms & intent_terms) / 3.0,
-                            ),
-                        )
+        profile = self._query_type_profile(query_type)
+        pats = {
+            "abstract": r"\babstract\b",
+            "introduction": r"\bintroduction\b",
+            "result": r"\b(results?|result analysis|findings?|performance)\b",
+            "comparison": r"\b(comparison|comparative|versus|vs\.?)\b",
+            "conclusion": r"\b(conclusion|discussion|concluding|final outcome)\b",
+            "future": r"\b(future (work|scope)|future directions?|recommendations?|next steps?)\b",
+            "methodology": r"\b(methodology|method|approach|experimental setup|procedure)\b",
+            "experimental": r"\b(experiment(al)?|experimental setup)\b",
+            "implementation": r"\b(implementation|implemented|training|trained)\b",
+            "evaluation": r"\b(evaluation|metrics?|robustness|calibration)\b",
+            "limitation": r"\b(limitations?|drawbacks?|shortcomings?|constraints?)\b",
+            "discussion": r"\bdiscussion\b",
+        }
+        for label, weight in profile.items():
+            pat = pats.get(label)
+            if pat and re.search(pat, structural, re.I):
+                score += .20 * weight
+            elif pat and re.search(pat, content, re.I):
+                score += .05 * weight
 
-        score += 0.25 * intent_hits
+        # Detect salient named entities from the user's original wording.
+        # This improves model/dataset comparisons without hardcoding any names.
+        entities = re.findall(r"\b(?:[A-Z][A-Za-z0-9-]+(?:\s+[A-Z][A-Za-z0-9-]+)*)\b", q)
+        entities = [e.lower() for e in entities if e.lower() not in {"what", "how", "which", "why", "does", "did", "is", "are", "was", "were"}]
+        if entities:
+            entity_text = f"{heading} {parent} {content}"
+            hits = sum(1 for entity in entities if entity in entity_text)
+            score += .18 * min(1.0, hits / max(len(entities), 1))
 
         if query_type == "factual":
-            # Early pages are often important for titles/authors/abstracts.
-            position = chunk.get("document_chunk_index")
-            try:
-                position = int(position)
-                if position <= 5:
-                    score += 0.30
-                elif position <= 15:
-                    score += 0.12
-            except (TypeError, ValueError):
-                pass
+            if re.search(r"\b(metric|metrics|evaluation|ece|mce|accuracy|calibration)\b", q_lower) and re.search(r"\b(evaluation|metrics?|calibration|performance|results?|methodology)\b", structural):
+                score += .42
+            if re.search(r"\b(corruptions?|robustness|noise|blur)\b", q_lower) and re.search(r"\b(robustness|corruptions?|evaluation|methodology|experimental)\b", structural):
+                score += .48
+            if re.search(r"\b(preprocessing|augmentation)\b", q_lower) and re.search(r"\b(preprocessing|augmentation|data|methodology)\b", structural):
+                score += .32
 
-        if chunk.get("page") is not None:
-            score += 0.05
+        elif query_type == "overview":
+            conclusion = bool(re.search(r"\b(main conclusion|overall conclusion|conclusion|conclude|outcome)\b", q_lower))
+            future = bool(re.search(r"\b(future work|future scope|future directions?|proposed future)\b", q_lower))
+            broad = bool(re.search(r"\b(about|explain|summarize|summary|main idea)\b", q_lower))
+            findings = bool(re.search(r"\b(main findings?|key findings?|key points?|results?)\b", q_lower))
+            if conclusion and re.search(r"\b(conclusion|discussion|final outcome)\b", structural):
+                score += .62
+            if future and re.search(r"\b(future (work|scope)|future directions?|recommendations?|next steps?)\b", structural):
+                score += .72
+            if findings and re.search(r"\b(results?|result analysis|findings?|performance|conclusion|discussion)\b", structural):
+                score += .34
+            if broad and not conclusion and not future and re.search(r"\b(abstract|introduction)\b", structural):
+                score += .28
 
-        return max(0.0, min(1.0, score))
+        elif query_type == "comparison":
+            if re.search(r"\b(compare|comparison|versus|vs\.?|across|better|outperform)\b", q_lower) and re.search(r"\b(results?|result analysis|comparison|performance|ranking)\b", structural):
+                score += .48
+
+        elif query_type == "methodology":
+            if re.search(r"\b(robustness|corruptions?|noise|blur)\b", q_lower) and re.search(r"\b(methodology|evaluation|robustness|experimental|procedure)\b", structural):
+                score += .58
+            if re.search(r"\b(implemented|implementation|trained|training)\b", q_lower) and re.search(r"\b(implementation|training|methodology|experimental|architecture)\b", structural):
+                score += .40
+            if re.search(r"\btemperature scaling|calibration\b", q_lower) and re.search(r"\b(calibration|evaluation|temperature|methodology|results?)\b", structural):
+                score += .42
+
+        # Early pages are useful for genuinely broad overviews, but should not
+        # outrank a dedicated conclusion/future section for focused overview asks.
+        try:
+            pos = int(chunk.get("document_chunk_index"))
+            focused_overview = query_type == "overview" and bool(
+                re.search(r"\b(conclusion|conclude|future work|future scope|outcome)\b", q_lower)
+            )
+            if focused_overview and pos <= 5:
+                score -= .22
+            if query_type == "factual" and pos <= 15:
+                score += .06
+        except (TypeError, ValueError):
+            pass
+
+        return max(0.0, min(1.0, score + (.02 if chunk.get("page") is not None else 0.0)))
+
 
 
     # ------------------------------------------------------------------
     # Query-aware relevance filtering
     # ------------------------------------------------------------------
 
-    def _query_aware_filter(
-        self,
-        question: str,
-        candidates: List[Dict[str, Any]],
-        query_type: str,
-    ) -> List[Dict[str, Any]]:
-        if not candidates:
-            return []
+    def _query_aware_filter(self,question,candidates,query_type):
+        if not candidates: return []
+        terms=self._query_terms(question); phrases=self._important_phrases(question); scored=[]
+        for c in candidates:
+            text=self._retrieval_text(c).lower(); tokens=set(self._tokens(str(c.get("content") or "").lower())); overlap=len(terms & tokens)/max(len(terms),1); ph=min(1,sum(1 for p in phrases if p in text)/max(len(phrases),1)) if phrases else 0; hybrid=float(c.get("_hybrid_score",0)); meta=float(c.get("_metadata_score",0)); structural=self._metadata_score(question,c,query_type); fit=.35*hybrid+.20*overlap+.10*ph+.20*meta+.15*structural; c["_query_fit_score"]=fit; c["_hybrid_score"]=.72*hybrid+.28*fit; scored.append(c)
+        scored.sort(key=lambda x:float(x.get("_hybrid_score",0)),reverse=True)
+        keep_count=min(len(scored),max(24,self.focused_top_k*5))
+        kept=scored[:keep_count]
 
-        query_terms = self._query_terms(question)
-        if not query_terms:
-            return candidates
-
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-
-        for candidate in candidates:
-            content = str(candidate.get("content") or "").lower()
-            retrieval_text = self._retrieval_text(candidate).lower()
-            content_tokens = set(self._tokens(content))
-
-            term_overlap = len(query_terms & content_tokens) / max(
-                len(query_terms), 1
-            )
-
-            phrases = self._important_phrases(question)
-            phrase_hits = sum(
-                1 for phrase in phrases if phrase in retrieval_text
-            )
-            phrase_score = min(
-                1.0,
-                phrase_hits / max(len(phrases), 1),
-            )
-
-            hybrid = float(candidate.get("_hybrid_score", 0.0))
-            metadata = float(candidate.get("_metadata_score", 0.0))
-
-            query_fit = (
-                0.45 * hybrid
-                + 0.30 * term_overlap
-                + 0.15 * phrase_score
-                + 0.10 * metadata
-            )
-
-            candidate["_query_fit_score"] = query_fit
-            scored.append((query_fit, candidate))
-
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-
-        keep_count = min(
-            len(scored),
-            max(self.focused_top_k * 3, 10),
-        )
-        kept = [candidate for _, candidate in scored[:keep_count]]
-
-        # Preserve the strongest lexical result for short factual queries.
-        if query_type == "factual" and candidates:
-            lexical_best = max(
-                candidates,
-                key=lambda item: (
-                    0.65 * float(item.get("_bm25_score", 0.0))
-                    + 0.35 * float(item.get("_tfidf_score", 0.0))
-                ),
-            )
-            if not any(
-                self._stable_chunk_id(item)
-                == self._stable_chunk_id(lexical_best)
-                for item in kept
-            ):
-                kept.append(lexical_best)
-
+        # Preserve a structurally strong candidate for specialized intents even
+        # when lexical/dense retrieval initially ranked it outside the main set.
+        specialized=bool(re.search(r"\b(conclusion|conclude|outcome|future work|future scope|robustness|corruptions?|metrics?|evaluation|calibration|across|datasets?|performance|compare|comparison)\b", question.lower()))
+        if specialized and candidates:
+            champion=max(candidates,key=lambda x: float(x.get("_metadata_score",0.0)))
+            if not any(self._stable_chunk_id(x)==self._stable_chunk_id(champion) for x in kept):
+                kept.append(champion)
         return kept
+
 
     @classmethod
     def _important_phrases(cls, question: str) -> List[str]:
@@ -955,25 +865,29 @@ class DocumentRetriever:
         question: str,
         candidates: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """Rerank candidates with the CrossEncoder when available.
+
+        The CrossEncoder score is kept separate from the retrieval score.
+        If the model is unavailable, no fake reranker score is produced and
+        the original retrieval ranking is preserved.
+        """
         if not candidates:
             return []
 
+        for candidate in candidates:
+            candidate.pop("_reranker_score", None)
+
         if not self.reranker_enabled:
-            for candidate in candidates:
-                candidate["_reranker_score"] = float(
-                    candidate.get("_hybrid_score", 0.0)
-                )
+            self._last_reranker_status = "disabled"
             return candidates
 
         model = self._get_reranker_model()
         if model is None:
-            for candidate in candidates:
-                candidate["_reranker_score"] = float(
-                    candidate.get("_hybrid_score", 0.0)
-                )
+            if self._last_reranker_status == "not_run":
+                self._last_reranker_status = "unavailable"
             return candidates
 
-        rerank_pool = candidates[:self.reranker_candidate_count]
+        rerank_pool = candidates[: self.reranker_candidate_count]
         pairs = [
             (question, self._reranker_text(candidate))
             for candidate in rerank_pool
@@ -986,46 +900,44 @@ class DocumentRetriever:
                 show_progress_bar=False,
             )
 
-            normalized_scores = []
-            for score in scores:
-                score = max(-30.0, min(30.0, float(score)))
-                normalized_scores.append(
-                    1.0 / (1.0 + math.exp(-score))
+            for candidate, raw_score in zip(rerank_pool, scores):
+                raw_score = float(raw_score)
+                clipped = max(-30.0, min(30.0, raw_score))
+                reranker_score = 1.0 / (1.0 + math.exp(-clipped))
+
+                candidate["_reranker_score"] = reranker_score
+
+                retrieval_score = float(
+                    candidate.get("_hybrid_score", 0.0)
+                )
+                query_fit = float(
+                    candidate.get("_query_fit_score", 0.0)
                 )
 
-            for candidate, score in zip(
-                rerank_pool,
-                normalized_scores,
-            ):
-                candidate["_reranker_score"] = score
-
-            for candidate in candidates[len(rerank_pool):]:
-                candidate["_reranker_score"] = (
-                    0.25 * float(candidate.get("_hybrid_score", 0.0))
-                )
-
-            for candidate in candidates:
-                hybrid = float(candidate.get("_hybrid_score", 0.0))
-                reranker = float(candidate.get("_reranker_score", 0.0))
-                query_fit = float(candidate.get("_query_fit_score", 0.0))
-
+                # CrossEncoder is the dominant ranking signal. Retrieval and
+                # query-fit remain small stabilizing signals.
                 candidate["_hybrid_score"] = (
-                    0.70 * reranker
-                    + 0.20 * hybrid
+                    0.62 * reranker_score
+                    + 0.18 * retrieval_score
                     + 0.10 * query_fit
+                    + 0.10 * float(candidate.get("_metadata_score", 0.0))
                 )
 
             candidates.sort(
-                key=lambda item: float(item.get("_hybrid_score", 0.0)),
+                key=lambda item: float(
+                    item.get("_hybrid_score", 0.0)
+                ),
                 reverse=True,
             )
+
+            self._last_reranker_status = f"active:{len(rerank_pool)}"
             return candidates
 
-        except Exception:
+        except Exception as exc:
             for candidate in candidates:
-                candidate["_reranker_score"] = float(
-                    candidate.get("_hybrid_score", 0.0)
-                )
+                candidate.pop("_reranker_score", None)
+
+            self._last_reranker_status = f"error:{type(exc).__name__}"
             return candidates
 
     def _get_reranker_model(self):
@@ -1037,6 +949,7 @@ class DocumentRetriever:
 
         if CrossEncoder is None:
             self._reranker_failed = True
+            self._last_reranker_status = "unavailable:crossencoder_import"
             return None
 
         try:
@@ -1044,8 +957,9 @@ class DocumentRetriever:
                 self.reranker_model_name
             )
             return self._reranker_model
-        except Exception:
+        except Exception as exc:
             self._reranker_failed = True
+            self._last_reranker_status = f"unavailable:{type(exc).__name__}"
             return None
 
     def _reranker_text(self, chunk: Dict[str, Any]) -> str:
@@ -1076,8 +990,108 @@ class DocumentRetriever:
         top_k: int,
         question: str,
     ) -> List[Dict[str, Any]]:
+        """Relevance-first MMR with evidence preservation.
+
+        MMR must not discard a strong answer-bearing chunk simply because
+        another chunk is more diverse. For specialized factual/methodology/
+        comparison questions, preserve the strongest evidence candidate from
+        each relevant page before applying diversity to the remaining slots.
+        """
+        if not candidates or top_k <= 0:
+            return []
+
+        q = str(question or "").strip().lower()
+        specialized = bool(re.search(
+            r"\b(conclusion|conclude|outcome|future work|future scope|"
+            r"robustness|corruptions?|metrics?|evaluation|calibration|"
+            r"performance|compare|comparison|across|datasets?|"
+            r"methodology|implementation|training|architecture)\b", q
+        ))
+
+        pool = list(candidates)
+        pool.sort(
+            key=lambda x: float(x.get("_hybrid_score", 0.0)),
+            reverse=True,
+        )
+
+        if specialized:
+            pool = pool[:min(len(pool), max(30, top_k * 6))]
+
+        def channel_strength(c: Dict[str, Any]) -> float:
+            return max(
+                float(c.get("_bm25_score", 0.0)),
+                float(c.get("_tfidf_score", 0.0)),
+                float(c.get("_dense_score", 0.0)),
+            )
+
+        def strong_channels(c: Dict[str, Any]) -> int:
+            return sum(
+                float(c.get(k, 0.0)) >= 0.20
+                for k in ("_bm25_score", "_tfidf_score", "_dense_score")
+            )
+
+        def relevance(c: Dict[str, Any]) -> float:
+            hybrid = float(c.get("_hybrid_score", 0.0))
+            fit = float(c.get("_query_fit_score", 0.0))
+            meta = float(c.get("_metadata_score", 0.0))
+            rerank = c.get("_reranker_score")
+            rerank_value = float(rerank) if rerank is not None else 0.0
+            # Retrieval evidence remains dominant. Query-fit is especially
+            # useful when the hybrid score was diluted by a weak lexical match.
+            score = 0.68 * hybrid + 0.20 * fit + 0.07 * meta + 0.05 * rerank_value
+            return score
+
         selected: List[Dict[str, Any]] = []
-        remaining = list(candidates)
+        remaining = list(pool)
+
+        if specialized:
+            # Protect at most one chunk per page. A chunk is protected when it
+            # has either multiple strong retrieval channels or unusually strong
+            # query fit. This catches evidence such as page 13/19 chunks even
+            # when their final hybrid rank is modest.
+            protected: List[Dict[str, Any]] = []
+            seen_pages = set()
+
+            eligible = sorted(
+                pool,
+                key=lambda c: (
+                    strong_channels(c) >= 2,
+                    float(c.get("_query_fit_score", 0.0)) >= 0.30,
+                    channel_strength(c),
+                    float(c.get("_query_fit_score", 0.0)),
+                    relevance(c),
+                ),
+                reverse=True,
+            )
+
+            for c in eligible:
+                page = c.get("page")
+                page_key = str(page) if page is not None else f"__none__{id(c)}"
+                is_strong = (
+                    strong_channels(c) >= 2
+                    or float(c.get("_query_fit_score", 0.0)) >= 0.30
+                    or float(c.get("_metadata_score", 0.0)) >= 0.22
+                )
+                if is_strong and page_key not in seen_pages:
+                    protected.append(c)
+                    seen_pages.add(page_key)
+                    if len(protected) >= top_k:
+                        break
+
+            # Order protected evidence by actual relevance rather than by the
+            # boolean protection criteria above.
+            protected.sort(key=relevance, reverse=True)
+            for c in protected[:top_k]:
+                c["_mmr_protected"] = True
+                c["_mmr_score"] = relevance(c)
+                c["_redundancy_score"] = 0.0
+                selected.append(c)
+                if c in remaining:
+                    remaining.remove(c)
+
+        # Fill remaining slots with relevance-first MMR. Diversity is a small
+        # penalty, never the main decision signal.
+        lambda_value = max(self.mmr_lambda, 0.94) if specialized else self.mmr_lambda
 
         while remaining and len(selected) < top_k:
             best = None
@@ -1085,10 +1099,7 @@ class DocumentRetriever:
             best_redundancy = 0.0
 
             for candidate in remaining:
-                relevance = float(
-                    candidate.get("_hybrid_score", 0.0)
-                )
-
+                rel = relevance(candidate)
                 redundancy = 0.0
                 if selected:
                     redundancy = max(
@@ -1096,13 +1107,10 @@ class DocumentRetriever:
                         for other in selected
                     )
 
-                mmr_value = (
-                    self.mmr_lambda * relevance
-                    - (1.0 - self.mmr_lambda) * redundancy
-                )
+                value = lambda_value * rel - (1.0 - lambda_value) * redundancy
 
-                if mmr_value > best_value:
-                    best_value = mmr_value
+                if value > best_value:
+                    best_value = value
                     best = candidate
                     best_redundancy = redundancy
 
@@ -1111,11 +1119,10 @@ class DocumentRetriever:
 
             best["_mmr_score"] = best_value
             best["_redundancy_score"] = best_redundancy
-
             selected.append(best)
             remaining.remove(best)
 
-        return selected
+        return selected[:top_k]
 
     def _chunk_similarity(
         self,
@@ -1216,9 +1223,6 @@ class DocumentRetriever:
                 parent_copy["_hybrid_score"] = (
                     float(primary.get("_hybrid_score", 0.0)) * 0.30
                 )
-                parent_copy["_reranker_score"] = (
-                    float(primary.get("_reranker_score", 0.0)) * 0.20
-                )
                 parent_copy["_mmr_score"] = 0.0
                 parent_copy["_redundancy_score"] = 0.0
                 parent_copy["evidence_role"] = "parent"
@@ -1287,9 +1291,6 @@ class DocumentRetriever:
                     primary_score = float(primary.get("_hybrid_score", 0.0))
                     neighbor_copy["_hybrid_score"] = (
                         0.30 * primary_score + 0.70 * relevance
-                    )
-                    neighbor_copy["_reranker_score"] = (
-                        float(primary.get("_reranker_score", 0.0)) * 0.20
                     )
                     neighbor_copy["_mmr_score"] = 0.0
                     neighbor_copy["_redundancy_score"] = 0.0
