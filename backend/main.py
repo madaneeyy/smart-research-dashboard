@@ -93,24 +93,74 @@ MAX_CONTEXT_CHARACTERS = int(
 # The embedding model/cache should be reused between requests.
 # ============================================================
 
-hybrid_retriever = HybridRetriever(
-    semantic_weight=0.5,
-    bm25_weight=0.5,
-    rrf_k=60,
-    candidate_multiplier=4,
-    mmr_lambda=0.75,
-    relevance_filter_enabled=True,
-    relevance_threshold=0.30,
-    relevance_relative_threshold=0.70,
-    near_duplicate_threshold=0.92,
-    metadata_bonus_weight=0.08,
-    lexical_bonus_weight=0.12,
-    bm25_presence_bonus=0.04,
-    complementarity_bonus_weight=0.10,
-    protected_primary_count=2,
-    protected_primary_margin=0.08,
-    minimum_results=1,
-)
+# ============================================================
+# LAZY RAG COMPONENT INITIALIZATION
+# ============================================================
+# Keep the heavy ML retrievers out of module-import/startup time.
+# Render Free has limited RAM, so initializing both retrieval stacks
+# before Uvicorn starts can cause SIGKILL / exit 137.
+# Each component is initialized once, on first use, then reused.
+
+_hybrid_retriever = None
+_document_retriever = None
+_evidence_engine = None
+_evidence_validator = None
+
+
+def get_hybrid_retriever():
+    global _hybrid_retriever
+    if _hybrid_retriever is None:
+        _hybrid_retriever = HybridRetriever(
+            semantic_weight=0.5,
+            bm25_weight=0.5,
+            rrf_k=60,
+            candidate_multiplier=4,
+            mmr_lambda=0.75,
+            relevance_filter_enabled=True,
+            relevance_threshold=0.30,
+            relevance_relative_threshold=0.70,
+            near_duplicate_threshold=0.92,
+            metadata_bonus_weight=0.08,
+            lexical_bonus_weight=0.12,
+            bm25_presence_bonus=0.04,
+            complementarity_bonus_weight=0.10,
+            protected_primary_count=2,
+            protected_primary_margin=0.08,
+            minimum_results=1,
+        )
+    return _hybrid_retriever
+
+
+def get_document_retriever():
+    global _document_retriever
+    if _document_retriever is None:
+        _document_retriever = DocumentRetriever(
+            overview_top_k=7,
+            focused_top_k=6,
+            candidate_multiplier=5,
+            mmr_lambda=0.72,
+            profiling_enabled=True,
+        )
+    return _document_retriever
+
+
+def get_evidence_engine():
+    global _evidence_engine
+    if _evidence_engine is None:
+        _evidence_engine = EvidenceEngine(
+            retriever=get_document_retriever(),
+            overview_per_source=2,
+            analysis_per_source=2,
+            max_final_evidence=12,
+        )
+    return _evidence_engine
+
+
+def get_evidence_validator():
+    global _evidence_validator
+    if _evidence_validator is None:
+        _evidence_validator = EvidenceValidator()
+    return _evidence_validator
 
 # The chunker is lightweight and can safely be reused.
 document_chunker = DocumentChunker(
@@ -2578,7 +2628,7 @@ technical terminology. Answer directly and appropriately concisely.
                 )
 
                 github_results = (
-                    hybrid_retriever.retrieve(
+                    get_hybrid_retriever().retrieve(
                         question=retrieval_query,
                         chunks=github_chunks,
                         top_k=min(per_source_k, len(github_chunks)),
@@ -2594,7 +2644,7 @@ technical terminology. Answer directly and appropriately concisely.
                 query_type = str(classification.get("query_type") or "focused").strip().lower()
 
                 upload_results = (
-                    document_retriever.retrieve(
+                    get_document_retriever().retrieve(
                         question=retrieval_query,
                         chunks=upload_chunks,
                         query_type=query_type,
@@ -2693,7 +2743,7 @@ technical terminology. Answer directly and appropriately concisely.
         retrieval_start = _profile_start()
         try:
             if context_scope == "github":
-                retrieved_chunks = hybrid_retriever.retrieve(
+                retrieved_chunks = get_hybrid_retriever().retrieve(
                     question=retrieval_query,
                     chunks=chunks,
                     top_k=min(requested_top_k, len(chunks)),
@@ -2701,14 +2751,14 @@ technical terminology. Answer directly and appropriately concisely.
                 active_retriever_name = "HybridRetriever"
 
             elif context_scope == "document":
-                evidence_result = evidence_engine.retrieve(
+                evidence_result = get_evidence_engine().retrieve(
                     question=retrieval_query,
                     chunks=chunks,
                     document_ids=active_document_ids,
                     top_k=requested_top_k,
                 )
                 retrieved_chunks = list(evidence_result.get("evidence") or [])
-                evidence_validation = evidence_validator.validate(
+                evidence_validation = get_evidence_validator().validate(
                     question=retrieval_query,
                     evidence_result=evidence_result,
                 )
@@ -2729,7 +2779,7 @@ technical terminology. Answer directly and appropriately concisely.
                 pass
 
             else:
-                retrieved_chunks = hybrid_retriever.retrieve(
+                retrieved_chunks = get_hybrid_retriever().retrieve(
                     question=retrieval_query,
                     chunks=chunks,
                     top_k=min(requested_top_k, len(chunks)),
