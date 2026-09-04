@@ -106,7 +106,7 @@ _evidence_validator = None
 def get_hybrid_retriever():
     global _hybrid_retriever
     if _hybrid_retriever is None:
-        from src.services.rag.hybrid_retriever import HybridRetriever
+        from src.services.github_rag.hybrid_retriever import HybridRetriever
         _hybrid_retriever = HybridRetriever(
             semantic_weight=0.5,
             bm25_weight=0.5,
@@ -132,13 +132,21 @@ def get_document_retriever():
     global _document_retriever
     if _document_retriever is None:
         from src.services.document_rag.document_retriever import DocumentRetriever
+
+        reranker_enabled = (
+            os.getenv("RERANKER_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
         _document_retriever = DocumentRetriever(
             overview_top_k=7,
             focused_top_k=6,
             candidate_multiplier=5,
             mmr_lambda=0.72,
+            reranker_enabled=reranker_enabled,
             profiling_enabled=True,
         )
+
     return _document_retriever
 
 
@@ -168,7 +176,7 @@ _uploaded_document_chunker = None
 def get_document_chunker():
     global _document_chunker
     if _document_chunker is None:
-        from src.services.rag.chunker import DocumentChunker
+        from src.services.github_rag.chunker import DocumentChunker
         _document_chunker = DocumentChunker(
             max_chars=1800, min_chars=250, overlap_chars=250
         )

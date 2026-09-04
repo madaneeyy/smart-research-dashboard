@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+
 """
 Independent retrieval layer for uploaded documents.
 
@@ -8,13 +10,13 @@ This module is intentionally separate from the GitHub RAG pipeline.
 Retrieval stack:
     1. BM25 lexical retrieval
     2. TF-IDF lexical retrieval
-    3. Optional dense semantic retrieval via sentence-transformers
+    3. Optional dense semantic retrieval via the shared embedding provider
     4. Query-adaptive reciprocal-rank fusion
     5. Metadata / heading boosts
     6. MMR diversity selection
     7. Context-size protection
 
-Dense retrieval is optional. If sentence-transformers is not installed, the
+Dense retrieval is optional. If the embedding provider is unavailable, the
 retriever still works using BM25 + TF-IDF + lexical/metadata signals.
 
 Public API is kept compatible with the current backend:
@@ -30,9 +32,11 @@ import time
 from collections import Counter, OrderedDict
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
+from ..github_rag.embedding_provider import create_embedding_provider
+
 # Heavy ML dependencies are imported lazily inside the methods that need them.
-# This keeps Render startup lightweight and prevents torch/sentence-transformers
-# from being loaded merely by importing the module.
+# Dense embeddings are provided by embedding_provider.py; the cross-encoder
+# remains lazy-loaded below.
 TfidfVectorizer = None
 cosine_similarity = None
 CrossEncoder = None
@@ -118,7 +122,7 @@ class DocumentRetriever:
         self.dense_batch_size = max(1, int(dense_batch_size))
         self.dense_cache_size = max(1, int(dense_cache_size))
         self.query_embedding_cache_size = max(1, int(query_embedding_cache_size))
-        self._dense_model = None
+        self._embedding_provider = None
         self._dense_failed = False
 
         # In-memory only: no cache files are created.
@@ -562,6 +566,12 @@ class DocumentRetriever:
     # Dense semantic retrieval
     # ------------------------------------------------------------------
 
+    def _get_embedding_provider(self):
+        """Lazily create and reuse the shared embedding provider."""
+        if self._embedding_provider is None:
+            self._embedding_provider = create_embedding_provider()
+        return self._embedding_provider
+
     def _dense_scores(
         self,
         question: str,
@@ -570,53 +580,57 @@ class DocumentRetriever:
         if not self.dense_enabled or self._dense_failed:
             return [0.0] * len(chunks)
 
-        model = self._get_dense_model()
-        if model is None:
-            return [0.0] * len(chunks)
-
         try:
+            provider = self._get_embedding_provider()
             texts = [self._retrieval_text(chunk) for chunk in chunks]
 
-            # Expensive document encoding is cached in memory. Subsequent
-            # questions only need the query embedding.
+            # Preserve the existing in-memory document embedding LRU.
             document_key = self._embedding_cache_key(chunks, texts)
             embeddings = self._dense_embedding_cache.get(document_key)
 
             if embeddings is not None:
                 self._dense_embedding_cache.move_to_end(document_key)
             else:
-                embeddings = model.encode(
-                    texts,
-                    batch_size=self.dense_batch_size,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
+                embeddings = np.asarray(
+                    provider.embed(texts),
+                    dtype=np.float32,
                 )
+
+                if embeddings.ndim == 1:
+                    embeddings = embeddings.reshape(1, -1)
+
+                if len(embeddings) != len(chunks):
+                    raise ValueError(
+                        "Embedding provider returned an unexpected "
+                        "number of document embeddings."
+                    )
+
                 self._dense_embedding_cache[document_key] = embeddings
                 self._dense_embedding_cache.move_to_end(document_key)
+
                 while len(self._dense_embedding_cache) > self.dense_cache_size:
                     self._dense_embedding_cache.popitem(last=False)
 
-            # Small LRU for repeated questions.
+            # Preserve the existing query embedding LRU.
             query_key = question.strip()
             query_embedding = self._query_embedding_cache.get(query_key)
 
             if query_embedding is not None:
                 self._query_embedding_cache.move_to_end(query_key)
             else:
-                query_embedding = model.encode(
-                    [question],
-                    batch_size=1,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                )[0]
+                query_embedding = np.asarray(
+                    provider.embed(question),
+                    dtype=np.float32,
+                ).reshape(-1)
+
                 self._query_embedding_cache[query_key] = query_embedding
                 self._query_embedding_cache.move_to_end(query_key)
+
                 while len(self._query_embedding_cache) > self.query_embedding_cache_size:
                     self._query_embedding_cache.popitem(last=False)
 
-            # Normalized embeddings make dot product equivalent to cosine.
+            # Provider embeddings are normalized, so dot product preserves
+            # the previous cosine-similarity calculation.
             scores = embeddings @ query_embedding
 
             return [
@@ -625,6 +639,8 @@ class DocumentRetriever:
             ]
 
         except Exception:
+            # Preserve the original graceful fallback: lexical retrieval
+            # continues if dense embedding generation is unavailable.
             return [0.0] * len(chunks)
 
     @staticmethod
@@ -647,25 +663,6 @@ class DocumentRetriever:
             hasher.update(b"\\0")
 
         return hasher.hexdigest()
-
-    def _get_dense_model(self):
-        if self._dense_model is not None:
-            return self._dense_model
-
-        if self._dense_failed:
-            return None
-
-        try:
-            from sentence_transformers import SentenceTransformer
-
-            self._dense_model = SentenceTransformer(
-                self.dense_model_name
-            )
-            return self._dense_model
-
-        except Exception:
-            self._dense_failed = True
-            return None
 
     # ------------------------------------------------------------------
     # Hybrid fusion

@@ -1,23 +1,26 @@
 from functools import lru_cache
 
-from sentence_transformers import SentenceTransformer
+from src.services.github_rag.embedding_provider import create_embedding_provider
 
 
 class SemanticSearch:
     """
     Generate semantic embeddings and calculate similarity
     between a search query and research items.
+
+    Embeddings are generated through the shared embedding provider,
+    which can use the configured remote Hugging Face provider.
     """
 
     MODEL_NAME = "all-MiniLM-L6-v2"
 
     @classmethod
     @lru_cache(maxsize=1)
-    def _get_model(cls) -> SentenceTransformer:
+    def _get_embedding_provider(cls):
         """
-        Load the embedding model once and reuse it.
+        Create and reuse the shared embedding provider.
         """
-        return SentenceTransformer(cls.MODEL_NAME)
+        return create_embedding_provider()
 
     @staticmethod
     def _build_text(result) -> str:
@@ -81,23 +84,21 @@ class SemanticSearch:
         if not results:
             return []
 
-        model = cls._get_model()
+        provider = cls._get_embedding_provider()
 
-        query_embedding = model.encode(
-            query,
-            normalize_embeddings=True,
-        )
+        # Generate normalized query embedding.
+        query_embedding = provider.embed([query])[0]
 
         result_texts = [
             cls._build_text(result)
             for result in results
         ]
 
-        result_embeddings = model.encode(
-            result_texts,
-            normalize_embeddings=True,
-        )
+        # Generate normalized result embeddings.
+        result_embeddings = provider.embed(result_texts)
 
+        # Because embeddings are normalized, dot product is
+        # equivalent to cosine similarity.
         scores = (
             result_embeddings
             @ query_embedding
@@ -111,3 +112,4 @@ class SemanticSearch:
         ]
 
         return normalized_scores
+

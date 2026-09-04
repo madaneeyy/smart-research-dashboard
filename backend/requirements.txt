@@ -6,6 +6,7 @@ supabase
 ollama
 python-multipart
 requests
+httpx
 # Document processing
 pypdf
 PyMuPDF
@@ -14,5 +15,7 @@ openpyxl
 python-pptx
 
 # RAG / retrieval
+numpy
+rank-bm25
 scikit-learn
-sentence-transformers
+huggingface_hub
