@@ -417,7 +417,6 @@ screenshots/
 
 ## Dashboard
 
-Add your dashboard screenshot here:
 
 ```markdown
 ![Dashboard](screenshots/overview.png)
@@ -438,7 +437,7 @@ Add your dashboard screenshot here:
 ## GitHub Repository Retrieval
 
 ```markdown
-![GitHub Retrieval](screenshots/chat.png)
+![GitHub Retrieval](screenshots/ai.png)
 ```
 
 ---
