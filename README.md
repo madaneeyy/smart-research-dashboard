@@ -420,25 +420,25 @@ screenshots/
 Add your dashboard screenshot here:
 
 ```markdown
-![Dashboard](screenshots/dashboard.png)
+![Dashboard](screenshots/overview.png)
 ```
 
 ## Research Answer
 
 ```markdown
-![Research Answer](screenshots/research-answer.png)
+![Research Answer](screenshots/chat.png)
 ```
 
 ## Evidence and Sources
 
 ```markdown
-![Evidence Panel](screenshots/evidence-panel.png)
+![Evidence Panel](screenshots/sources.png)
 ```
 
 ## GitHub Repository Retrieval
 
 ```markdown
-![GitHub Retrieval](screenshots/github-retrieval.png)
+![GitHub Retrieval](screenshots/chat.png)
 ```
 
 ---
