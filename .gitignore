@@ -223,6 +223,7 @@ __marimo__/
 src/services/github_rag/cache/models/
 src/services/rag/cache/*.npy
 src/services/document_rag/cache/
+src/services/github_rag/cache/
 
 # GitHub indexing / retrieval cache
 src/services/github/cache/
