@@ -415,32 +415,25 @@ screenshots/
 └── github-retrieval.png
 ```
 
+# Screenshots
+
+Application screenshots are stored in the `screenshots/` directory.
+
 ## Dashboard
 
-
-```markdown
-![Dashboard](screenshots/overview.png)
-```
+![Dashboard](./screenshots/overview.png)
 
 ## Research Answer
 
-```markdown
-![Research Answer](screenshots/chat.png)
-```
+![Research Answer](./screenshots/chat.png)
 
 ## Evidence and Sources
 
-```markdown
-![Evidence Panel](screenshots/sources.png)
-```
+![Evidence Panel](./screenshots/sources.png)
 
 ## GitHub Repository Retrieval
 
-```markdown
-![GitHub Retrieval](screenshots/ai.png)
-```
-
----
+![GitHub Retrieval](./screenshots/ai.png)
 
 # High-Level Architecture
 
