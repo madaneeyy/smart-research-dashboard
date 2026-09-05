@@ -22,6 +22,7 @@ from backend.routes.source import (
     workspace_source_router,
 )
 from backend.routes.research import router as research_router
+from backend.routes.activity import router as activity_router
 from backend.services.workspace_document_service import (
     create_workspace_document,
     get_workspace_document,
@@ -206,6 +207,7 @@ app.include_router(source_router)
 app.include_router(workspace_source_router)
 app.include_router(chat_router)
 app.include_router(research_router)
+app.include_router(activity_router)
 # ============================================================
 # CORS
 # ============================================================
