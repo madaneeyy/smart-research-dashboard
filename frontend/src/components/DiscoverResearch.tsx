@@ -19,6 +19,7 @@ import {
   addResearchSourceToWorkspace,
   getWorkspaceSources,
   searchResearch,
+  tryRecordWorkspaceActivity,
   type ResearchItem,
   type Workspace,
 } from "../lib/api";
@@ -235,6 +236,19 @@ export function DiscoverResearch({
           searchMode,
         });
 
+      void tryRecordWorkspaceActivity(workspace.id, {
+        activity_type: "research_performed",
+        title: "Research performed",
+        description: normalized,
+        reference_type: "research",
+        metadata: {
+          sources: selectedSources,
+          search_mode: searchMode,
+          sort_by: sortBy,
+          result_count: found.length,
+        },
+      });
+
       setResults(found);
     } catch (searchError) {
       setResults([]);
@@ -269,51 +283,74 @@ export function DiscoverResearch({
     setError(null);
 
     try {
-      await addResearchSourceToWorkspace(
-        workspace.id,
-        {
-          source_type: result.source,
-          title: result.title,
-          url: result.url,
-          metadata: {
-            research_id:
-              result.id,
+      const createdSource =
+        await addResearchSourceToWorkspace(
+          workspace.id,
+          {
+            source_type: result.source,
             title: result.title,
-            description:
-              result.description,
-            authors:
-              result.authors,
-            source:
-              result.source,
             url: result.url,
-            published:
-              result.published,
-            updated:
-              result.updated,
-            tags: result.tags,
-            stars:
-              result.stars,
-            forks:
-              result.forks,
-            language:
-              result.language,
-            downloads:
-              result.downloads,
-            likes:
-              result.likes,
-            library:
-              result.library,
-            pipeline_tag:
-              result.pipeline_tag,
-            tasks:
-              result.tasks,
-            conference:
-              result.conference,
-            metadata:
-              result.metadata,
+            metadata: {
+              research_id: result.id,
+              title: result.title,
+              description: result.description,
+              authors: result.authors,
+              source: result.source,
+              url: result.url,
+              published: result.published,
+              updated: result.updated,
+              tags: result.tags,
+              stars: result.stars,
+              forks: result.forks,
+              language: result.language,
+              downloads: result.downloads,
+              likes: result.likes,
+              library: result.library,
+              pipeline_tag: result.pipeline_tag,
+              tasks: result.tasks,
+              conference: result.conference,
+              metadata: result.metadata,
+            },
           },
-        },
-      );
+        );
+
+      const normalizedSourceType = result.source.trim().toLowerCase();
+      const activityConfig =
+        normalizedSourceType === "arxiv" ||
+        normalizedSourceType === "paperswithcode"
+          ? {
+              activity_type: "paper_added" as const,
+              title: "Paper added",
+              reference_type: "paper",
+            }
+          : normalizedSourceType === "huggingface"
+            ? {
+                activity_type: "model_added" as const,
+                title: "Model added",
+                reference_type: "model",
+              }
+            : normalizedSourceType === "github"
+              ? {
+                  activity_type: "repository_added" as const,
+                  title: "Repository added",
+                  reference_type: "repository",
+                }
+              : null;
+
+      if (activityConfig) {
+        void tryRecordWorkspaceActivity(workspace.id, {
+          activity_type: activityConfig.activity_type,
+          title: activityConfig.title,
+          description: result.title,
+          reference_id: createdSource.id,
+          reference_type: activityConfig.reference_type,
+          metadata: {
+            source_type: normalizedSourceType,
+            source_id: result.id,
+            url: result.url,
+          },
+        });
+      }
 
       setAddedSourceKeys(
         (current) => {

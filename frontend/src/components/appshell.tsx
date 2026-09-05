@@ -2,6 +2,8 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import {
   AlertTriangle,
+  ChevronLeft,
+  ChevronRight,
   FileText,
   LayoutDashboard,
   MessageSquare,
@@ -57,64 +59,116 @@ export function AppShell({
     deleteDialogOpen,
     setDeleteDialogOpen,
   ] = useState(false);
+  const [
+    sidebarCollapsed,
+    setSidebarCollapsed,
+  ] = useState(false);
+
+  const [
+    sidebarHovered,
+    setSidebarHovered,
+  ] = useState(false);
+
+  const sidebarExpanded =
+    !sidebarCollapsed || sidebarHovered;
 
   return (
     <div className="flex min-h-screen bg-[var(--paper)] text-[var(--ink)]">
-      <aside className="hidden w-60 shrink-0 flex-col border-r border-[var(--line)] bg-[var(--paper)] lg:flex">
-        <div className="flex h-16 items-center border-b border-[var(--line-soft)] px-4">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-[var(--ink)]">
-              <Sparkles
-                size={14}
-                className="text-[var(--paper)]"
-              />
+      <aside
+        onMouseEnter={() => setSidebarHovered(true)}
+        onMouseLeave={() => setSidebarHovered(false)}
+        className={[
+          "hidden shrink-0 flex-col border-r border-[var(--line)] bg-[var(--paper)] lg:flex",
+          "transition-[width] duration-200 ease-in-out",
+          sidebarExpanded ? "w-60" : "w-16",
+        ].join(" ")}
+      >
+        <div
+          className={[
+            "flex h-16 items-center border-b border-[var(--line-soft)]",
+            sidebarExpanded ? "justify-between px-4" : "justify-center px-2",
+          ].join(" ")}
+        >
+          <div className="flex min-w-0 items-center gap-1.5">
+            <img
+              src="/bujhalogo.png"
+              alt="Bujha AI"
+              className="h-9 w-9 shrink-0 object-contain"
+            />
+
+            {sidebarExpanded && (
+              <span className="truncate font-[var(--font-display)] text-sm font-semibold tracking-[-0.02em]">
+                Bujha AI
+              </span>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setSidebarCollapsed((current) => !current)}
+            className={[
+              "flex h-7 w-7 shrink-0 items-center justify-center rounded-md",
+              "text-[var(--muted)] transition-all duration-200",
+              "hover:bg-[var(--paper-dim)] hover:text-[var(--ink)]",
+              sidebarExpanded ? "" : "absolute ml-12",
+            ].join(" ")}
+            aria-label={sidebarExpanded ? "Collapse sidebar" : "Expand sidebar"}
+            title={sidebarExpanded ? "Collapse sidebar" : "Expand sidebar"}
+          >
+            {sidebarExpanded ? <ChevronLeft size={14} /> : <ChevronRight size={14} />}
+          </button>
+        </div>
+        <div className={sidebarExpanded ? "px-3 py-4" : "px-2 py-4"}>
+          {sidebarExpanded && (
+            <div className="flex items-center justify-between px-2">
+              <p className="font-[var(--font-mono)] text-[9px] uppercase tracking-[0.14em] text-[var(--muted)]">
+                Workspace
+              </p>
+
+              <button
+                type="button"
+                onClick={() => setDeleteDialogOpen(true)}
+                disabled={isDeletingWorkspace}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--muted)] transition-all duration-200 hover:bg-[var(--accent-dim)] hover:text-[var(--accent)] disabled:opacity-40"
+                aria-label="Delete workspace"
+                title="Delete workspace"
+              >
+                <Trash2 size={13} />
+              </button>
             </div>
+          )}
 
-            <span className="font-[var(--font-display)] text-sm font-semibold tracking-tight">
-              Smart Research AI
-            </span>
+          <div
+            className={[
+              "rounded-lg border border-[var(--line)] bg-[var(--paper-dim)]",
+              sidebarCollapsed
+                ? "flex h-10 items-center justify-center p-1.5"
+                : "mt-2 p-3",
+            ].join(" ")}
+            title={!sidebarExpanded ? workspace.name : undefined}
+          >
+            {!sidebarExpanded ? (
+              <span className="font-[var(--font-display)] text-xs font-semibold">
+                {workspace.name.charAt(0).toUpperCase()}
+              </span>
+            ) : (
+              <>
+                <p className="truncate font-[var(--font-display)] text-xs font-semibold">
+                  {workspace.name}
+                </p>
+                <p className="mt-1 truncate font-[var(--font-mono)] text-[9px] text-[var(--muted)]">
+                  Demo workspace
+                </p>
+              </>
+            )}
           </div>
         </div>
-
-        <div className="px-3 py-4">
-          <div className="flex items-center justify-between px-2">
-            <p className="font-[var(--font-mono)] text-[9px] uppercase tracking-[0.14em] text-[var(--muted)]">
-              Workspace
+        <nav className={sidebarExpanded ? "px-3" : "px-2"}>
+          {sidebarExpanded && (
+            <p className="px-2 font-[var(--font-mono)] text-[9px] uppercase tracking-[0.14em] text-[var(--muted)]">
+              Research
             </p>
-
-            <button
-              type="button"
-              onClick={() =>
-                setDeleteDialogOpen(
-                  true,
-                )
-              }
-              disabled={
-                isDeletingWorkspace
-              }
-              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--muted)] transition-all duration-200 hover:bg-[var(--accent-dim)] hover:text-[var(--accent)] disabled:opacity-40"
-              aria-label="Delete workspace"
-              title="Delete workspace"
-            >
-              <Trash2 size={13} />
-            </button>
-          </div>
-
-          <div className="mt-2 rounded-lg border border-[var(--line)] bg-[var(--paper-dim)] p-3">
-            <p className="truncate font-[var(--font-display)] text-xs font-semibold">
-              {workspace.name}
-            </p>
-
-            <p className="mt-1 truncate font-[var(--font-mono)] text-[9px] text-[var(--muted)]">
-              Demo workspace
-            </p>
-          </div>
-        </div>
-
-        <nav className="px-3">
-          <p className="px-2 font-[var(--font-mono)] text-[9px] uppercase tracking-[0.14em] text-[var(--muted)]">
-            Research
-          </p>
+          )}
 
           <div className="mt-2 space-y-1">
             <NavItem
@@ -131,6 +185,7 @@ export function AppShell({
                   "overview",
                 )
               }
+              collapsed={!sidebarExpanded}
             />
 
             <NavItem
@@ -147,6 +202,7 @@ export function AppShell({
                   "sources",
                 )
               }
+              collapsed={!sidebarExpanded}
             />
 
             <NavItem
@@ -161,6 +217,7 @@ export function AppShell({
                   "discover",
                 )
               }
+              collapsed={!sidebarExpanded}
             />
 
             <NavItem
@@ -177,55 +234,52 @@ export function AppShell({
               onClick={() =>
                 onNavigate("chat")
               }
+              collapsed={!sidebarExpanded}
             />
           </div>
         </nav>
 
-        <div className="mt-8 px-3">
-          <p className="px-2 font-[var(--font-mono)] text-[9px] uppercase tracking-[0.14em] text-[var(--muted)]">
-            Recent chats
-          </p>
-
-          <div className="mt-3 rounded-lg border border-dashed border-[var(--line)] px-3 py-4 text-center">
-            <MessageSquare
-              size={15}
-              className="mx-auto text-[var(--muted)]"
-            />
-
-            <p className="mt-2 text-[10px] text-[var(--muted)]">
-              No conversations yet
-            </p>
-          </div>
-        </div>
-
-        <div className="mt-auto border-t border-[var(--line-soft)] p-3">
+        <div
+          className={[
+            "mt-auto border-t border-[var(--line-soft)]",
+            sidebarExpanded ? "p-3" : "p-2",
+          ].join(" ")}
+        >
           <button
             type="button"
-            onClick={() =>
-              setAccountGateOpen(
-                true,
-              )
-            }
-            className="flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-xs font-medium text-[var(--ink-soft)] transition-all duration-200 hover:bg-[var(--paper-dim)] hover:text-[var(--ink)]"
+            onClick={() => setAccountGateOpen(true)}
+            className={[
+              "flex w-full items-center rounded-md py-2.5 text-xs font-medium text-[var(--ink-soft)]",
+              "transition-all duration-200 hover:bg-[var(--paper-dim)] hover:text-[var(--ink)]",
+              sidebarExpanded ? "gap-2 px-3" : "justify-center px-0",
+            ].join(" ")}
+            aria-label="New workspace"
+            title={!sidebarExpanded ? "New workspace" : undefined}
           >
             <Plus size={14} />
-            New workspace
+            {sidebarExpanded && "New workspace"}
           </button>
 
           <button
             type="button"
             onClick={toggleTheme}
-            className="mt-1 flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-xs font-medium text-[var(--ink-soft)] transition-all duration-200 hover:bg-[var(--paper-dim)] hover:text-[var(--ink)]"
+            className={[
+              "mt-1 flex w-full items-center rounded-md py-2.5 text-xs font-medium text-[var(--ink-soft)]",
+              "transition-all duration-200 hover:bg-[var(--paper-dim)] hover:text-[var(--ink)]",
+              sidebarExpanded ? "gap-2 px-3" : "justify-center px-0",
+            ].join(" ")}
+            aria-label={theme === "light" ? "Dark mode" : "Light mode"}
+            title={
+              !sidebarExpanded
+                ? theme === "light"
+                  ? "Dark mode"
+                  : "Light mode"
+                : undefined
+            }
           >
-            {theme === "light" ? (
-              <Moon size={14} />
-            ) : (
-              <Sun size={14} />
-            )}
-
-            {theme === "light"
-              ? "Dark mode"
-              : "Light mode"}
+            {theme === "light" ? <Moon size={14} /> : <Sun size={14} />}
+            {sidebarExpanded &&
+              (theme === "light" ? "Dark mode" : "Light mode")}
           </button>
         </div>
       </aside>
@@ -476,23 +530,27 @@ function NavItem({
   label,
   active,
   onClick,
+  collapsed = false,
 }: {
   icon: ReactNode;
   label: string;
   active: boolean;
   onClick: () => void;
+  collapsed?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       className={[
-        "flex w-full items-center gap-2.5 rounded-md px-3 py-2.5 text-left text-xs font-medium",
+        "flex w-full rounded-md py-2.5 text-left text-xs font-medium",
         "transition-all duration-150",
+        collapsed ? "justify-center px-0" : "items-center gap-2.5 px-3",
         active
           ? "bg-[var(--paper-dim)] text-[var(--ink)]"
           : "text-[var(--ink-soft)] hover:bg-[var(--paper-dim)] hover:text-[var(--ink)]",
       ].join(" ")}
+      title={collapsed ? label : undefined}
     >
       <span
         className={
@@ -504,7 +562,7 @@ function NavItem({
         {icon}
       </span>
 
-      {label}
+      {!collapsed && label}
     </button>
   );
 }

@@ -66,6 +66,35 @@ export interface DocumentPreview {
   content: string;
 }
 
+export type ActivityType =
+  | "document_added"
+  | "paper_added"
+  | "model_added"
+  | "repository_added"
+  | "chat_started"
+  | "research_performed";
+
+export interface WorkspaceActivity {
+  id: string;
+  workspace_id: string;
+  activity_type: ActivityType;
+  title: string;
+  description: string | null;
+  reference_id: string | null;
+  reference_type: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface CreateWorkspaceActivityPayload {
+  activity_type: ActivityType;
+  title: string;
+  description?: string | null;
+  reference_id?: string | null;
+  reference_type?: string | null;
+  metadata?: Record<string, unknown> | null;
+}
+
 /* ============================================================
    Error handling
    ============================================================ */
@@ -174,6 +203,56 @@ export async function deleteWorkspace(
     },
     "Unable to delete workspace.",
   );
+}
+
+/* ============================================================
+   Recent activity
+   ============================================================ */
+
+export async function getWorkspaceActivity(
+  workspaceId: string,
+  limit: number = 8,
+): Promise<WorkspaceActivity[]> {
+  return requestJson<WorkspaceActivity[]>(
+    `${API_BASE_URL}/workspaces/${workspaceId}/activity?limit=${encodeURIComponent(String(limit))}`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    },
+    "Unable to load recent activity.",
+  );
+}
+
+export async function recordWorkspaceActivity(
+  workspaceId: string,
+  payload: CreateWorkspaceActivityPayload,
+): Promise<WorkspaceActivity> {
+  return requestJson<WorkspaceActivity>(
+    `${API_BASE_URL}/workspaces/${workspaceId}/activity`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+    "Unable to record activity.",
+  );
+}
+
+export async function tryRecordWorkspaceActivity(
+  workspaceId: string,
+  payload: CreateWorkspaceActivityPayload,
+): Promise<void> {
+  try {
+    await recordWorkspaceActivity(workspaceId, payload);
+  } catch {
+    // Activity tracking is non-critical. A failed activity write must never
+    // make the user's primary action fail.
+  }
 }
 
 /* ============================================================

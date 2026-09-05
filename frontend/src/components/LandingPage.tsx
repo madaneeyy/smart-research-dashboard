@@ -71,14 +71,16 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
         <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-6 lg:px-8">
           <button
             onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
-            className="group flex items-center gap-2.5"
+            className="group flex items-center gap-0.5"
           >
-            <span className="relative flex h-8 w-8 items-center justify-center rounded-md border border-[var(--ink)] bg-[var(--ink)] transition-transform duration-200 group-hover:scale-[1.05]">
-              <Crosshair size={15} strokeWidth={2} className="text-[var(--paper)]" />
-            </span>
-            <span className="font-[var(--font-display)] text-sm font-semibold tracking-[-0.01em]">
-              Smart Research AI
-            </span>
+            <img
+              src="/bujhalogo.png"
+              alt="Bujha AI"
+              className="h-11 w-11 object-contain transition-transform duration-200 group-hover:scale-[1.05]"
+            />
+             <span className="font-[var(--font-display)] text-sm font-semibold tracking-[-0.02em]">
+               Bujha AI
+             </span>
           </button>
 
           <nav className="hidden items-center gap-7 md:flex">
@@ -154,7 +156,7 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
               {/* Eyebrow */}
               <div className="inline-flex animate-[fadeUp_0.65s_ease-out_both] items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--paper)] px-3.5 py-1.5 font-[var(--font-mono)] text-[11px] uppercase tracking-[0.1em] text-[var(--ink-soft)]">
                 <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
-                Field-tested for research workflows
+                AI-powered research workspace
               </div>
 
               {/* Heading */}
@@ -166,9 +168,9 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
 
               {/* Description */}
               <p className="mx-auto mt-7 max-w-2xl animate-[fadeUp_0.75s_0.16s_ease-out_both] text-base leading-7 text-[var(--ink-soft)] sm:text-lg">
-                Discover research, collect the sources that matter, and ask
-                intelligent questions across your documents and code — all
-                mapped in one place.
+                Discover research, organize the sources that matter, and ask
+                grounded questions across your documents and code — all in one
+                focused workspace.
               </p>
 
               {/* CTA */}
@@ -212,7 +214,7 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
                       <span className="h-2.5 w-2.5 rounded-full border border-[var(--line)]" />
                     </div>
                     <div className="mx-auto hidden rounded-md border border-[var(--line-soft)] bg-[var(--paper-dim)] px-16 py-1.5 font-[var(--font-mono)] text-[10px] text-[var(--muted)] sm:block">
-                      app.smartresearch.ai
+                      app.bujha.ai
                     </div>
                     <span className="ml-auto hidden font-[var(--font-mono)] text-[9px] uppercase tracking-[0.12em] text-[var(--muted)] sm:block">
                       REF—014
@@ -227,7 +229,7 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
                           <Crosshair size={13} className="text-[var(--paper)]" />
                         </div>
                         <span className="font-[var(--font-display)] text-[11px] font-semibold">
-                          Smart Research
+                          Bujha AI
                         </span>
                       </div>
 
@@ -299,7 +301,7 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
                           </div>
                           <div className="min-w-0">
                             <p className="font-[var(--font-mono)] text-[10px] uppercase tracking-[0.1em] text-[var(--muted)]">
-                              Ask your research
+                              Ask your sources
                             </p>
                             <p className="mt-1.5 text-xs leading-5 text-[var(--ink-soft)]">
                               How does the repository implementation differ from
@@ -464,8 +466,12 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
 
         <section>
           <div className="mx-auto max-w-3xl px-6 py-16 text-center lg:px-8">
-            <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-lg border border-[var(--ink)] bg-[var(--ink)] transition-transform duration-300 hover:scale-105">
-              <Crosshair size={17} className="text-[var(--paper)]" />
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--paper)] p-1 transition-transform duration-300 hover:scale-105">
+              <img
+                src="/bujhalogo.png"
+                alt=""
+                className="h-full w-full rounded-lg object-contain"
+              />
             </div>
 
             <h2 className="mt-6 font-[var(--font-display)] text-3xl font-semibold tracking-[-0.02em] sm:text-4xl">
@@ -503,9 +509,9 @@ export function LandingPage({ onTryDemo, onSignIn }: LandingPageProps) {
             <div className="flex h-6 w-6 items-center justify-center rounded-md bg-[var(--ink)]">
               <Crosshair size={12} className="text-[var(--paper)]" />
             </div>
-            <span className="font-[var(--font-display)] text-xs font-semibold">Smart Research AI</span>
+            <span className="font-[var(--font-display)] text-xs font-semibold">Bujha AI</span>
           </div>
-          <p className="font-[var(--font-mono)] text-[11px] text-[var(--muted)]">Research, mapped.</p>
+          <p className="font-[var(--font-mono)] text-[11px] text-[var(--muted)]">Research, understood.</p>
         </div>
       </footer>
 

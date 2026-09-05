@@ -24,6 +24,7 @@ import {
   getWorkspaceDocuments,
   getWorkspaceSources,
   uploadWorkspaceDocument,
+  tryRecordWorkspaceActivity,
   type Workspace,
   type WorkspaceDocument,
   type WorkspaceSource,
@@ -242,8 +243,8 @@ export function SourcesPage({
           item.kind === "document") ||
         (activeFilter === "papers" &&
           item.kind === "source" &&
-          item.source.source_type.toLowerCase() ===
-            "arxiv") ||
+          (item.source.source_type.toLowerCase() === "arxiv" ||
+            item.source.source_type.toLowerCase() === "paperswithcode")) ||
         (activeFilter ===
           "repositories" &&
           item.kind === "source" &&
@@ -296,6 +297,20 @@ export function SourcesPage({
             workspace.id,
             file,
           );
+
+        if (!created.already_exists) {
+          void tryRecordWorkspaceActivity(workspace.id, {
+            activity_type: "document_added",
+            title: "Document added",
+            description: file.name,
+            reference_id: created.document_id,
+            reference_type: "document",
+            metadata: {
+              filename: file.name,
+              content_type: file.type || null,
+            },
+          });
+        }
 
         setDocuments(
           (current) => {

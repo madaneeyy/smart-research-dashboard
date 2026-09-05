@@ -1,16 +1,11 @@
 import { useState } from "react";
-import type { ReactNode } from "react";
 import {
   ArrowLeft,
   ArrowRight,
-  BookOpen,
   Check,
-  FileText,
-  Search,
-  Sparkles,
 } from "lucide-react";
 
-type StartMode = "blank" | "topic" | "file";
+type StartMode = "blank";
 
 interface CreateWorkspacePageProps {
   onBack: () => void;
@@ -31,7 +26,7 @@ export function CreateWorkspacePage({
 }: CreateWorkspacePageProps) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [startMode, setStartMode] =
+  const [startMode] =
     useState<StartMode>("blank");
 
   const canCreate = name.trim().length >= 2;
@@ -54,16 +49,15 @@ export function CreateWorkspacePage({
 
       <header className="border-b border-[var(--line)] bg-[var(--paper)]">
         <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-6 lg:px-8">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-[var(--ink)]">
-              <Sparkles
-                size={15}
-                className="text-[var(--paper)]"
-              />
-            </div>
+          <div className="flex items-center gap-1.5">
+            <img
+              src="/bujhalogo.png"
+              alt="Bujha AI"
+              className="h-9 w-9 object-contain"
+            />
 
-            <span className="font-[var(--font-display)] text-sm font-semibold">
-              Smart Research AI
+            <span className="font-[var(--font-display)] text-sm font-semibold tracking-[-0.02em]">
+              Bujha AI
             </span>
           </div>
 
@@ -267,36 +261,20 @@ export function CreateWorkspacePage({
                     </span>
                   </div>
 
-                  <div className="mt-5 grid gap-3 md:grid-cols-3">
-                    <StartOption
-                      icon={<FileText size={18} />}
-                      title="Blank"
-                      description="Start from scratch."
-                      active={startMode === "blank"}
-                      onClick={() =>
-                        setStartMode("blank")
-                      }
-                    />
-
-                    <StartOption
-                      icon={<Search size={18} />}
-                      title="Research topic"
-                      description="Begin with a question."
-                      active={startMode === "topic"}
-                      onClick={() =>
-                        setStartMode("topic")
-                      }
-                    />
-
-                    <StartOption
-                      icon={<BookOpen size={18} />}
-                      title="Upload files"
-                      description="Start with your documents."
-                      active={startMode === "file"}
-                      onClick={() =>
-                        setStartMode("file")
-                      }
-                    />
+                  <div className="mt-5 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-dim)] p-4">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-white">
+                        <span className="h-2 w-2 rounded-full bg-white" />
+                      </div>
+                      <div>
+                        <p className="font-[var(--font-display)] text-sm font-semibold">
+                          Blank workspace
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-[var(--ink-soft)]">
+                          Start with your workspace and add sources later.
+                        </p>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
@@ -375,73 +353,6 @@ function StepIndicator({
         {label}
       </span>
     </div>
-  );
-}
-
-/* ============================================================
-   START OPTION
-   ============================================================ */
-
-function StartOption({
-  icon,
-  title,
-  description,
-  active,
-  onClick,
-}: {
-  icon: ReactNode;
-  title: string;
-  description: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        "group rounded-xl border p-4 text-left",
-        "transition-all duration-200",
-        active
-          ? "border-[var(--accent)] bg-[var(--accent-dim)] shadow-sm"
-          : "border-[var(--line)] bg-[var(--paper)] hover:-translate-y-px hover:bg-[var(--paper-dim)] hover:shadow-sm",
-      ].join(" ")}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div
-          className={[
-            "flex h-9 w-9 items-center justify-center rounded-lg",
-            "transition-colors duration-200",
-            active
-              ? "bg-[var(--accent)] text-white"
-              : "bg-[var(--paper-dim)] text-[var(--ink-soft)]",
-          ].join(" ")}
-        >
-          {icon}
-        </div>
-
-        <span
-          className={[
-            "flex h-4 w-4 items-center justify-center rounded-full border",
-            active
-              ? "border-[var(--accent)] bg-[var(--accent)]"
-              : "border-[var(--line)]",
-          ].join(" ")}
-        >
-          {active && (
-            <span className="h-1.5 w-1.5 rounded-full bg-white" />
-          )}
-        </span>
-      </div>
-
-      <p className="mt-4 font-[var(--font-display)] text-sm font-semibold">
-        {title}
-      </p>
-
-      <p className="mt-1 text-xs leading-5 text-[var(--ink-soft)]">
-        {description}
-      </p>
-    </button>
   );
 }
 

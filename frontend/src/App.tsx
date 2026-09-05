@@ -416,9 +416,6 @@ function App() {
             onNavigate={
               handleNavigate
             }
-            onCreateWorkspace={
-              handleNewWorkspace
-            }
           />
         )}
 

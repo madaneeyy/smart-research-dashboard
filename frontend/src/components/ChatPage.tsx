@@ -30,6 +30,7 @@ import {
   updateChatTitle,
   uploadWorkspaceDocument,
   streamAsk,
+  tryRecordWorkspaceActivity,
   type Chat,
   type ChatMessage,
   type Workspace,
@@ -227,6 +228,7 @@ export function ChatPage({
     currentChats = chats,
     initialIds: string[] = [],
     initialGithubIds: string[] = [],
+    recordActivity = false,
   ) {
     setError(null);
 
@@ -308,6 +310,19 @@ export function ChatPage({
       setSelectedArxivSourceIds(new Set(initialArxivIds));
       setSelectedGithubSourceIds(new Set(normalizedGithubIds));
       setInput("");
+
+      if (recordActivity) {
+        void tryRecordWorkspaceActivity(workspace.id, {
+          activity_type: "chat_started",
+          title: "Started a new chat",
+          description: result.chat.title || "New Chat",
+          reference_id: chatId,
+          reference_type: "chat",
+          metadata: {
+            source_count: normalizedIds.length + normalizedGithubIds.length,
+          },
+        });
+      }
     } catch (chatError) {
       setError(
         chatError instanceof Error
@@ -783,6 +798,20 @@ export function ChatPage({
         file,
       );
 
+      if (!uploaded.already_exists) {
+        void tryRecordWorkspaceActivity(workspace.id, {
+          activity_type: "document_added",
+          title: "Document added",
+          description: file.name,
+          reference_id: uploaded.document_id,
+          reference_type: "document",
+          metadata: {
+            filename: file.name,
+            content_type: file.type || null,
+          },
+        });
+      }
+
       setDocuments((current) => {
         const existingIndex = current.findIndex(
           (document) =>
@@ -915,7 +944,7 @@ export function ChatPage({
           <div className="border-b border-[var(--line-soft)] p-4">
             <button
               type="button"
-              onClick={() => void createNewChat()}
+              onClick={() => void createNewChat(chats, [], [], true)}
               className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--ink)] px-3 py-2.5 text-xs font-medium text-[var(--paper)] transition-all duration-200 hover:-translate-y-px hover:bg-[var(--accent)] hover:shadow-sm"
             >
               <Plus size={13} />
