@@ -12,7 +12,7 @@ import { DiscoverResearch } from "./components/DiscoverResearch";
 import {
   createWorkspace,
   deleteWorkspace,
-  listWorkspaces,
+  getWorkspace,
   type Workspace,
 } from "./lib/api";
 
@@ -119,90 +119,71 @@ function App() {
      ========================================================== */
 
   const handleTryDemo = async () => {
-  setWorkspaceError(null);
-  setIsRestoringWorkspace(true);
+    setWorkspaceError(null);
+    setIsRestoringWorkspace(true);
 
-  try {
-    /*
-     * Demo always asks the backend for the current
-     * workspaces instead of trusting localStorage.
-     *
-     * This is important for development because a
-     * workspace may have been deleted directly from
-     * Supabase or Swagger.
-     */
+    try {
+      const savedDemoWorkspaceId =
+        window.localStorage.getItem(DEMO_WORKSPACE_KEY);
 
-    const workspaces =
-      await listWorkspaces();
-
-    /*
-     * The backend already returns workspaces ordered
-     * by created_at descending, so the first item is
-     * the most recently created existing workspace.
-     */
-
-    const existingWorkspace =
-      workspaces[0];
-
-    if (!existingWorkspace) {
       /*
-       * No workspace exists anywhere.
-       * Send the user through the first-workspace flow.
+       * If this browser already has a demo workspace,
+       * restore it.
        */
+      if (savedDemoWorkspaceId) {
+        try {
+          const existingWorkspace =
+            await getWorkspace(savedDemoWorkspaceId);
 
-      setCreateWorkspaceReturn(
-        "landing",
+          setWorkspace(existingWorkspace);
+
+          window.localStorage.setItem(
+            ACTIVE_WORKSPACE_KEY,
+            existingWorkspace.id,
+          );
+
+          window.localStorage.setItem(
+            ACTIVE_SECTION_KEY,
+            "overview",
+          );
+
+          setActiveSection("overview");
+          setPage("workspace");
+
+          return;
+        } catch {
+          /*
+           * The saved workspace no longer exists.
+           * Remove the stale browser reference and
+           * show the Create Workspace page again.
+           */
+          window.localStorage.removeItem(
+            DEMO_WORKSPACE_KEY,
+          );
+
+          window.localStorage.removeItem(
+            ACTIVE_WORKSPACE_KEY,
+          );
+        }
+      }
+
+      /*
+       * First demo visit for this browser.
+       * Let the user configure their workspace through
+       * the existing CreateWorkspacePage.
+       */
+      setCreateWorkspaceReturn("landing");
+      setPage("create-workspace");
+    } catch (error) {
+      setWorkspaceError(
+        error instanceof Error
+          ? error.message
+          : "Unable to open the demo workspace.",
       );
-
-      setPage(
-        "create-workspace",
-      );
-
-      return;
+    } finally {
+      setIsRestoringWorkspace(false);
     }
-
-    /*
-     * Open the latest existing workspace.
-     */
-
-    setWorkspace(
-      existingWorkspace,
-    );
-
-    /*
-     * Make this workspace the currently active
-     * workspace for refresh persistence.
-     */
-
-    window.localStorage.setItem(
-      ACTIVE_WORKSPACE_KEY,
-      existingWorkspace.id,
-    );
-
-    /*
-     * Always begin Demo on Overview.
-     */
-
-    window.localStorage.setItem(
-      ACTIVE_SECTION_KEY,
-      "overview",
-    );
-
-    setActiveSection(
-      "overview",
-    );
-
-    setPage("workspace");
-  } catch (error) {
-    setWorkspaceError(
-      error instanceof Error
-        ? error.message
-        : "Unable to open the demo workspace.",
-    );
-  } finally {
-    setIsRestoringWorkspace(false);
-  }
-};
+  };
 
   const handleSignIn = () => {
     console.log("Sign in clicked");
