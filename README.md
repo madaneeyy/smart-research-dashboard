@@ -1,224 +1,184 @@
-# Bujha AI — Smart Research Dashboard
+# Bujha AI
 
-> An AI-powered research workspace for discovering, organizing, retrieving, and querying technical knowledge across research papers, GitHub repositories, ML models, and uploaded documents.
+### Smart Research Dashboard
 
-**Live Demo:** https://bujha.vercel.app/  
-**GitHub:** https://github.com/madaneeyy/smart-research-dashboard
+Bujha AI is a full-stack AI research workspace for discovering, organizing, retrieving, and querying technical knowledge across research papers, GitHub repositories, machine-learning models, and uploaded documents.
 
----
+The system combines multi-source research discovery with a hybrid retrieval pipeline consisting of semantic search, BM25, Reciprocal Rank Fusion, relevance filtering, neural reranking, and MMR-based evidence selection before generating grounded responses.
 
-## Overview
+## Features
 
-Bujha AI is a full-stack AI research assistant designed to help users find, organize, and query technical information from multiple research sources in a single workspace.
+### Research Discovery
 
-Rather than functioning as a generic chatbot, the system combines **research discovery, document processing, repository retrieval, hybrid information retrieval, evidence ranking, and grounded LLM generation**.
+Search and explore technical resources from:
 
-The application supports research workflows across:
+- [arXiv](https://arxiv.org/) — research papers and metadata
+- [GitHub](https://github.com/) — repositories and source code
+- [Papers With Code](https://paperswithcode.com/) — papers, methods, datasets, and paper-code relationships
+- [Hugging Face](https://huggingface.co/) — models and ML resources
 
-- Research papers
-- GitHub repositories and source code
-- Machine learning models
-- Uploaded documents
-- Persistent research workspaces
-- Research-focused conversations
-
-The system is built around a retrieval pipeline that combines **semantic retrieval and lexical BM25 search**, followed by rank fusion, relevance filtering, reranking, and evidence selection before the final response is generated.
-
----
-
-## Key Features
-
-### Multi-Source Research Discovery
-
-Search and discover technical resources from:
-
-- **arXiv** — research papers and metadata
-- **GitHub** — repositories and repository content
-- **PapersWithCode** — papers, methods, datasets, and paper-code relationships
-- **Hugging Face** — models and ML resources
-
-Provider-specific results are normalized into a common research representation so heterogeneous sources can be handled consistently.
-
----
+Results from different providers are normalized into a common research representation while preserving provider-specific metadata.
 
 ### Workspace-Based Research
 
-Research is organized into persistent workspaces.
+Research is organized into persistent workspaces containing:
 
-A workspace can contain:
-
-- Sources
-- Documents
+- Research sources
+- Uploaded documents
 - Papers
 - GitHub repositories
 - Models
 - Chats
 - Recent activity
 
-This allows related research to remain organized rather than being spread across isolated searches and conversations.
+This allows users to keep related research and conversations together instead of managing isolated searches.
 
----
+### Research Chat
 
-### AI-Powered Research Chat
+Users can ask questions against selected sources and documents.
 
-Users can ask research questions against selected sources and documents.
-
-The chat system supports:
+The chat layer supports:
 
 - Persistent conversations
-- Source attachments
-- Document attachments
-- Streamed responses
+- Source and document attachments
+- Streaming responses
 - Retrieval metadata
 - Evidence display
-- Grounded responses
-
-The intended flow is:
-
-```text
-User Question
-     ↓
-Query Classification / Routing
-     ↓
-Retrieve Candidate Evidence
-     ↓
-Rank and Filter
-     ↓
-Select Supporting Evidence
-     ↓
-Build Grounded Context
-     ↓
-LLM Generation
-     ↓
-Response + Evidence
-```
-
----
+- Source attribution
 
 ### Document Processing
 
-Bujha AI supports ingestion of:
+Supported formats:
 
 - PDF
 - DOCX
 - XLSX
 - PPTX
 
-Uploaded content is processed into retrieval-friendly chunks while preserving useful structural information such as:
-
-- Headings
-- Section hierarchy
-- Parent sections
-- Section paths
-- Page information
-- Chunk indices
-- Chunk type
-- File paths
-- Programming language where applicable
-
----
+Documents are processed into retrieval-friendly chunks while preserving structural metadata such as headings, section hierarchy, page information, chunk type, file path, and chunk indices.
 
 ### GitHub Repository Retrieval
 
-GitHub repositories can be incorporated into the research workflow.
+Repositories can be used as research sources without sending an entire repository directly to the LLM.
 
-Instead of sending entire repositories directly to the language model, repository information and source files are acquired, filtered, chunked, and ranked before relevant content is selected.
+Repository content is:
 
-This is especially useful for questions such as:
+1. Acquired
+2. Filtered
+3. Chunked
+4. Made searchable
+5. Ranked
+6. Reduced to relevant evidence
 
-- What does this repository do?
-- How is a particular feature implemented?
-- Where is a specific class or function defined?
-- How does one implementation compare with another?
-- What technical approach does the repository use?
+Caching and fallback acquisition paths are used to reduce unnecessary repeated repository retrieval.
 
-The repository workflow also uses caching and fallback acquisition paths to reduce unnecessary repeated retrieval.
+### Citations
+
+For arXiv-backed research items, Bujha AI can generate:
+
+- APA 7
+- BibTeX
+
+### Recent Activity
+
+Workspace activity is persisted for actions such as:
+
+- Documents added
+- Papers added
+- Models added
+- Repositories added
+- Chats started
+- Research performed
 
 ---
 
 # Architecture
 
 ```text
-                         ┌─────────────────────────────┐
-                         │      React + TypeScript      │
-                         │          Frontend            │
-                         └──────────────┬──────────────┘
-                                        │
-                               HTTP / JSON / Streaming
-                                        │
-                                        ▼
-                         ┌─────────────────────────────┐
-                         │        FastAPI Backend       │
-                         └──────────────┬──────────────┘
-                                        │
-              ┌─────────────────────────┼─────────────────────────┐
-              │                         │                         │
-              ▼                         ▼                         ▼
-      ┌──────────────┐         ┌────────────────┐        ┌────────────────┐
-      │ Workspace    │         │ Research       │        │ Chat / Activity│
-      │ APIs         │         │ APIs           │        │ APIs           │
-      └──────────────┘         └────────────────┘        └────────────────┘
-              │                         │                         │
-              └─────────────────────────┼─────────────────────────┘
-                                        │
-                                        ▼
-                         ┌─────────────────────────────┐
-                         │       Research / RAG        │
-                         │           Layer             │
-                         └──────────────┬──────────────┘
-                                        │
-              ┌─────────────────────────┼─────────────────────────┐
-              │                         │                         │
-              ▼                         ▼                         ▼
-      ┌──────────────┐         ┌────────────────┐        ┌────────────────┐
-      │ Semantic     │         │ BM25 Lexical   │        │ Query Routing  │
-      │ Retrieval    │         │ Retrieval      │        │ & Relevance    │
-      └──────┬───────┘         └───────┬────────┘        └────────────────┘
-             │                         │
-             └──────────────┬──────────┘
-                            ▼
-                    ┌──────────────────┐
-                    │ Reciprocal Rank  │
-                    │ Fusion (RRF)     │
-                    └────────┬─────────┘
-                             ▼
-                    ┌──────────────────┐
-                    │ Relevance        │
-                    │ Filtering        │
-                    └────────┬─────────┘
-                             ▼
-                    ┌──────────────────┐
-                    │ CrossEncoder     │
-                    │ Reranking        │
-                    └────────┬─────────┘
-                             ▼
-                    ┌──────────────────┐
-                    │ MMR Evidence     │
-                    │ Selection        │
-                    └────────┬─────────┘
-                             ▼
-                    ┌──────────────────┐
-                    │ LLM Generation   │
-                    └────────┬─────────┘
-                             ▼
-                    Grounded Response
+┌───────────────────────────────┐
+│       React + TypeScript      │
+│           Frontend            │
+└───────────────┬───────────────┘
+                │
+                │ HTTP / JSON / Streaming
+                ▼
+┌───────────────────────────────┐
+│         FastAPI Backend       │
+└───────────────┬───────────────┘
+                │
+        ┌───────┼────────┬──────────────┐
+        │       │        │              │
+        ▼       ▼        ▼              ▼
+   Workspace Research   Chat        Activity
+      APIs      APIs    APIs           APIs
+        │       │        │              │
+        └───────┴────────┴──────────────┘
+                        │
+                        ▼
+             ┌─────────────────────┐
+             │      RAG Layer      │
+             └──────────┬──────────┘
+                        │
+         ┌──────────────┼──────────────┐
+         │              │              │
+         ▼              ▼              ▼
+    Semantic          BM25         Query Routing
+    Retrieval       Retrieval       & Relevance
+         │              │
+         └───────┬──────┘
+                 ▼
+        Reciprocal Rank Fusion
+                 │
+                 ▼
+        Relevance Filtering
+                 │
+                 ▼
+         CrossEncoder Reranking
+                 │
+                 ▼
+          MMR Evidence Selection
+                 │
+                 ▼
+          Grounded LLM Response
 ```
 
 ---
 
 # Retrieval Pipeline
 
-One of the main engineering components of Bujha AI is its hybrid retrieval pipeline.
+The retrieval pipeline is designed to combine the strengths of lexical and semantic search.
 
-The system does not rely on a single retrieval strategy.
+```text
+Query
+  │
+  ▼
+Classification / Routing
+  │
+  ├───────────────┐
+  ▼               ▼
+Semantic          BM25
+Retrieval        Retrieval
+  │               │
+  └───────┬───────┘
+          ▼
+     RRF Fusion
+          ▼
+  Relevance Filtering
+          ▼
+ CrossEncoder Reranking
+          ▼
+  MMR Evidence Selection
+          ▼
+   Grounded Context
+          ▼
+        LLM
+          ▼
+     Final Response
+```
 
-Instead, it combines multiple retrieval stages to improve technical search quality.
+## Query Classification
 
----
-
-## 1. Query Classification and Routing
-
-Queries are classified into research-oriented categories including:
+Queries are routed into research-oriented categories such as:
 
 - Factual
 - Methodology
@@ -227,44 +187,21 @@ Queries are classified into research-oriented categories including:
 - Limitation
 - Cross-source / relationship queries
 
-The classification and routing layer determines how the query should be handled by downstream research and retrieval components.
+## Semantic Retrieval
 
----
-
-## 2. Semantic Retrieval
-
-Dense semantic retrieval uses:
+Dense retrieval uses:
 
 ```text
 sentence-transformers/all-MiniLM-L6-v2
 ```
 
-Semantic retrieval is useful when the relevant evidence uses different wording from the original query but expresses a similar concept.
+The embedding layer supports both local Sentence Transformer inference and remote Hugging Face inference.
 
-The embedding layer supports:
+## BM25 Retrieval
 
-- Local Sentence Transformer inference
-- Remote Hugging Face inference
+BM25 provides lexical retrieval for exact technical terminology, identifiers, filenames, symbols, repository-specific terms, and other keyword-sensitive queries.
 
-This allows embedding generation to be separated from the application infrastructure.
-
----
-
-## 3. BM25 Retrieval
-
-BM25 provides lexical retrieval for exact terms and technical identifiers.
-
-This is particularly useful for:
-
-- Model names
-- Function names
-- Class names
-- File paths
-- API names
-- Repository-specific terminology
-- Technical keywords
-
-The searchable representation can also incorporate structural metadata such as:
+Searchable metadata can include:
 
 ```text
 path
@@ -277,160 +214,81 @@ language
 symbol
 ```
 
----
+## Reciprocal Rank Fusion
 
-## 4. Reciprocal Rank Fusion
+Semantic and BM25 rankings are combined using Reciprocal Rank Fusion (RRF).
 
-Semantic and lexical result rankings are combined using **Reciprocal Rank Fusion (RRF)**.
+This provides a single candidate ranking that benefits from both semantic similarity and exact lexical matching.
 
-```text
-Semantic Search ───────┐
-                       ├──> RRF ───> Unified Candidate Ranking
-BM25 Search ───────────┘
-```
+## Relevance Filtering
 
-This allows the system to benefit from both semantic similarity and exact lexical matching.
+Retrieved candidates are filtered using relevance scoring and duplicate removal before final evidence selection.
 
----
+## CrossEncoder Reranking
 
-## 5. Relevance Filtering
+For the document RAG path, candidate chunks can undergo second-stage CrossEncoder reranking to improve query-aware ordering.
 
-Candidate results are filtered before final evidence selection.
+## MMR Evidence Selection
 
-The system applies relevance scoring and removes exact duplicate results so that low-value or repeated evidence is less likely to reach the generation stage.
+Maximum Marginal Relevance is used to reduce redundant evidence while retaining highly relevant primary results.
 
----
-
-## 6. CrossEncoder Reranking
-
-For the document RAG path, candidate results can be reranked using a CrossEncoder.
-
-This provides a second-stage query-aware ranking step after the initial retrieval process.
-
----
-
-## 7. MMR-Based Evidence Selection
-
-Maximum Marginal Relevance is used to reduce redundant evidence.
-
-The selection process prioritizes:
+The selection priority is:
 
 ```text
 Relevance
-    ↓
+   ↓
 Exact technical matching
-    ↓
-Complementary supporting evidence
-    ↓
+   ↓
+Complementary evidence
+   ↓
 Diversity
 ```
-
-Highly relevant primary evidence is protected so that diversity does not unnecessarily replace the strongest evidence.
 
 ---
 
 # Structure-Aware Chunking
 
-Bujha AI uses structure-aware document and code chunking rather than relying only on naive fixed-size text splitting.
+Bujha AI does not rely solely on naive fixed-size text splitting.
 
-The chunking system preserves meaningful structure including:
+The chunking pipeline preserves useful structure including:
 
 - Headings
 - Heading hierarchy
+- Parent sections
+- Section paths
 - Paragraphs
 - Lists
 - Fenced code blocks
-- Section paths
-- Parent sections
 - File paths
-- Language
+- Programming language
 - Chunk type
 - Chunk indices
+- Page information
 
-Oversized content can be split further while attempting to preserve meaningful sentence boundaries.
+This metadata is available to downstream retrieval and relevance components.
 
-This structural information becomes useful during lexical search, relevance scoring, and evidence selection.
+For code repositories, preserving file paths, language, symbols, and structural information helps distinguish otherwise similar chunks.
 
 ---
 
-# Research Discovery
+# Research Sources
 
-Bujha AI integrates multiple external research ecosystems.
-
-| Source | Role |
+| Source | Purpose |
 |---|---|
 | arXiv | Research paper discovery and metadata |
 | GitHub | Repository discovery and source-code retrieval |
-| PapersWithCode | Papers, methods, datasets, and paper-code relationships |
+| Papers With Code | Papers, methods, datasets, and paper-code relationships |
 | Hugging Face | Model and ML resource discovery |
 
-Results from each provider are normalized into a shared `ResearchItem` representation while preserving provider-specific metadata.
-
-Examples include:
-
-- GitHub stars and forks
-- Repository language and topics
-- Hugging Face downloads and likes
-- Model pipeline tags
-- PapersWithCode tasks
-- Conference information
-- Publication and update timestamps
+External results are normalized into a shared `ResearchItem` representation so that different providers can be handled consistently by the application.
 
 ---
 
-# Document & Research Workflow
-
-```text
-Discover or Upload Source
-           ↓
-      Normalize Data
-           ↓
-    Process / Chunk Content
-           ↓
-     Build Searchable Data
-           ↓
-   Semantic + Lexical Search
-           ↓
-     Rank and Filter Results
-           ↓
-      Select Evidence
-           ↓
-      Generate Answer
-           ↓
-      Display Sources
-```
-
-arXiv papers can also be processed through the document pipeline when their PDFs are ingested, allowing the same document processing and retrieval mechanisms to be applied to research papers.
-
----
-
-# LLM Layer
-
-Bujha AI supports separate production and local development inference paths.
-
-## Production
-
-```text
-Provider: Groq
-Model: openai/gpt-oss-120b
-```
-
-## Local Development
-
-```text
-Provider: Ollama
-Model: qwen3:4b-instruct
-```
-
-This separation makes it possible to use local inference during development while using a hosted inference provider for deployment.
-
----
-
-# Data & Persistence
+# Data Architecture
 
 Bujha AI uses **Supabase / PostgreSQL** for application persistence and **Supabase Storage** for uploaded document files.
 
-The application stores data across entities such as:
+Core persistent entities include:
 
 ```text
 workspaces
@@ -444,7 +302,7 @@ chat_messages
 recent_activity
 ```
 
-### Simplified Storage Architecture
+### Storage
 
 ```text
 Supabase / PostgreSQL
@@ -456,65 +314,40 @@ Supabase / PostgreSQL
 ├── Chats
 ├── Messages
 └── Recent Activity
-     
+
 Supabase Storage
-│
-└── Uploaded Document Files
+└── Uploaded Documents
 ```
 
-The document deletion workflow also checks whether an underlying document is referenced by another workspace before deleting its persistent data and stored file.
+The document deletion workflow checks whether an underlying document is still referenced by another workspace before removing persistent document data and its stored file.
 
 ---
 
-# Chat System
+# LLM Providers
 
-The chat layer provides research-oriented conversations over selected sources.
+Bujha AI supports separate inference paths for production and local development.
 
-Features include:
+### Production
 
-- Persistent chat sessions
-- Source attachments
-- Document attachments
-- Streamed model responses
-- Retrieval metadata
-- Evidence display
-- Source attribution
+```text
+Provider: Groq
+Model: openai/gpt-oss-120b
+```
 
-Chat context can be built from retrieved evidence rather than requiring the user to manually paste research material into the conversation.
+### Local Development
 
----
+```text
+Provider: Ollama
+Model: qwen3:4b-instruct
+```
 
-# Citations
-
-For arXiv-backed research items, Bujha AI can generate:
-
-- APA 7 citations
-- BibTeX citations
-
-This makes the system useful for academic research and technical documentation workflows.
-
----
-
-# Recent Activity
-
-Research activity is persisted at the workspace level.
-
-Tracked activity includes events such as:
-
-- Document added
-- Paper added
-- Model added
-- Repository added
-- Chat started
-- Research performed
-
-This gives users a persistent view of what has happened inside a workspace.
+This keeps the application architecture independent from a single inference environment.
 
 ---
 
 # Technology Stack
 
-## Frontend
+### Frontend
 
 - React
 - TypeScript
@@ -522,7 +355,7 @@ This gives users a persistent view of what has happened inside a workspace.
 - Tailwind-style utility classes
 - Lucide React
 
-## Backend
+### Backend
 
 - Python
 - FastAPI
@@ -532,34 +365,27 @@ This gives users a persistent view of what has happened inside a workspace.
 - HTTPX
 - python-dotenv
 
-## AI & Retrieval
+### Retrieval / AI
 
 - Retrieval-Augmented Generation (RAG)
 - BM25
 - Sentence Transformers
 - `all-MiniLM-L6-v2`
-- Reciprocal Rank Fusion (RRF)
+- Reciprocal Rank Fusion
 - CrossEncoder reranking
-- Maximum Marginal Relevance (MMR)
+- Maximum Marginal Relevance
 - Query classification
 - Query-aware relevance scoring
 - NumPy
 - scikit-learn
 
-## LLM
-
-- Groq
-- Ollama
-- Qwen
-- `openai/gpt-oss-120b`
-
-## Database & Storage
+### Database / Storage
 
 - Supabase
 - PostgreSQL
 - Supabase Storage
 
-## Document Processing
+### Document Processing
 
 - PyPDF
 - PyMuPDF
@@ -567,15 +393,15 @@ This gives users a persistent view of what has happened inside a workspace.
 - openpyxl
 - python-pptx
 
-## Research APIs
+### Research Integrations
 
 - arXiv
 - GitHub REST API
-- PapersWithCode
+- Papers With Code
 - Hugging Face API
 - Hugging Face Datasets Server
 
-## Development
+### Development
 
 - Git
 - GitHub
@@ -586,7 +412,7 @@ This gives users a persistent view of what has happened inside a workspace.
 
 # Project Structure
 
-A simplified representation of the project architecture:
+A simplified view of the application structure:
 
 ```text
 .
@@ -627,30 +453,29 @@ A simplified representation of the project architecture:
 │   ├── test_research_service.py
 │   └── test_hybrid_retrieval.py
 │
+├── requirements.txt
 └── README.md
 ```
 
-The backend follows a service-oriented design:
+The backend follows a service-oriented architecture:
 
 ```text
-Routes
-  ↓
-Services
-  ↓
-Research / RAG Components
-  ↓
-Persistence / External Providers
+API Routes
+    ↓
+Application Services
+    ↓
+Research / Retrieval Components
+    ↓
+Persistence + External Providers
 ```
 
-API routes handle HTTP-level concerns, while services manage application logic, research acquisition, persistence, and retrieval behavior.
-
-Heavy RAG components are initialized lazily to reduce startup memory pressure in constrained deployment environments.
+Heavy retrieval components are initialized lazily to reduce startup memory pressure in constrained deployment environments.
 
 ---
 
 # Evaluation
 
-Bujha AI includes a retrieval benchmark to measure retrieval behavior quantitatively.
+Bujha AI includes a retrieval benchmark to measure search quality quantitatively.
 
 Current benchmark:
 
@@ -673,170 +498,11 @@ The evaluation includes:
 - Query classification accuracy
 - Per-question failure analysis
 
-The benchmark is intended to identify retrieval strengths and weaknesses rather than to claim universal answer accuracy.
+These measurements are intended to evaluate the retrieval pipeline and identify weaknesses rather than claim universal answer accuracy.
 
 ---
 
-# Example Evaluation Workflow
-
-```text
-Benchmark Questions
-        ↓
-Query Classification
-        ↓
-Hybrid Retrieval
-        ↓
-Ranking / Reranking
-        ↓
-Evidence Selection
-        ↓
-Compare Returned Evidence
-        ↓
-Calculate:
-    Recall@K
-    Precision@K
-    MRR
-    nDCG
-        ↓
-Failure Analysis
-```
-
-This makes retrieval changes measurable and provides a basis for future retrieval experiments.
-
----
-
-# Design Decisions
-
-## Why Hybrid Retrieval?
-
-Technical research frequently contains both semantic concepts and exact technical identifiers.
-
-For example:
-
-```text
-"attention mechanism used by the model"
-```
-
-and:
-
-```text
-"CrossEntropyLoss"
-```
-
-represent different retrieval challenges.
-
-Semantic retrieval helps with conceptual similarity, while BM25 is valuable for exact lexical matching.
-
-Combining the two provides a more balanced retrieval strategy.
-
----
-
-## Why Structure-Aware Chunking?
-
-The meaning of technical content often depends on its surrounding structure.
-
-For example:
-
-```text
-Paper
- └── Methodology
-      └── Training Procedure
-```
-
-or:
-
-```text
-Repository
- └── src/
-      └── services/
-           └── retriever.py
-```
-
-Preserving this structure provides additional context for retrieval and ranking.
-
----
-
-## Why MMR?
-
-A retrieval result containing five nearly identical chunks provides less useful evidence than several complementary pieces of relevant information.
-
-MMR helps reduce this redundancy while protecting highly relevant evidence.
-
----
-
-## Why an Embedding Provider Abstraction?
-
-Embedding inference may be performed:
-
-- Locally during development
-- Remotely during deployment
-
-Keeping the embedding provider behind an abstraction makes the retrieval layer less dependent on a specific inference environment.
-
----
-
-## Why Lazy RAG Initialization?
-
-Embedding and retrieval components can be memory-intensive.
-
-Lazy initialization helps reduce the application's startup memory requirements and is useful when deploying the backend on resource-constrained infrastructure.
-
----
-
-# Current Limitations
-
-Bujha AI is an evolving engineering and experimentation project.
-
-Current limitations include:
-
-- Retrieval quality is not uniform across every query type.
-- Some broad overview and methodology queries have lower recall.
-- Some precise factual queries remain difficult.
-- Dense vector persistence is not currently implemented using `pgvector`.
-- The current benchmark contains 32 questions and is therefore relatively small.
-- The evaluation should not be interpreted as evidence of large-scale production traffic or commercial-scale usage.
-
-These limitations are intentionally documented because retrieval systems should be evaluated using measurable evidence rather than only qualitative examples.
-
----
-
-# Future Improvements
-
-Potential directions include:
-
-### Persistent Vector Search
-
-Move persistent dense vectors into PostgreSQL using `pgvector` while retaining the existing retrieval and evidence-selection pipeline.
-
-### Improved Context Reconstruction
-
-Use parent and neighboring chunks to improve context for broad overview and methodology questions.
-
-### Retrieval Ablation Studies
-
-Compare progressively more sophisticated retrieval configurations:
-
-```text
-BM25
-   ↓
-Dense Retrieval
-   ↓
-Hybrid Retrieval + RRF
-   ↓
-Hybrid + Reranking
-   ↓
-Hybrid + Reranking + MMR
-```
-
-using consistent retrieval metrics.
-
-### Source Summarization
-
-Introduce a workflow for summarizing selected sources using retrieved evidence instead of summarizing entire datasets indiscriminately.
-
----
-
-# Installation
+# Development Setup
 
 ## Prerequisites
 
@@ -846,7 +512,7 @@ Introduce a workflow for summarizing selected sources using retrieved evidence i
 - Supabase project
 - LLM provider credentials
 
-Optional depending on configuration:
+Depending on the selected configuration, you may also need:
 
 - Groq API key
 - Ollama
@@ -855,7 +521,7 @@ Optional depending on configuration:
 
 ---
 
-## Clone
+## Clone the Repository
 
 ```bash
 git clone https://github.com/madaneeyy/smart-research-dashboard.git
@@ -865,7 +531,7 @@ cd smart-research-dashboard
 
 ---
 
-## Backend Setup
+## Backend
 
 Create a virtual environment:
 
@@ -893,11 +559,9 @@ pip install -r requirements.txt
 
 ---
 
-# Environment Variables
+## Environment Variables
 
-Create a `.env` file in the backend environment.
-
-Example:
+Create a `.env` file using your own credentials.
 
 ```env
 SUPABASE_URL=your_supabase_url
@@ -913,11 +577,11 @@ HF_TOKEN=your_huggingface_token
 GITHUB_TOKEN=your_github_token
 ```
 
-Never commit your actual credentials, API keys, or tokens to GitHub.
+Never commit secrets or API keys to the repository.
 
 ---
 
-# Run the Backend
+## Run the Backend
 
 ```bash
 uvicorn backend.main:app --reload
@@ -925,7 +589,7 @@ uvicorn backend.main:app --reload
 
 ---
 
-# Run the Frontend
+## Run the Frontend
 
 Install dependencies:
 
@@ -941,7 +605,7 @@ npm run dev
 
 ---
 
-# Run Tests
+## Run Tests
 
 ```bash
 pytest
@@ -951,64 +615,126 @@ pytest
 
 # Deployment
 
-The current architecture supports:
+The application is designed around the following deployment architecture:
 
 ```text
-Frontend → Vercel
-Backend  → Render
-Database → Supabase / PostgreSQL
-Storage  → Supabase Storage
-LLM      → Groq / Ollama
+Frontend
+   │
+   ▼
+Vercel
+
+Backend
+   │
+   ▼
+Render
+
+Database
+   │
+   ▼
+Supabase / PostgreSQL
+
+Document Storage
+   │
+   ▼
+Supabase Storage
+
+LLM
+   │
+   ├── Groq
+   └── Ollama
 ```
 
-The deployment setup also supports remote embedding inference so the application does not necessarily need to load the local embedding model into the cloud application process.
+The embedding provider abstraction also supports remote inference so that deployment environments do not necessarily need to load the local embedding model into the application process.
 
 ---
 
-# Security Notes
+# Current Limitations
 
-Before deploying your own instance:
+Bujha AI is an evolving engineering and experimentation project.
 
-- Keep API keys in environment variables.
-- Do not expose private Supabase credentials.
-- Do not commit `.env` files.
-- Validate uploaded files on the backend.
-- Apply appropriate database access policies.
-- Restrict external API credentials to the permissions they require.
+Current limitations include:
 
----
+- Retrieval quality is not uniform across all query types.
+- Some overview and methodology queries have lower recall.
+- Some precise factual queries remain difficult.
+- Dense vector persistence is not currently implemented using `pgvector`.
+- The current benchmark contains 32 questions and is relatively small.
+- Evaluation results should not be interpreted as evidence of large-scale production traffic or commercial-scale usage.
 
-# Why I Built This
-
-Technical research often involves switching between:
-
-- Research papers
-- GitHub repositories
-- Model repositories
-- Documentation
-- PDFs
-- Spreadsheets
-- Presentations
-- Multiple conversations
-
-Bujha AI was built to bring these sources together into one research environment and experiment with better ways of retrieving technical evidence before sending context to an LLM.
-
-The project also serves as a practical exploration of **information retrieval, RAG architecture, ranking, document processing, and AI-assisted research workflows**.
+These limitations are documented intentionally so that system capabilities are represented by measurable evidence rather than by broad claims.
 
 ---
 
-# What This Project Demonstrates
+# Roadmap
 
-Bujha AI brings together work across:
+The following areas are candidates for future development:
+
+### Persistent Vector Search
+
+Evaluate PostgreSQL with `pgvector` for persistent dense-vector storage and scalable vector retrieval.
+
+### Improved Context Reconstruction
+
+Use parent and neighboring chunks to improve context for broad overview and methodology queries.
+
+### Retrieval Ablation Studies
+
+Compare retrieval configurations using the same benchmark:
+
+```text
+BM25
+Dense Retrieval
+Hybrid + RRF
+Hybrid + Reranking
+Hybrid + Reranking + MMR
+```
+
+Measure each configuration using:
+
+- Recall@5
+- Recall@10
+- MRR
+- nDCG
+
+### Source Summarization
+
+Add a workflow for summarizing selected sources using the existing retrieval and evidence pipeline.
+
+---
+
+# Engineering Principles
+
+Bujha AI follows a few core design principles:
+
+**Evidence before generation**  
+Retrieve relevant evidence before asking the LLM to generate an answer.
+
+**Hybrid retrieval over single-method search**  
+Use both lexical and semantic retrieval because technical queries often require both.
+
+**Structure-aware processing**  
+Preserve document and repository structure where it contributes to retrieval quality.
+
+**Measured improvements**  
+Evaluate retrieval changes with benchmark metrics instead of relying only on qualitative examples.
+
+**Deployment-aware architecture**  
+Keep inference and retrieval components modular so the application can operate under constrained infrastructure.
+
+---
+
+# What the Project Demonstrates
+
+Bujha AI brings together practical work across:
 
 - Full-stack application development
 - Backend API engineering
 - AI integration
 - Retrieval-Augmented Generation
 - Information retrieval
-- Hybrid search
 - Semantic search
 - BM25
+- Hybrid retrieval
 - Ranking and reranking
 - Document processing
 - Code retrieval
@@ -1019,29 +745,26 @@ Bujha AI brings together work across:
 
 ---
 
-# Project Links
+# Repository
 
-**Live Application:**  
-https://bujha.vercel.app/
-
-**GitHub Repository:**  
+**GitHub:**  
 https://github.com/madaneeyy/smart-research-dashboard
 
 ---
 
 # Author
 
-## Madan Pandey
+**Madan Pandey**
 
-Computer Science graduate interested in:
+Computer Science graduate focused on AI/ML, information retrieval, software engineering, and intelligent applications.
 
-- Artificial Intelligence
-- Machine Learning
-- Information Retrieval
-- RAG Systems
-- Software Engineering
-- Intelligent Applications
-- Research Tools
+- GitHub: https://github.com/madaneeyy
+- LinkedIn: https://www.linkedin.com/in/madaneeyy/
 
-**GitHub:** https://github.com/madaneeyy  
-**LinkedIn:** https://www.linkedin.com/in/madaneeyy/
+---
+
+## License
+
+This project is currently maintained as a personal engineering and research project.
+
+Add a repository license here once one is selected.
