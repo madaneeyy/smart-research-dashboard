@@ -6,7 +6,7 @@ Bujha AI is a full-stack AI research workspace for discovering, organizing, retr
 
 The system combines multi-source research discovery with a hybrid retrieval pipeline consisting of semantic search, BM25, Reciprocal Rank Fusion, relevance filtering, neural reranking, and MMR-based evidence selection before generating grounded responses.
 
-## Features
+## Features 
 
 ### Research Discovery
 
@@ -696,11 +696,6 @@ Measure each configuration using:
 - MRR
 - nDCG
 
-### Source Summarization
-
-Add a workflow for summarizing selected sources using the existing retrieval and evidence pipeline.
-
----
 
 # Engineering Principles
 
